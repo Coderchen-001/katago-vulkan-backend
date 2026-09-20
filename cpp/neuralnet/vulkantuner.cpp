@@ -1666,13 +1666,49 @@ namespace VulkanTuner {
       verdictCase("(e) our-gap all-reject", d, Decision::FinalizeVerdict::OurGap,
                   Decision::FinalizeVerdict::OurGap, false, "not in a writable state");
     }
+    { // (f) THE RACE, on ONE decision: the first call concludes "device-only all-reject" and sets OUR
+      // marker; a row then installs (the (b) window: another context's install lands between the install
+      // path's finalize and the once point's), and the SECOND call must therefore RETRACT that marker --
+      // not merely stop setting it.  This is the only case that executes the from-scratch recompute at
+      // the top of finalizeOutcome: with that block turned off, (a)-(e) all still pass, which is exactly
+      // why this case exists.  The origin is asserted too, because "the marker is gone" and "we still
+      // know where it came from" are two different statements and the second half would be a half-state.
+      // (No writer call here on purpose: after the transition the durable set is empty, so there is
+      // nothing to refuse that (a)/(b)/(e) do not already refuse.)
+      Decision d;
+      d.deviceName = "self-test";
+      d.cachePath = probePath;
+      d.install.declared = 1;
+      d.install.installed = 0;
+      d.allRejectReasonsAreDevice = true;
+      const Decision::FinalizeVerdict first = finalizeOutcome(d);
+      const bool markerFirst = d.negative;
+      const Decision::NegativeOrigin originFirst = d.negativeOrigin;
+      d.install.installed = 1;   // the install that arrives between the two finalize calls
+      const Decision::FinalizeVerdict second = finalizeOutcome(d);
+      if (first != Decision::FinalizeVerdict::DeviceOnlyAllReject || !markerFirst
+          || originFirst != Decision::NegativeOrigin::AllReject
+          || second != Decision::FinalizeVerdict::Measured || d.negative
+          || d.negativeOrigin != Decision::NegativeOrigin::None) {
+        verdictOk = false;
+        if (verdictBad.empty()) {
+          verdictBad = string("(f) all-reject -> measured: verdict ") + verdictName(first) + "/"
+                     + verdictName(second) + " (want DeviceOnlyAllReject/Measured), marker "
+                     + (markerFirst ? "true" : "false") + "/" + (d.negative ? "true" : "false")
+                     + " (want true/false), origin "
+                     + (originFirst == Decision::NegativeOrigin::AllReject ? "AllReject" : "?") + "/"
+                     + (d.negativeOrigin == Decision::NegativeOrigin::None ? "None" : "?")
+                     + " (want AllReject/None)";
+        }
+      }
+    }
 
     const bool absent = !FileUtils::exists(probePath);    logLine("cache write self-test: " + to_string(declared) + " outcome(s) declared, "
             + to_string(refused) + " refused by the state gate, " + to_string(allowed)
             + " state-writable; probe file " + (absent ? "absent" : "PRESENT")
             + "; encoding probe (non-ASCII name) written+read-back+removed ["
             + ((encWrote && encReadBack && encRemoved) ? "ok" : "FAIL") + "]"
-            + "; (a)(b) no marker / (c) from-file retirement / (d) control / (e) our-gap ["
+            + "; (a)(b) no marker / (c) from-file retirement / (d) control / (e) our-gap / (f) all-reject->measured retracts ["
             + (verdictOk ? "ok" : "FAIL: " + verdictBad) + "]"
             + " [" + ((ok && absent && encWrote && encReadBack && encRemoved && verdictOk) ? "ok" : "FAIL") + "]"
             + (ok ? "" : " first problem: " + firstBad));
