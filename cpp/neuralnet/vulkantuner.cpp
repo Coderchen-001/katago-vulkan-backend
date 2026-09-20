@@ -1524,6 +1524,11 @@ namespace VulkanTuner {
     d->baselineVersion = std::to_string(TUNER_POLICY_VERSION);
     d->rowSource = "none";   // stays "none" unless a load actually produced rows
     d->tuneModeText = policy.modeText;
+    // W2: the resolved policy travels WITH the decision so the once hook can capture it BY VALUE.
+    // The hook is assembled on the INSTALL path (that is what makes "callback is empty" mean "this
+    // context's install has not run yet") and called from the backend's eval path, which knows
+    // nothing about policies.
+    d->tunePolicy = policy;
 
     try {
       char fp[512];
@@ -1857,6 +1862,48 @@ namespace VulkanTuner {
     return formatRowsFileImpl(decision);
   }
 
+  // W2 (decision A): pick this decision's OUTCOME from the install accounting, using ONLY names the
+  // declared table already carries -- this batch invents no new outcome.
+  //
+  // It runs at the END OF EACH INSTALL, not at the end of makeDecision: at makeDecision's return the
+  // accounting is still EMPTY (no ComputeHandle exists yet, and the installs happen inside its
+  // constructor), so finalizing there would leave every decision in "running" for ever.  The last
+  // install before the first eval is therefore what decides, and the once point re-finalizes so the
+  // body is self-contained.
+  //
+  //   installed > 0                      -> "measured"
+  //   declared > 0, nothing installed    -> "structural-all-reject"  (coarse, see below)
+  //   otherwise                          -> stay in "running"        (nothing to conclude: the empty
+  //                                         set is the 1b-2b production form, not a verdict)
+  //
+  // 🔴 The coarse name is recorded EVEN WHEN allRejectReasonsAreDevice is false, and then this prints
+  // flag=false + the counts (G-D20).  The write is refused by the table's own `device-only` condition,
+  // so no file appears -- and "the file was not written" must never be the only thing the log says.
+  // The NEGATIVE ENTRY (negative + negativeReason) is set ONLY on the device-only branch: that marker
+  // outlives the process, so our own implementation gap must never leave one behind.
+  void finalizeOutcome(Decision& d) {
+    if (d.install.installed > 0) {
+      d.outcome = "measured";
+      return;
+    }
+    if (d.install.declared > 0) {
+      d.outcome = "structural-all-reject";
+      if (d.allRejectReasonsAreDevice) {
+        d.negative = true;
+        d.negativeReason = "no-injection-slot";
+      }
+      else {
+        logLine("NOTICE: " + d.deviceName + ": every declared row was rejected, but NOT every reason "
+                "is a device property (flag=false; our-gap=" + to_string(d.install.dropped_unsupported_our_gap)
+                + " illegal=" + to_string(d.install.dropped_illegal)
+                + " variant-failed=" + to_string(d.install.variant_failed) + "): the coarse outcome "
+                "'structural-all-reject' is recorded WITHOUT a negative entry, because our own "
+                "implementation gap is not a property of this device (G-D20)");
+      }
+      return;
+    }
+  }
+
   void installForHandle(const shared_ptr<Decision>& decision, ggml_backend_t backend) {
     if (decision == nullptr) {
       return;
@@ -1942,6 +1989,11 @@ namespace VulkanTuner {
     //   RefusedByGate -> no file was written at all (nothing was silently lost);
     //   NotAttempted  -> nothing to say: the hook has not run yet, which is the normal order.
     // "Trigger and consume": this REPORTS.  There is no retry, by design.
+    // --- W2 (decision A): this context's accounting is in, so the outcome can be chosen NOW. -------
+    // (Not at the end of makeDecision: there the accounting is still empty -- no ComputeHandle exists
+    // yet -- so every decision would stay in "running" for ever.)  The last install before the first
+    // eval is what decides; the once body below re-finalizes so it stands on its own.
+    finalizeOutcome(*decision);
     if (decision->writeState != Decision::WriteState::NotAttempted) {
       logLine(string("WARNING: ctx=") + to_string(installed.ctx_ordinal)
               + " installed after the cache write for " + decision->deviceName + ": "
