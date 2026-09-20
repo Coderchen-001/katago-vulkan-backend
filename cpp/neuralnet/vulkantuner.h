@@ -201,7 +201,15 @@ namespace VulkanTuner {
     // cache or the import file; still refused by the backend's T4 gate today (loudly), and
     // never silently dropped.
     std::vector<vk_tune_row_spec> rows;
-    std::string rowSource;        // "none" / "cache" / "import"
+    // W3-P1: WHERE THE CANDIDATE SET CAME FROM.  Four states, and the fourth is the one the write
+    // side reads: "none" (nothing was loaded -- the declared set is empty, or the self-test
+    // synthesized it), "cache"/"import" (a FILE produced the candidates), "measured" (THIS process's
+    // own enumeration produced them).  The value is what `negativeProvable` tests, so the initial
+    // value is the fail-closed one: a decision nobody marked can never mint a durable verdict.
+    // 🔴 Production has NO setter of "measured" today -- the enumerator is step 5 -- which is exactly
+    // why the key-scoped NEGATIVE entry is unreachable until then.  R42 counts the setters rather
+    // than trusting this sentence: production 0, the self-test's one named fixture 1.
+    std::string rowSource = "none";   // "none" / "cache" / "import" / "measured"
     // What the decision line prints for "which mode is running" (auto(cfg) / off(cfg)): without
     // it the log cannot prove which mode was in effect, and "auto" vs "off" is exactly the
     // difference between "we tried to tune" and "we deliberately did not".

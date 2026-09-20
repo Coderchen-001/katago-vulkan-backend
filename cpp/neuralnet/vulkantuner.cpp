@@ -333,6 +333,76 @@ namespace VulkanTuner {
       return false;
     }
 
+    // ── W3-P1: PROVENANCE -- "this candidate set is THIS process's own measurement" ────────────────
+    // "This key has no injection slot" is a KEY-SCOPED and STICKY claim: once it is in the cache the
+    // key is skipped until the file's invalidation rule voids it.  It may therefore only be concluded
+    // from a candidate set this process produced ITSELF -- a set read from a file (cache or IMPORT)
+    // says what SOME OTHER run saw, and a hand-made or dev-reflowed file says nothing at all.  This is
+    // the ONE predicate that answers that question, and it is named and printable because the write
+    // path has to cite it (R42 pins the citation).
+    //
+    // Fail-closed by construction: the tested value is the string "measured", and nothing but the
+    // enumerator (step 5) ever writes it.  So today the durable negative entry is UNREACHABLE, which
+    // is the intended state until that writer exists -- no writer, no verdict.  The two older guards
+    // (`imported` / `anyRowInstalled`) stay in place: they still decide what the FILE would carry on
+    // the ungated EXPORT channel, which is a different question from what may be remembered.
+    bool negativeProvable(const Decision & d) {
+      return d.rowSource == "measured";
+    }
+
+    // The EXTRA conditions a table row may name: a CLOSED SET, each entry owning the sentence it
+    // refuses with.  Why the sentence lives here and not in the writer: the generic state-gate
+    // message ("not in a writable state ... only a completed measurement or a structural all-reject
+    // may be remembered") is TRUE for a flag flip but MISLEADING for this condition -- it lists
+    // `structural-all-reject` as allowed while refusing one -- and a refusal that names the wrong
+    // clause sends the next reader to the wrong code.  `refusal == nullptr` means "the state gate's
+    // own sentence is the right one" (`device-only` has no sentence of its own: the outcome really is
+    // not in a writable state when a rejection came from our own gap).
+    struct ConditionSpec {
+      const char* name;
+      bool (*holds)(const Decision &);
+      const char* refusal;
+    };
+    const ConditionSpec CONDITION_SPECS[] = {
+      { "device-only",   [](const Decision & x) { return x.allRejectReasonsAreDevice; }, nullptr },
+      { "measured-here", [](const Decision & x) { return negativeProvable(x); },
+        "not this process's own measurement" },
+    };
+
+    // Fail-closed lookup: an unknown name is never satisfied AND has no sentence to quote, so a typo
+    // in the table refuses the write with the generic message instead of opening it.
+    const ConditionSpec * findCondition(const string & name) {
+      for (const ConditionSpec & c : CONDITION_SPECS) {
+        if (name == c.name) {
+          return &c;
+        }
+      }
+      return nullptr;
+    }
+
+    bool conditionHolds(const Decision & d, const string & name) {
+      const ConditionSpec * c = findCondition(name);
+      return c != nullptr && c->holds(d);
+    }
+
+    // A row's `condition` field is a comma-separated LIST of names from that set ("device-only",
+    // "device-only,measured-here", ...): one row can then require several extra conditions without
+    // growing a column per condition, while every name still comes from the closed set above.
+    vector<string> splitConditions(const char * condition) {
+      vector<string> out;
+      string cur;
+      for (const char * p = condition; p != nullptr && *p != '\0'; p++) {
+        if (*p == ',') {
+          if (!cur.empty()) { out.push_back(cur); cur.clear(); }
+        }
+        else {
+          cur.push_back(*p);
+        }
+      }
+      if (!cur.empty()) { out.push_back(cur); }
+      return out;
+    }
+
     // "Is there anything to write?" -- the SECOND half of the write permission.
     // `cacheWriteAllowed(policy)` answers "may this process touch the cache at all" (the user's
     // mode); this answers "does this decision say anything" (the decision's state), and they are
@@ -424,14 +494,17 @@ namespace VulkanTuner {
       // impossible to land green.
       const char* klass;       // "structural" / "completed" / "gate" / "measurement"
       bool writable;
-      // The EXTRA condition on top of `writable` (G-D20): "" = none, "device-only" = every
-      // rejection reason must be a device property.  It lives in the table on purpose -- a
-      // condition expressed as a branch on `klass` would let a class rename silently change what
-      // may be written, which is the "implicit knowledge in a branch" the first design rule bans.
+      // The EXTRA conditions on top of `writable`, as a comma-separated LIST from the closed set in
+      // `CONDITION_SPECS`: "" = none, "device-only" = every rejection reason must be a device property
+      // (G-D20), "measured-here" = the candidate set must be this process's own measurement (W3-P1).
+      // They live in the table on purpose -- a condition expressed as a branch on `klass`, or as a
+      // clause inside one of the gates, would let a rename or a refactor silently change what may be
+      // written, which is the "implicit knowledge in a branch" the first design rule bans.  The
+      // writer reports the FIRST named condition that does not hold, so a refusal names its clause.
       const char* condition;
     };
     const DecisionOutcomeSpec DECISION_OUTCOMES[] = {
-      { "structural-all-reject", "structural",  true,  "device-only" },
+      { "structural-all-reject", "structural",  true,  "device-only,measured-here" },
       { "measured",              "completed",   true,  ""            },
       { "gate-reject",           "gate",        false, ""            },
       { "running",               "measurement", false, ""            },
@@ -441,17 +514,16 @@ namespace VulkanTuner {
       { "no-winner",             "measurement", false, ""            },
     };
 
-    // The extra condition named by a table row (G-D20).  Fail-closed: an unknown condition is
-    // never satisfied, so a typo in the table cannot make something writable.
+    // The extra conditions named by a table row (G-D20 + W3-P1).  Fail-closed: EVERY name in the list
+    // must hold, and an unknown name is never satisfied, so a typo in the table cannot make something
+    // writable.
     bool outcomeConditionOk(const Decision & d, const char * condition) {
-      const string c = (condition == nullptr) ? string() : string(condition);
-      if (c.empty()) {
-        return true;
+      for (const string & name : splitConditions(condition)) {
+        if (!conditionHolds(d, name)) {
+          return false;
+        }
       }
-      if (c == "device-only") {
-        return d.allRejectReasonsAreDevice;
-      }
-      return false;
+      return true;
     }
 
     bool outcomeWritable(const Decision & d) {
@@ -461,6 +533,30 @@ namespace VulkanTuner {
         }
       }
       return false;
+    }
+
+    // WHICH condition refused (W3-P1): the writer's message must name its clause, the same way
+    // rowsForWrite's mismatch names the sizes and the fold's message names the differing byte.
+    // nullptr means "no NAMED condition is the reason" -- an unwritable row, an undeclared outcome,
+    // or an unknown condition name -- and in all three the state gate's own sentence is the accurate
+    // one (fail-closed: a name this build does not know cannot claim a refusal message).
+    const ConditionSpec * firstUnsatisfiedCondition(const Decision & d) {
+      for (const DecisionOutcomeSpec & o : DECISION_OUTCOMES) {
+        if (d.outcome != o.outcome) {
+          continue;
+        }
+        if (!o.writable) {
+          return nullptr;
+        }
+        for (const string & name : splitConditions(o.condition)) {
+          const ConditionSpec * c = findCondition(name);
+          if (c == nullptr || !c->holds(d)) {
+            return c;
+          }
+        }
+        return nullptr;
+      }
+      return nullptr;
     }
 
     // ---- the KIND registry and the completeness gate (C4) --------------------------------
@@ -1198,8 +1294,26 @@ namespace VulkanTuner {
       // those describe THIS attempt, and a cache file describes the DEVICE.  Only a completed
       // measurement or a structural all-reject gets past here (see DECISION_OUTCOMES), and an
       // outcome nobody declared is refused too (fail-closed).
-      err = "the decision is not in a writable state ('" + d.outcome + "'): only a completed "
-            "measurement or a structural all-reject may be remembered";
+      //
+      // W3-P1: when a NAMED condition is what refused, the message names THAT condition instead of
+      // reciting the generic sentence -- which says the opposite here ("a structural all-reject may be
+      // remembered" while refusing exactly one) and would send the next reader to the wrong code.  The
+      // provenance sentence is deliberately INDEPENDENT of the content refusal below ("nothing to
+      // write: no rows and no negative entry"): in this state that sentence is FALSE -- the negative
+      // entry IS there, it is simply not provable -- and the acceptance leg greps for THIS one by its
+      // registered marker, so a writer that fell through to the other sentence must not look green.
+      const ConditionSpec * bad = firstUnsatisfiedCondition(d);
+      if (bad != nullptr && bad->refusal != nullptr) {
+        err = string(bad->refusal) + ": this decision concluded '" + d.outcome
+              + "' from a candidate set it did not produce itself (row source '" + d.rowSource
+              + "'), and only a candidate set THIS process measured may be remembered as a durable "
+                "verdict -- a file says what some other run saw, and a hand-made or reflowed file says "
+                "nothing at all";
+      }
+      else {
+        err = "the decision is not in a writable state ('" + d.outcome + "'): only a completed "
+              "measurement or a structural all-reject may be remembered";
+      }
       return false;
     }
     if (!cacheEntryWritable(d)) {
@@ -1370,6 +1484,23 @@ namespace VulkanTuner {
                    + " v64@32=" + (why32no == nullptr ? "LEGAL (BUG)" : "refused");
       }
     }
+    // W3-P1: THE ONE fixture that may say "these candidates are this process's own measurement".
+    // Production has no such setter -- the enumerator is step 5 -- so this helper is the only place the
+    // state can be minted, and R42 counts exactly that (production 0 / self-test 1) instead of trusting
+    // a comment.  A named helper rather than inline assignments keeps the count a count of STATES
+    // rather than of text occurrences.
+    auto aMeasuredSet = [](Decision & x) { x.rowSource = "measured"; };
+
+    // One breaker per condition NAME in the closed set: the refusing direction of a condition can only
+    // be tested by making THAT condition false.  A name with no breaker returns false, and the caller
+    // turns that into a FAIL rather than a skip -- an untestable condition is precisely what this loop
+    // exists to prevent (a declared condition that nothing can falsify is a comment with a name).
+    auto breakCondition = [](const string & name, Decision & x) {
+      if (name == "device-only")   { x.allRejectReasonsAreDevice = false; return true; }
+      if (name == "measured-here") { x.rowSource = "none";                 return true; }
+      return false;
+    };
+
     for (const DecisionOutcomeSpec & o : DECISION_OUTCOMES) {
       Decision d;
       d.outcome = o.outcome;
@@ -1388,6 +1519,10 @@ namespace VulkanTuner {
         // G-D20: "the device has no injectable slot" is writable only when every rejection reason
         // is a device property; the fixture has to say so explicitly (unset => not writable).
         d.allRejectReasonsAreDevice = true;
+        // W3-P1: and the row names a SECOND condition, so the fixture must satisfy that one too --
+        // a fixture that only met `device-only` would fail this loop's positive direction, which is
+        // how "the table gained a condition nobody's fixture knows about" announces itself.
+        aMeasuredSet(d);
       }
       else if (o.writable && string(o.klass) == "completed") {
         // The rows-file shape: one legal row, so the CONTENT gate passes and only the state gate
@@ -1420,14 +1555,25 @@ namespace VulkanTuner {
       // The condition's OTHER direction, per row (G-D20): a row that names an extra condition must
       // be REFUSED when that condition does not hold.  Asserting only the satisfying direction would
       // leave the condition itself untested (and would let it decay into a comment).
-      if (string(o.condition).size() > 0) {
+      // The conditions' OTHER direction, per NAME (G-D20 for the reasons + W3-P1 for provenance): a row
+      // that names extra conditions must be REFUSED whenever any one of them does not hold -- asserting
+      // only the satisfying direction would leave the condition itself untested (and would let it decay
+      // into a comment).  A name with no breaker is a FAIL, not a skip: see `breakCondition`.
+      for (const string & cname : splitConditions(o.condition)) {
         Decision dCond = d;
-        dCond.allRejectReasonsAreDevice = false;
-        if (outcomeWritable(dCond)) {
+        if (!breakCondition(cname, dCond)) {
+          ok = false;
+          if (firstBad.empty()) {
+            firstBad = string("outcome ") + o.outcome + " names the condition '" + cname
+                       + "', which has no breaker in this self-test (so it could never be tested in "
+                         "the refusing direction)";
+          }
+        }
+        else if (outcomeWritable(dCond)) {
           ok = false;
           if (firstBad.empty()) {
             firstBad = string("outcome ") + o.outcome + " is writable while its condition ("
-                       + o.condition + ") does not hold";
+                       + cname + ") does not hold";
           }
         }
       }
@@ -1484,6 +1630,10 @@ namespace VulkanTuner {
       d.outcome = "structural-all-reject";
       d.negative = true;
       d.negativeReason = "no-injection-slot";
+      // W3-P1: provenance is satisfied for BOTH readings, so the only thing they differ in is
+      // `device-only` -- which is what makes this leg a test of G-D20 rather than of the table as a
+      // whole (with the candidates unmet, both readings would be false and the leg would prove nothing).
+      aMeasuredSet(d);
       d.allRejectReasonsAreDevice = false;   // one reason came from our own gap
       const bool refusedOurGap = !outcomeWritable(d);
       d.allRejectReasonsAreDevice = true;    // every reason is a device property
@@ -1621,6 +1771,21 @@ namespace VulkanTuner {
         }
       }
     };
+    // The registered marker, READ OUT OF THE TABLE rather than spelled a second time here: the
+    // self-test must assert the sentence the writer actually prints, so a rename cannot leave it
+    // testing a string nobody prints -- and the .cpp keeps ONE occurrence of the literal, which is
+    // also what section 9.4 counts.  An empty marker is a FAIL, never a silent skip (a `find("")`
+    // would otherwise pass and this whole case would look green while asserting nothing).
+    const ConditionSpec * mhSpec = findCondition("measured-here");
+    const char * measuredMarker = (mhSpec != nullptr && mhSpec->refusal != nullptr) ? mhSpec->refusal : "";
+    if (measuredMarker[0] == '\0') {
+      verdictOk = false;
+      if (verdictBad.empty()) {
+        verdictBad = "the `measured-here` condition has no refusal sentence, so a refusal cannot name "
+                     "its clause (the self-test would be asserting an empty marker)";
+      }
+    }
+
     { // (a) an IMPORTed set may not create a durable verdict
       Decision d;
       d.deviceName = "self-test";
@@ -1628,9 +1793,14 @@ namespace VulkanTuner {
       d.imported = true;
       d.install.declared = 1;
       d.install.installed = 0;
-      d.allRejectReasonsAreDevice = true;   // so the refusal comes from CONTENT, not from the state gate
+      d.allRejectReasonsAreDevice = true;   // so no OTHER condition can be the reason it is refused
+      // 🔴 W3-P1 moved the durable refusal one step earlier for every structural all-reject this process
+      // did not measure, so this call no longer reaches the CONTENT refusal ("nothing to write") it used
+      // to reach: what it pins now is that the refusal NAMES provenance.  The guard's own effect -- no
+      // marker AT ALL -- is the `wantNegative == false` half, and that is the half that keeps an
+      // IMPORTed set from carrying a marker onto the ungated EXPORT channel.
       verdictCase("(a) imported all-reject", d, Decision::FinalizeVerdict::ImportedRejected,
-                  Decision::FinalizeVerdict::ImportedRejected, false, "nothing to write");
+                  Decision::FinalizeVerdict::ImportedRejected, false, measuredMarker);
     }
     { // (b) our own account refutes the marker
       Decision d;
@@ -1640,8 +1810,10 @@ namespace VulkanTuner {
       d.install.declared = 1;
       d.install.installed = 0;
       d.allRejectReasonsAreDevice = true;
+      // Same shift as (a): the durable channel is closed by provenance before the self-falsification
+      // guard can be the thing the WRITER reports; the guard's own effect is the missing marker.
       verdictCase("(b) self-falsified all-reject", d, Decision::FinalizeVerdict::AnyRowInstalled,
-                  Decision::FinalizeVerdict::AnyRowInstalled, false, "nothing to write");
+                  Decision::FinalizeVerdict::AnyRowInstalled, false, measuredMarker);
     }
     { // (c) a from-file marker is retired by a durable row (one-way: the second call is `Measured`)
       Decision d;
@@ -1678,6 +1850,10 @@ namespace VulkanTuner {
       d.install.declared = 1;
       d.install.installed = 0;
       d.allRejectReasonsAreDevice = true;
+      // W3-P1: the control must satisfy BOTH conditions, or it would not be a control -- it would be a
+      // second refusal case.  With provenance met, the marker is writable: that is the positive half the
+      // table still has to allow, and (i) below is its mirror image.
+      aMeasuredSet(d);
       verdictCase("(d) device-only all-reject", d, Decision::FinalizeVerdict::DeviceOnlyAllReject,
                   Decision::FinalizeVerdict::DeviceOnlyAllReject, true, nullptr);
       if (!outcomeWritable(d) || !cacheEntryWritable(d)) {
@@ -1788,12 +1964,43 @@ namespace VulkanTuner {
       }
     }
 
+    { // (i) THE MIRROR OF (d), and the shape the acceptance leg (A36) meets in production: the CONTENT
+      // gate says writable -- the marker exists and its reason is in the closed set -- while the STATE
+      // gate refuses it because the candidate set came from a file.  Both halves are asserted, in this
+      // order, because "the write was refused" alone is satisfied by two very different rules, and the
+      // whole point of W3-P1 is that the refusal is for PROVENANCE and not because the file had nothing
+      // in it.  Without this case the provenance condition would only ever be exercised in its
+      // satisfying direction (by the fixtures in the loop above and by (d)).
+      Decision d;
+      d.deviceName = "self-test";
+      d.cachePath = probePath;
+      d.install.declared = 1;
+      d.install.installed = 0;
+      d.allRejectReasonsAreDevice = true;   // the outcome's own condition holds ...
+      d.rowSource = "cache";                // ... and the candidates came from a file
+      verdictCase("(i) unmeasured all-reject", d, Decision::FinalizeVerdict::DeviceOnlyAllReject,
+                  Decision::FinalizeVerdict::DeviceOnlyAllReject, true, measuredMarker);
+      const bool contentWritable = cacheEntryWritable(d);
+      const bool stateWritable = outcomeWritable(d);
+      if (stateWritable || !contentWritable) {
+        verdictOk = false;
+        if (verdictBad.empty()) {
+          verdictBad = string("(i) provenance is not what refused: state-writable=")
+                     + (stateWritable ? "YES (BUG)" : "no") + ", content-writable="
+                     + (contentWritable ? "yes"
+                                        : "NO (BUG: the marker is set and its reason is in the closed "
+                                          "set, so the content gate must allow it -- otherwise the "
+                                          "refusal could be 'nothing to write', which is FALSE here)");
+        }
+      }
+    }
+
     const bool absent = !FileUtils::exists(probePath);    logLine("cache write self-test: " + to_string(declared) + " outcome(s) declared, "
             + to_string(refused) + " refused by the state gate, " + to_string(allowed)
             + " state-writable; probe file " + (absent ? "absent" : "PRESENT")
             + "; encoding probe (non-ASCII name) written+read-back+removed ["
             + ((encWrote && encReadBack && encRemoved) ? "ok" : "FAIL") + "]"
-            + "; (a)(b) no marker / (c) from-file retirement / (d) control / (e) our-gap / (f) all-reject->measured retracts / (g)(h) fold AND+mismatch ["
+            + "; (a)(b) no marker / (c) from-file retirement / (d) measured control / (e) our-gap / (f) all-reject->measured retracts / (g)(h) fold AND+mismatch / (i) unmeasured marker refused by name ["
             + (verdictOk ? "ok" : "FAIL: " + verdictBad) + "]"
             + " [" + ((ok && absent && encWrote && encReadBack && encRemoved && verdictOk) ? "ok" : "FAIL") + "]"
             + (ok ? "" : " first problem: " + firstBad));
