@@ -1748,10 +1748,28 @@ namespace VulkanTuner {
         const bool ok = (f.mask == want) && (f.mismatch == wantMismatch)
                      && (!wantMismatch || f.mismatchAcc == wantAcc);
         if (!ok && foldBad.empty()) {
-          foldBad = string(what) + ": mask size " + to_string(f.mask.size()) + ", mismatch "
+          // 🔴 The message must name WHAT differs.  Reporting only (size, mismatch, acc) was blind to the
+          // one failure the AND rule can produce: `&` -> `|` keeps the size, the mismatch flag and the
+          // accumulated length IDENTICAL and changes only the BYTES, so the first version printed
+          // "got size 2, mismatch false, acc 0 (want size 2, mismatch false, acc 0)" -- a message whose
+          // actual and expected halves read the same, which is exactly the "error string that does not
+          // name the clause" failure this project refuses.
+          string detail;
+          if (f.mask.size() != want.size()) {
+            detail = "mask size " + to_string(f.mask.size()) + " (want " + to_string(want.size()) + ")";
+          }
+          else {
+            std::size_t k = 0;
+            while (k < want.size() && f.mask[k] == want[k]) { k++; }
+            detail = (k == want.size())
+                   ? "the mask bytes match, so the MISMATCH rule is what differs"
+                   : ("first differing byte " + to_string(k) + ": got " + to_string((int) f.mask[k])
+                      + ", want " + to_string((int) want[k]));
+          }
+          foldBad = string(what) + ": " + detail + " (mismatch "
                   + (f.mismatch ? "true" : "false") + ", acc " + to_string(f.mismatchAcc)
-                  + " (want size " + to_string(want.size()) + ", mismatch "
-                  + (wantMismatch ? "true" : "false") + ", acc " + to_string(wantAcc) + ")";
+                  + "; want mismatch " + (wantMismatch ? "true" : "false") + ", acc "
+                  + to_string(wantAcc) + ")";
         }
       };
       wantMask("(g) the first context IS the fold", foldRowInstalled(std::vector<uint8_t>(), false, m10),
