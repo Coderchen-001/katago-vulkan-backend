@@ -350,23 +350,48 @@ namespace VulkanTuner {
       return d.rowSource == "measured";
     }
 
-    // The EXTRA conditions a table row may name: a CLOSED SET, each entry owning the sentence it
-    // refuses with.  Why the sentence lives here and not in the writer: the generic state-gate
-    // message ("not in a writable state ... only a completed measurement or a structural all-reject
-    // may be remembered") is TRUE for a flag flip but MISLEADING for this condition -- it lists
-    // `structural-all-reject` as allowed while refusing one -- and a refusal that names the wrong
-    // clause sends the next reader to the wrong code.  `refusal == nullptr` means "the state gate's
-    // own sentence is the right one" (`device-only` has no sentence of its own: the outcome really is
-    // not in a writable state when a rejection came from our own gap).
+    // The registered marker of the provenance refusal, as its OWN literal (W3b).  Why a named constant
+    // rather than a literal inside the sentence: the acceptance leg (A36) greps exactly this string, the
+    // self-test asserts against the same string the writer prints, and R42(e) pins that the two
+    // spellings are EQUAL -- all three only work if the marker is one literal in one place.  The refusal
+    // sentence below starts with it, so a reader who greps the marker finds the clause that owns it.
+    const char* const MEASURED_MARKER = "not this process's own measurement";
+
+    // The EXTRA conditions a table row may name: a CLOSED SET, each entry owning the WHOLE sentence it
+    // refuses with.  Why the sentence lives here and not in the writer: the generic state-gate message
+    // ("not in a writable state ... only a completed measurement or a structural all-reject may be
+    // remembered") is accurate for an outcome that is simply not writable, but it is FALSE for a named
+    // condition -- it lists `structural-all-reject` as allowed while refusing exactly that.  A refusal
+    // that names the wrong clause sends the next reader to the wrong code.
+    //   🔴 W3b: a PREFIX was not enough.  With a prefix, the rest of the sentence lived in the writer,
+    // hanging off the `refusal != nullptr` branch -- so the NEXT condition to gain a sentence would have
+    // inherited the provenance narrative.  Each entry now returns its own complete sentence, and
+    // `refusal == nullptr` stays as the fail-closed default a new entry gets until somebody decides
+    // what it should say (the writer then uses the generic sentence, which is why an entry may only be
+    // left null when that sentence is TRUE for it).
     struct ConditionSpec {
       const char* name;
       bool (*holds)(const Decision &);
-      const char* refusal;
+      string (*refusal)(const Decision &);
     };
     const ConditionSpec CONDITION_SPECS[] = {
-      { "device-only",   [](const Decision & x) { return x.allRejectReasonsAreDevice; }, nullptr },
+      { "device-only", [](const Decision & x) { return x.allRejectReasonsAreDevice; },
+        [](const Decision & x) {
+          // G-D20's own truth: the refusal is about OUR gap, and the sentence this replaces said the
+          // outcome "may be remembered" while refusing it.
+          return "at least one rejection reason came from OUR implementation gap (our-gap="
+               + to_string(x.install.dropped_unsupported_our_gap) + "), and our own gap is not a "
+                 "property of this device -- so the coarse outcome 'structural-all-reject' is recorded "
+                 "WITHOUT a durable verdict (G-D20)";
+        } },
       { "measured-here", [](const Decision & x) { return negativeProvable(x); },
-        "not this process's own measurement" },
+        [](const Decision & x) {
+          return string(MEASURED_MARKER) + ": this decision concluded '" + x.outcome
+               + "' from a candidate set it did not produce itself (row source '" + x.rowSource
+               + "'), and only a candidate set THIS process measured may be remembered as a durable "
+                 "verdict -- a file says what some other run saw, and a hand-made or reflowed file says "
+                 "nothing at all";
+        } },
     };
 
     // Fail-closed lookup: an unknown name is never satisfied AND has no sentence to quote, so a typo
@@ -537,10 +562,15 @@ namespace VulkanTuner {
 
     // WHICH condition refused (W3-P1): the writer's message must name its clause, the same way
     // rowsForWrite's mismatch names the sizes and the fold's message names the differing byte.
-    // nullptr means "no NAMED condition is the reason" -- an unwritable row, an undeclared outcome,
-    // or an unknown condition name -- and in all three the state gate's own sentence is the accurate
-    // one (fail-closed: a name this build does not know cannot claim a refusal message).
-    const ConditionSpec * firstUnsatisfiedCondition(const Decision & d) {
+    // nullptr means "no NAMED condition is the reason" -- an unwritable row, an undeclared outcome, or
+    // an unknown condition name -- and in all three the state gate's own sentence applies, EXCEPT that
+    // W3b splits the unknown-name case out: `unknownName` is filled in for it, because there the generic
+    // sentence is false in the same way it was false for provenance (the outcome it refuses is the one
+    // the sentence says may be remembered).
+    const ConditionSpec * firstUnsatisfiedCondition(const Decision & d, string * unknownName = nullptr) {
+      if (unknownName != nullptr) {
+        unknownName->clear();
+      }
       for (const DecisionOutcomeSpec & o : DECISION_OUTCOMES) {
         if (d.outcome != o.outcome) {
           continue;
@@ -550,7 +580,15 @@ namespace VulkanTuner {
         }
         for (const string & name : splitConditions(o.condition)) {
           const ConditionSpec * c = findCondition(name);
-          if (c == nullptr || !c->holds(d)) {
+          if (c == nullptr) {
+            // Fail-closed: a name this build does not implement is never satisfied, and the writer says
+            // so in its own words rather than borrowing a sentence that contradicts it.
+            if (unknownName != nullptr) {
+              *unknownName = name;
+            }
+            return nullptr;
+          }
+          if (!c->holds(d)) {
             return c;
           }
         }
@@ -810,6 +848,23 @@ namespace VulkanTuner {
       // rather than pretending the check happened.
       vector<string> absentKeys;
     };
+
+    // ── W3b: MAY THE LOADER BELIEVE A FILE'S NEGATIVE ENTRY? ─────────────────────────────────────────
+    // The read side of the same rule W3-P1 closed on the write side.  Two channels share this loader and
+    // they are NOT the same kind of statement:
+    //   cache  -- this device's own MEMORY.  It is key-checked (fingerprint, version, policy, baseline,
+    //             the outer keys, ROWSET_HASH), it is the file the writer maintains, and the operator's
+    //             "I do not trust this" switch is KATAGO_VK_TUNE_RETUNE.  Believing it is the DESIGN.
+    //   IMPORT -- a REQUEST (a reflow/development channel): the outer keys and ROWSET_HASH are skipped
+    //             for it, so it is not even key-checked.  The write side already refuses to mint a
+    //             verdict from one ("an IMPORT is not evidence that we measured this key"); the same
+    //             sentence has to hold on the read side, or a hand-passed file would decide for this
+    //             device by simply asserting it.
+    // Named and printable for the same reason `negativeProvable` is: R43 pins that the ONE adoption site
+    // CITES this predicate instead of re-deriving the rule from a boolean expression in place.
+    bool negativeAdoptable(const RowsFile& file, bool fromImport) {
+      return !fromImport && file.negative && file.rows.empty();
+    }
 
     // Read the whole file rather than using FileUtils::readFile: that helper throws on failure
     // and this path must return an error string instead (every load failure here is fail-open +
@@ -1295,20 +1350,25 @@ namespace VulkanTuner {
       // measurement or a structural all-reject gets past here (see DECISION_OUTCOMES), and an
       // outcome nobody declared is refused too (fail-closed).
       //
-      // W3-P1: when a NAMED condition is what refused, the message names THAT condition instead of
-      // reciting the generic sentence -- which says the opposite here ("a structural all-reject may be
-      // remembered" while refusing exactly one) and would send the next reader to the wrong code.  The
-      // provenance sentence is deliberately INDEPENDENT of the content refusal below ("nothing to
-      // write: no rows and no negative entry"): in this state that sentence is FALSE -- the negative
-      // entry IS there, it is simply not provable -- and the acceptance leg greps for THIS one by its
-      // registered marker, so a writer that fell through to the other sentence must not look green.
-      const ConditionSpec * bad = firstUnsatisfiedCondition(d);
-      if (bad != nullptr && bad->refusal != nullptr) {
-        err = string(bad->refusal) + ": this decision concluded '" + d.outcome
-              + "' from a candidate set it did not produce itself (row source '" + d.rowSource
-              + "'), and only a candidate set THIS process measured may be remembered as a durable "
-                "verdict -- a file says what some other run saw, and a hand-made or reflowed file says "
-                "nothing at all";
+      // W3-P1/W3b: when a NAMED condition is what refused, the message IS that condition's own sentence
+      // (it lives in CONDITION_SPECS), because the generic one says the opposite here ("a structural
+      // all-reject may be remembered" while refusing exactly one) and would send the next reader to the
+      // wrong code.  The provenance sentence is deliberately INDEPENDENT of the content refusal below
+      // ("nothing to write: no rows and no negative entry"): in this state that sentence is FALSE -- the
+      // negative entry IS there, it is simply not provable -- and the acceptance leg greps for THIS one
+      // by its registered marker, so a writer that fell through to the other sentence must not look green.
+      // The third case is an unknown condition name (W3b): `unknownCondition` comes back non-empty, and
+      // the generic sentence is false there too (same reason as provenance), so it gets the internal one.
+      string unknownCondition;
+      const ConditionSpec * bad = firstUnsatisfiedCondition(d, &unknownCondition);
+      if (!unknownCondition.empty()) {
+        err = "internal: this build has no rule for the condition '" + unknownCondition
+              + "' named by the '" + d.outcome + "' table row, and an unimplemented condition is never "
+                "satisfied -- so the write is refused (the closed set in CONDITION_SPECS and R42's "
+                "both-sides clause are what keep this from being a silent fail-open)";
+      }
+      else if (bad != nullptr && bad->refusal != nullptr) {
+        err = bad->refusal(d);
       }
       else {
         err = "the decision is not in a writable state ('" + d.outcome + "'): only a completed "
@@ -1774,17 +1834,11 @@ namespace VulkanTuner {
     // The registered marker, READ OUT OF THE TABLE rather than spelled a second time here: the
     // self-test must assert the sentence the writer actually prints, so a rename cannot leave it
     // testing a string nobody prints -- and the .cpp keeps ONE occurrence of the literal, which is
-    // also what section 9.4 counts.  An empty marker is a FAIL, never a silent skip (a `find("")`
-    // would otherwise pass and this whole case would look green while asserting nothing).
-    const ConditionSpec * mhSpec = findCondition("measured-here");
-    const char * measuredMarker = (mhSpec != nullptr && mhSpec->refusal != nullptr) ? mhSpec->refusal : "";
-    if (measuredMarker[0] == '\0') {
-      verdictOk = false;
-      if (verdictBad.empty()) {
-        verdictBad = "the `measured-here` condition has no refusal sentence, so a refusal cannot name "
-                     "its clause (the self-test would be asserting an empty marker)";
-      }
-    }
+    // also what section 9.4 counts.  🔴 W3b: the marker is now a NAMED CONSTANT, because each condition's
+    // sentence is a whole sentence this table owns; "the table lost its sentence" can no longer happen
+    // silently (the constant is compile-time non-empty), and the checks that the TABLE still carries the
+    // condition and that its sentence equals the one the harness greps are R42's (b) and (e).
+    const char * measuredMarker = MEASURED_MARKER;
 
     { // (a) an IMPORTed set may not create a durable verdict
       Decision d;
@@ -1872,7 +1926,11 @@ namespace VulkanTuner {
       d.install.dropped_unsupported_our_gap = 1;
       d.allRejectReasonsAreDevice = false;
       verdictCase("(e) our-gap all-reject", d, Decision::FinalizeVerdict::OurGap,
-                  Decision::FinalizeVerdict::OurGap, false, "not in a writable state");
+                  Decision::FinalizeVerdict::OurGap, false,
+                  // W3b: the refusal must be `device-only`'s OWN sentence.  It used to assert the generic
+                  // one, which said this outcome "may be remembered" while refusing it -- the same class of
+                  // false sentence the provenance condition was fixed for in W3-P1.
+                  "came from OUR implementation gap");
     }
     { // (f) THE RACE, on ONE decision: the first call concludes "device-only all-reject" and sets OUR
       // marker; a row then installs (the (b) window: another context's install lands between the install
@@ -2322,8 +2380,25 @@ namespace VulkanTuner {
             d->rows = file.rows;
             d->rowCount = d->rows.size();
             d->rowSource = fromImport ? "import" : "cache";
-            d->cacheState = file.negative ? "negative" : "loaded";
-            d->negative = file.negative && file.rows.empty();
+            // 🔴 ONE fact, ONE spelling (W3b): `cacheState` and `negative` used to be two independent
+            // expressions of the same question, so limiting only one of them would have printed
+            // `cache_state=negative` next to `d->negative == false` -- two readings of ONE run that
+            // contradict each other.  Both derive from the named predicate now.
+            const bool adoptedNegative = negativeAdoptable(file, fromImport);
+            d->cacheState = adoptedNegative ? "negative" : "loaded";
+            d->negative = adoptedNegative;
+            if (fromImport && file.negative && file.rows.empty()) {
+              // The marker is NOT adopted, and that must be LOUD: with an empty row set this file is
+              // byte-shape-identical to the trap file that says neither ROW nor NEGATIVE, so
+              // `cache_state=loaded` + `rows=0` cannot tell them apart -- the loud is the only
+              // discriminator, which is why the acceptance leg asserts on it.  (Registered as a counted
+              // line: the smoke's A27 parses the literal below, so it must stay on ONE source line.)
+              logLine("WARNING: " + string(loadKind) + " carries a NEGATIVE entry ("
+                      + file.negativeReason + ")"
+                      + " but NEGATIVE entry ignored: an IMPORT is a request, not a durable verdict"
+                      + " (a cache file is this device's memory and is key-checked; an IMPORT file is "
+                        "neither)");
+            }
             if (d->negative) {
               // Carried onto the Decision, not just into the note: EXPORT has to re-emit the
               // marker (it writes what a cache file would contain), and the cache writer has to
