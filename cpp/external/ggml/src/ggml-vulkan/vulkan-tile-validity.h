@@ -149,6 +149,13 @@ enum vk_tune_row_drop {
 // name "the" required one.  A dead row -- installed on a variant production never resolves,
 // or on a variant that is empty while the other is not -- is what the per-row hit assertion
 // catches.
+// 🔴 OWNERSHIP (W2): EVERY field of this struct is written by the BACKEND.  Anything the CALLER owns
+// -- today the per-row truth buffer -- is an ARGUMENT of the install call, never a member: the
+// install entry resets this struct as a whole (`*result = vk_tune_install_result {}`), and that
+// reset has to stay correct for every field added later.  A member the backend does not own would be
+// silently cleared there (measured: adding `row_installed` as a member would have been wiped at
+// ggml-vulkan.cpp:21143 before a single byte could be written), so the OWNERSHIP BOUNDARY IS THE
+// TYPE/ARGUMENT SPLIT -- not a comment somebody has to remember.
 struct vk_tune_install_result {
     unsigned declared;
     unsigned installed;
@@ -163,6 +170,11 @@ struct vk_tune_install_result {
     unsigned dropped_build_failed;
     unsigned partial;          // subset of `installed` (see above)
     unsigned variant_failed;   // (row, target) build failures (see above)
+    // W2: the context's ordinal (ggml-vulkan.cpp's `tune_ctx_ordinal`, assigned once at context
+    // construction).  The shell records WHICH contexts contributed to a written file -- an IDENTITY,
+    // never a count -- so the file can say "written by ctx 0,1" and a context that arrives after the
+    // write can be told "this file does not contain your rows" without anybody guessing.
+    unsigned ctx_ordinal;
 };
 
 // ---------------------------------------------------------------------------

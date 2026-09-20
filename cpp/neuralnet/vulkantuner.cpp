@@ -1086,10 +1086,12 @@ namespace VulkanTuner {
     return ::ggml_backend_vk_tune_fingerprint(backend, out, outSize, sgOut);
   }
 
-  bool backendInstallRows(ggml_backend_t backend, const vk_tune_row_spec* rows, size_t nRows, string& err,
+  bool backendInstallRows(ggml_backend_t backend, const vk_tune_row_spec* rows, size_t nRows,
+                          unsigned char* rowInstalled, unsigned rowInstalledCap, string& err,
                           vk_tune_install_result& out) {
     vector<char> errBuf(512, '\0');
-    const bool ok = ::ggml_backend_vk_tune_install_rows(backend, rows, nRows, errBuf.data(), errBuf.size(), &out);
+    const bool ok = ::ggml_backend_vk_tune_install_rows(backend, rows, nRows, errBuf.data(), errBuf.size(),
+                                                        rowInstalled, rowInstalledCap, &out);
     if (!ok) {
       err = string(errBuf.data());
     }
@@ -1865,8 +1867,17 @@ namespace VulkanTuner {
     // the one thing it must never do is change behaviour without saying so (lesson #46).
     const vk_tune_row_spec* rows = decision->rows.empty() ? nullptr : decision->rows.data();
     vk_tune_install_result installed {};
+    // W2 (decision C): the backend fills a SCRATCH buffer, never the fold itself -- it zeroes what it
+    // is handed (that is what makes "not touched" distinguishable from "installed"), so handing it
+    // `decision->rowInstalled` would erase the fold on every new context.  One byte per declared row,
+    // in the same order, sized exactly (the backend refuses a short one instead of truncating).
+    vector<uint8_t> thisCtx(decision->rows.size(), 0);
     string err;
-    if (!backendInstallRows(backend, rows, decision->rows.size(), err, installed)) {
+    if (!backendInstallRows(backend, rows, decision->rows.size(),
+                            thisCtx.empty() ? nullptr : thisCtx.data(), (unsigned) thisCtx.size(),
+                            err, installed)) {
+      // A FAILED install owns no per-row truth: the buffer may be half-filled, and folding it would
+      // claim this context contributed rows when it did not.
       logLine("WARNING: install failed for " + decision->deviceName + ": " + err
               + " (fail-open: this context uses the stock heuristic)");
       return;
@@ -1891,6 +1902,53 @@ namespace VulkanTuner {
       // variant anywhere disqualifies the stronger claim.
       decision->install.partial = std::max(decision->install.partial, installed.partial);
       decision->install.variant_failed = std::max(decision->install.variant_failed, installed.variant_failed);
+    }
+    // W2 (decision C): the durable PER-ROW set is the AND of every context's set -- the aggregates
+    // above can only bound it, so the write side reads THIS.  The first successful context IS the
+    // fold; every later one may only confirm a row (a row installed here and dropped there is not
+    // durable).  A size mismatch cannot happen (the row set is fixed per decision); it is handled
+    // FAIL-CLOSED -- an empty set writes nothing -- rather than by folding mismatched vectors.
+    if (!decision->rowInstalledSeen) {
+      decision->rowInstalled = thisCtx;
+      decision->rowInstalledSeen = true;
+    } else if (decision->rowInstalled.size() == thisCtx.size()) {
+      for (size_t i = 0; i < thisCtx.size(); i++) {
+        decision->rowInstalled[i] = (uint8_t) (decision->rowInstalled[i] & thisCtx[i]);
+      }
+    } else {
+      logLine("WARNING: the durable per-row install set has " + to_string(decision->rowInstalled.size())
+              + " byte(s) but this context declared " + to_string(thisCtx.size())
+              + " row(s): the per-row set is cleared (fail-closed: nothing of it will be written)");
+      decision->rowInstalled.assign(thisCtx.size(), 0);
+      decision->rowInstalledSeen = true;
+    }
+    // W2 (decision B): the contexts that contributed, by the backend's own ordinal -- an IDENTITY
+    // list.  It is what the decision log can print as "written by ctx 0,1" and what a LATE context is
+    // told about below.
+    decision->ctxOrdinals.push_back(installed.ctx_ordinal);
+    // G-D20 (t3-shell-plan.md 6.9): "deterministically all-rejected" is a claim about the DEVICE only
+    // when no refusal came from OUR implementation gap.  The counts above are MAX-folded, so one
+    // context is enough to disqualify the claim for the whole key -- the safe direction, the same one
+    // `installed` takes with its min.  `dropped_build_failed` is deliberately NOT part of this gate
+    // (the recorded formula is the three below); if a site ever starts counting row-level build
+    // failures there, this gate has to be revisited in the same batch.
+    decision->allRejectReasonsAreDevice = decision->install.declared > 0
+                                       && decision->install.dropped_unsupported_our_gap == 0
+                                       && decision->install.dropped_illegal == 0
+                                       && decision->install.variant_failed == 0;
+    // W2 (decision B/E): a context that arrives AFTER the once point has already fired is told the
+    // truth, and the truth is the tri-state the once point recorded -- never a guess:
+    //   Wrote         -> the file exists and does NOT contain this context's rows;
+    //   RefusedByGate -> no file was written at all (nothing was silently lost);
+    //   NotAttempted  -> nothing to say: the hook has not run yet, which is the normal order.
+    // "Trigger and consume": this REPORTS.  There is no retry, by design.
+    if (decision->writeState != Decision::WriteState::NotAttempted) {
+      logLine(string("WARNING: ctx=") + to_string(installed.ctx_ordinal)
+              + " installed after the cache write for " + decision->deviceName + ": "
+              + (decision->writeState == Decision::WriteState::Wrote
+                   ? ("the written file " + decision->writeTarget
+                      + " does NOT contain this context's rows")
+                   : ("no file was written (the write gate refused: " + decision->writeRefusal + ")")));
     }
     if (decision->imported && installed.declared > 0) {
       logLine("IMPORT installed " + to_string(installed.installed) + " of "

@@ -21123,7 +21123,9 @@ static bool ggml_vk_tuned_row_build(vk_device & device, const vk_tune_row_spec &
 // a bare drop counter has no denominator -- which is why the counts are per reason and
 // why "installed 0 of N rows" is its own line (section 6.7 B1-补①).
 bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row_spec * rows, size_t n_rows,
-                                       char * err, size_t err_size, vk_tune_install_result * result) {
+                                       char * err, size_t err_size,
+                                       unsigned char * row_installed, unsigned row_installed_cap,
+                                       vk_tune_install_result * result) {
     const auto set_err = [&](const std::string & msg) {
         if (err != nullptr && err_size > 0) {
             snprintf(err, err_size, "%s", msg.c_str());
@@ -21140,14 +21142,38 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
     };
 
     if (result != nullptr) {
+        // W2: this resets the WHOLE struct, and that is correct only because every field of
+        // vk_tune_install_result is written by THIS function (see the ownership note in
+        // vulkan-tile-validity.h).  The caller's per-row truth buffer is an ARGUMENT for exactly
+        // that reason -- as a member it would be wiped right here, and so would the next
+        // caller-owned field somebody adds.
         *result = vk_tune_install_result {};
         result->declared = (unsigned) n_rows;
+    }
+
+    // W2 (decision C): zero the CALLER's per-row truth buffer BEFORE the first write, so "not
+    // touched" can never be read as "installed"; then REFUSE -- never truncate -- when it cannot
+    // hold one byte per declared row, because a short buffer silently under-reports installs.
+    // The caller sizes this buffer exactly, so the refusal only fires on a programming error, and
+    // it refuses the whole install (the shell then fails open to the stock heuristic and says so).
+    if (row_installed != nullptr && row_installed_cap > 0) {
+        memset(row_installed, 0, row_installed_cap);
+    }
+    if (n_rows > row_installed_cap) {
+        return refuse("the per-row install buffer holds " + std::to_string(row_installed_cap)
+                      + " row(s) but " + std::to_string(n_rows) + " were declared: refusing instead "
+                      "of truncating (a short buffer silently under-reports installs)");
     }
 
     if (!ggml_backend_is_vk(backend)) {
         return refuse("not a Vulkan backend");
     }
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    if (result != nullptr) {
+        // The context identity travels with the counts.  The shell cannot see contexts it did not
+        // create, and "which contexts contributed to this file" is what a late install must be told.
+        result->ctx_ordinal = ctx->tune_ctx_ordinal;
+    }
 
     // One install per context, before the first shape lookup.  A later install would be
     // applied to a table the first query already froze (R3) -- and once pre-record starts
@@ -21365,6 +21391,14 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
             drop_row(i, VK_TUNE_ROW_DROP_UNSUPPORTED,
                      "the device has no stock (family, acc) buckets for this row");
             continue;
+        }
+        // W2 (decision C): the PER-ROW truth, at the same index the caller handed the row in at.
+        // Written outside the `result != nullptr` branch on purpose: this buffer is the caller's
+        // ARGUMENT, not a field of `result`, and every caller that wants the per-row set passes one.
+        // Every `continue` above (illegal / unsupported / build-failed / no-stock-buckets) leaves the
+        // byte at 0, so the buffer partitions the declared set exactly the way the counts do.
+        if (row_installed != nullptr) {
+            row_installed[i] = 1;
         }
         if (result != nullptr) {
             result->installed++;

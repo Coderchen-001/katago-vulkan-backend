@@ -22,6 +22,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>   // W2: Decision::onFirstEval carries the once hook as DATA (std::function),
+                        // not as a fifth interface name -- R1 counts NAMES, and the hook's body stays
+                        // in vulkantuner.cpp so the backend never grows a control surface (R5/R6).
 #include <memory>
 #include <string>
 #include <vector>
@@ -48,8 +51,17 @@ size_t ggml_backend_vk_tune_fingerprint(ggml_backend_t backend, char* out, size_
 // declared / installed / dropped_*.  The shell needs them because "every row in the file
 // is hit at least once" is graded against the rows that INSTALLED, and because the write
 // side (step 5) may only write rows this process really installed.
+//
+// `rowInstalled` / `rowInstalledCap` (W2) are the CALLER'S per-row truth buffer: the
+// backend zeroes it, then writes 1 at the index of every row that installed.  It is a
+// PARAMETER and not a member of `out` because `out` is reset as a whole on entry, and that
+// reset is correct only while every field of `out` belongs to the backend (see the
+// ownership note on vk_tune_install_result in vulkan-tile-validity.h).  A buffer that cannot
+// hold one byte per declared row is refused loudly -- never truncated.
 bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row_spec* rows, size_t nRows,
-                                       char* err, size_t errSize, vk_tune_install_result* out);
+                                       char* err, size_t errSize,
+                                       unsigned char* rowInstalled, unsigned rowInstalledCap,
+                                       vk_tune_install_result* out);
 
 namespace VulkanTuner {
 
@@ -198,6 +210,48 @@ namespace VulkanTuner {
     // express the per-row intersection, so this is a sound bound rather than the set itself.
     vk_tune_install_result install {};
     bool installSeen = false;
+    // W2 (decision C): the PER-ROW truth, the same order as `rows` (index i describes rows[i]),
+    // folded with AND across this device's contexts -- a row is durable only if EVERY context
+    // installed it.  🔴 The aggregate fields above can only BOUND this set (min/max), so the WRITE
+    // SIDE READS THIS SET: the aggregates keep their old meaning (a conservative upper bound) and are
+    // NOT the truth.  Filled by installForHandle, one byte per declared row, zeroed by the backend.
+    std::vector<uint8_t> rowInstalled;
+    bool rowInstalledSeen = false;
+    // W2 (decision B): the contexts that contributed, in install order, by the backend's ordinal.
+    // An IDENTITY list, never a count: it is what lets a late install be told "this file does not
+    // contain your rows" instead of guessing.
+    std::vector<uint32_t> ctxOrdinals;
+    // W2 (decision E, AMENDED to 2' after source review): the once hook.  Its body lives entirely in
+    // vulkantuner.cpp, so this stays DATA: no fifth interface name (R1), no control surface in the
+    // backend (R5/R6).
+    //
+    // 🔴 It takes the Decision BY REFERENCE and is CALLED WHILE THE LOCK IS HELD (the backend's
+    // getOutput takes it and calls it inside the same critical section that now also covers
+    // installForHandle).  Why not the original `void()` + "take under the lock, call OUTSIDE it, then
+    // re-lock": that shape has a SILENT window -- an install arriving between the unlock and the
+    // re-lock reads `writeState == NotAttempted`, so its rows are neither written into the file nor
+    // reported as late.  Doing the write AND the tri-state in ONE critical section removes the window
+    // instead of patching it, and the price is one small file write under the lock, once per device.
+    std::function<void(Decision&)> onFirstEval;
+    // Set (under the lock) when the hook is TAKEN.  A moved-from std::function is empty exactly like a
+    // never-set one, so the two cases need this flag to stay distinguishable: empty + NOT taken = "this
+    // context's first eval beat its own install" (LOUD, with ctx=); empty + taken = another thread
+    // already consumed it (silent -- N-1 extra lines would be noise, and the late install still has
+    // its own loud).
+    bool onceHookTaken = false;
+    // The resolved policy, copied at decision time so the hook can capture it BY VALUE: the callback is
+    // built on the install path (which is what makes "callback empty" mean "install has not run yet")
+    // and called from the backend's eval path, which knows nothing about policies.
+    TunePolicy tunePolicy;
+    // W2 (decision E): what happened at that once point, so a LATE install says the right thing
+    // instead of inventing one.  NotAttempted = the hook never ran; Wrote = a file exists and does
+    // NOT contain the late context's rows; RefusedByGate = no file was written at all.  "Trigger and
+    // consume": a gate refusal is FINAL -- there is deliberately NO retry, because a retry loop would
+    // turn one decision into repeated attempts.
+    enum class WriteState { NotAttempted, Wrote, RefusedByGate };
+    WriteState writeState = WriteState::NotAttempted;
+    std::string writeRefusal;     // the gate that refused, when writeState == RefusedByGate
+    std::string writeTarget;      // the path the once point wrote (or refused to write), for the log
     std::string note;             // one short human-readable clause for the log line
   };
 
