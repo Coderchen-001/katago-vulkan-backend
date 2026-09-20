@@ -341,8 +341,37 @@ namespace VulkanTuner {
     // and reads as "this key is already decided" (see the writer comment in formatRowsFileImpl),
     // so the CACHE path must refuse to create one while EXPORT may still write it (that is how
     // the format is demonstrated in tests).
+    // W2: THE effective row set this process may write down -- ONE spelling, used by BOTH the write
+    // gate below and the formatter.  Why one spelling and not two: the gate answers "is there anything
+    // to write?" and the formatter emits it, so if they disagreed about a set whose rows were all
+    // dropped, the gate would say yes and the file would carry `ROWS 0` with no NEGATIVE -- which the
+    // reader treats as "this key is already decided", i.e. tuning suppressed for ever.
+    //
+    // The filter IS the durable per-row set (decision C), and it applies ONLY when an install really
+    // happened (`rowInstalledSeen` AND a mask whose size matches).  Without that -- an IMPORTed set that
+    // was never installed, the EXPORT demonstration path, the self-test's synthetic decisions -- the
+    // DECLARED rows are returned exactly as before, so an absent mask can never silently turn an export
+    // into an empty file.  The CACHE path cannot reach the unfiltered case either: with no install the
+    // accounting is empty, the outcome stays "running", and the declared table refuses the write before
+    // either caller looks at the rows.
+    vector<vk_tune_row_spec> rowsForWrite(const Decision& d) {
+      if (!d.rowInstalledSeen || d.rowInstalled.size() != d.rows.size()) {
+        return d.rows;
+      }
+      vector<vk_tune_row_spec> out;
+      for (size_t i = 0; i < d.rows.size(); i++) {
+        if (d.rowInstalled[i] != 0) {
+          out.push_back(d.rows[i]);
+        }
+      }
+      return out;
+    }
+
     bool cacheEntryWritable(const Decision & d) {
-      if (!d.rows.empty()) {
+      // W2: the gate now asks about the rows this process may actually WRITE (the durable per-row set
+      // when an install happened, the declared set otherwise) -- the SAME helper the formatter uses, so
+      // "there is something to write" and "here is what gets written" cannot disagree.
+      if (!rowsForWrite(d).empty()) {
         return true;
       }
       return d.negative && negativeReasonKnown(d.negativeReason);
@@ -993,6 +1022,17 @@ namespace VulkanTuner {
     // The serialised form.  Kept next to the parser so a field added to one is obviously
     // missing from the other.
     string formatRowsFileImpl(const Decision& d) {
+      // W2 (decisions C/D): what gets written is the DURABLE PER-ROW SET, not the declared set -- a row
+      // this process did not install must not be written down (w2-preview section 5 item 4: two
+      // contexts with different subsets write the INTERSECTION, and dropped rows are NOT in the file;
+      // ruling D asserts rowsDropped == 0 on our own files).  The rule itself lives in rowsForWrite(),
+      // which the write GATE also calls, so "there is something to write" and "here is what gets
+      // written" cannot drift apart.
+      //
+      // 🔴 The hash below is computed from the rows ACTUALLY EMITTED, not from d.rows: the reader
+      // compares the declared hash with the hash of what it parsed, so a filtered file carrying the
+      // unfiltered hash would refuse to load -- i.e. a cache that silently never loads.
+      const vector<vk_tune_row_spec> rows = rowsForWrite(d);
       ostringstream os;
       os << "VERSION " << SCHEMA_VERSION << "\n";
       os << "TUNER_VERSION " << TUNER_VERSION << "\n";
@@ -1002,7 +1042,7 @@ namespace VulkanTuner {
       os << "MODEL " << d.modelIdentity << "\n";
       os << "BOARD " << d.nnXLen << "x" << d.nnYLen << "\n";
       os << "MAXBATCH " << d.maxBatchSize << "\n";
-      os << "ROWSET_HASH " << rowSetHash(d.rows) << "\n";
+      os << "ROWSET_HASH " << rowSetHash(rows) << "\n";
       os << "CREATED " << createdAtNow() << "\n";
       // The mode is written as READABLE TEXT even though the NAME carries only its hash: the name
       // routes, and this line is what refutes a hand-renamed or cross-machine-copied file.  It is
@@ -1015,19 +1055,22 @@ namespace VulkanTuner {
       // case -- neither -- is only reachable through EXPORT of an empty row set, which is
       // how the format is demonstrated in tests; the CACHE write path cannot create one
       // because cacheEntryWritable() refuses it before this function is called.
-      if (!d.rows.empty() && d.negative) {
+      // W2: this test now runs on the rows actually emitted.  When every row was dropped the emitted
+      // set is EMPTY and a NEGATIVE-only file is exactly the right statement -- which is the
+      // structural-all-reject outcome; the old `d.rows` spelling would have refused to write it.
+      if (!rows.empty() && d.negative) {
         throw StringError("VulkanTuner: refusing to write a file with both ROW and NEGATIVE"
                           " (one file = one key: the two are exclusive statements)");
       }
       // The writer enforces the SAME cap the parser does (MAX_ROWS_PER_FILE).  Refusing to
       // write an over-cap set is the only honest option: writing it would produce a file
       // that the reader then rejects, i.e. a cache that silently never loads.
-      if (d.rows.size() > MAX_ROWS_PER_FILE) {
+      if (rows.size() > MAX_ROWS_PER_FILE) {
         throw StringError("VulkanTuner: refusing to write more than "
                           + std::to_string(MAX_ROWS_PER_FILE) + " rows");
       }
-      os << "ROWS " << d.rows.size() << "\n";
-      for (const vk_tune_row_spec& r : d.rows) {
+      os << "ROWS " << rows.size() << "\n";
+      for (const vk_tune_row_spec& r : rows) {
         os << "ROW " << r.path << " " << r.src0_type << " " << r.src1_type
            << " " << r.key_m << " " << r.key_k
            << " " << r.geom.BM << " " << r.geom.BN << " " << r.geom.BK
