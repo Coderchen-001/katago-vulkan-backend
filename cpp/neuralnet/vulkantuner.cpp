@@ -1270,6 +1270,38 @@ namespace VulkanTuner {
   // is turned into a loud line.
   Decision::FinalizeVerdict finalizeOutcome(Decision& d);
 
+  // The durable per-row set, folded over this device's contexts.  `mask` carries one byte per declared
+  // row; `mismatch` means the accumulated mask and this context's mask describe different row sets --
+  // which CANNOT happen today (the row set is fixed per decision) and is therefore handled FAIL-CLOSED,
+  // by returning an empty mask of the NEW size.  🔴 `mismatchAcc` is only meaningful when `mismatch` is
+  // true (it is the OLD length, reported so the caller can name both numbers in its warning).
+  struct RowFold {
+    std::vector<uint8_t> mask;
+    bool mismatch;
+    std::size_t mismatchAcc;
+  };
+
+  // The COMPUTATION of the fold: no logging, no state.  The caller owns the Decision's fields and the
+  // ONE message (see the call site in installForHandle for why the message does not live here).
+  // Executed by the self-test's (g) and (h) cases -- (g) the per-row AND, (h) the mismatch fail-closed --
+  // which is what makes w2-preview.md's long-registered "flip & to |" mutation deterministic at all: the
+  // mask is written in the backend AFTER every `continue` and BEFORE the pipeline build
+  // (ggml-vulkan.cpp:21400-21401), so two contexts of one device normally agree and no smoke leg can
+  // separate `&` from `|`.
+  RowFold foldRowInstalled(const std::vector<uint8_t>& acc, bool seen, const std::vector<uint8_t>& ctx) {
+    if (!seen) {
+      return { ctx, false, 0 };
+    }
+    if (acc.size() == ctx.size()) {
+      std::vector<uint8_t> out(ctx.size());
+      for (size_t i = 0; i < ctx.size(); i++) {
+        out[i] = (uint8_t) (acc[i] & ctx[i]);   // AND: durable only if EVERY context installed this row
+      }
+      return { out, false, 0 };
+    }
+    return { std::vector<uint8_t>(ctx.size(), 0), true, acc.size() };
+  }
+
   void cacheWriteSelfTest(const TunePolicy & policy, const string & cacheDir) {
     TunePolicy readOnly = policy;
     readOnly.off = true;
@@ -1703,12 +1735,47 @@ namespace VulkanTuner {
       }
     }
 
+    { // (g)/(h) THE FOLD -- the two rules of the write path that had NO executor anywhere before this
+      // case: the durable per-row set is the AND of every context's set, and a size mismatch is
+      // fail-closed.  Neither can be built as a smoke leg (see foldRowInstalled's comment), so the
+      // judgement is executed here, which is also what makes the registered "flip & to |" mutation
+      // deterministic.  `mismatchReverse` pins the DIRECTION of the mismatch too: the new size is this
+      // context's, not the accumulated one's.
+      const std::vector<uint8_t> m11 = { 1, 1 }, m10 = { 1, 0 }, m01 = { 0, 1 }, one = { 1 };
+      string foldBad;
+      auto wantMask = [&](const char* what, const RowFold& f, std::vector<uint8_t> want,
+                          bool wantMismatch, std::size_t wantAcc) {
+        const bool ok = (f.mask == want) && (f.mismatch == wantMismatch)
+                     && (!wantMismatch || f.mismatchAcc == wantAcc);
+        if (!ok && foldBad.empty()) {
+          foldBad = string(what) + ": mask size " + to_string(f.mask.size()) + ", mismatch "
+                  + (f.mismatch ? "true" : "false") + ", acc " + to_string(f.mismatchAcc)
+                  + " (want size " + to_string(want.size()) + ", mismatch "
+                  + (wantMismatch ? "true" : "false") + ", acc " + to_string(wantAcc) + ")";
+        }
+      };
+      wantMask("(g) the first context IS the fold", foldRowInstalled(std::vector<uint8_t>(), false, m10),
+               { 1, 0 }, false, 0);
+      wantMask("(g) both contexts installed", foldRowInstalled(m11, true, m11), { 1, 1 }, false, 0);
+      wantMask("(g) THIS context dropped it", foldRowInstalled(m11, true, m10), { 1, 0 }, false, 0);
+      wantMask("(g) an EARLIER context dropped it", foldRowInstalled(m10, true, m11), { 1, 0 }, false, 0);
+      wantMask("(g) only the other row survived", foldRowInstalled(m01, true, m11), { 0, 1 }, false, 0);
+      wantMask("(h) mismatch clears to the NEW size", foldRowInstalled(m11, true, one), { 0 }, true, 2);
+      wantMask("(h) mismatch, other direction", foldRowInstalled(one, true, m11), { 0, 0 }, true, 1);
+      if (!foldBad.empty()) {
+        verdictOk = false;
+        if (verdictBad.empty()) {
+          verdictBad = "(g)/(h) fold: " + foldBad;
+        }
+      }
+    }
+
     const bool absent = !FileUtils::exists(probePath);    logLine("cache write self-test: " + to_string(declared) + " outcome(s) declared, "
             + to_string(refused) + " refused by the state gate, " + to_string(allowed)
             + " state-writable; probe file " + (absent ? "absent" : "PRESENT")
             + "; encoding probe (non-ASCII name) written+read-back+removed ["
             + ((encWrote && encReadBack && encRemoved) ? "ok" : "FAIL") + "]"
-            + "; (a)(b) no marker / (c) from-file retirement / (d) control / (e) our-gap / (f) all-reject->measured retracts ["
+            + "; (a)(b) no marker / (c) from-file retirement / (d) control / (e) our-gap / (f) all-reject->measured retracts / (g)(h) fold AND+mismatch ["
             + (verdictOk ? "ok" : "FAIL: " + verdictBad) + "]"
             + " [" + ((ok && absent && encWrote && encReadBack && encRemoved && verdictOk) ? "ok" : "FAIL") + "]"
             + (ok ? "" : " first problem: " + firstBad));
@@ -2286,19 +2353,22 @@ namespace VulkanTuner {
     // fold; every later one may only confirm a row (a row installed here and dropped there is not
     // durable).  A size mismatch cannot happen (the row set is fixed per decision); it is handled
     // FAIL-CLOSED -- an empty set writes nothing -- rather than by folding mismatched vectors.
-    if (!decision->rowInstalledSeen) {
-      decision->rowInstalled = thisCtx;
-      decision->rowInstalledSeen = true;
-    } else if (decision->rowInstalled.size() == thisCtx.size()) {
-      for (size_t i = 0; i < thisCtx.size(); i++) {
-        decision->rowInstalled[i] = (uint8_t) (decision->rowInstalled[i] & thisCtx[i]);
-      }
-    } else {
-      logLine("WARNING: the durable per-row install set has " + to_string(decision->rowInstalled.size())
+    // 🔴 W2 closure: the COMPUTATION moved into foldRowInstalled() (a pure function, defined next to the
+    // self-test that executes it).  The reason is the same one that made finalizeOutcome pure: the fold's
+    // two rules -- per-row AND, and "a mismatch clears the set" -- had NO executor anywhere, because the
+    // mask write sits after every `continue` and before the pipeline build in the backend
+    // (ggml-vulkan.cpp:21400-21401), so two contexts of one device normally agree and a smoke leg cannot
+    // be built for either rule.  A judgement can be, in-process.  The MESSAGE stays HERE, at the single
+    // call site: if it moved into the pure function's return value and a criterion asserted it, that
+    // WARNING would become a counted line by section 9.4's own definition (the smoke parses the
+    // self-test's summary string, so the text would be parsed transitively).
+    const RowFold folded = foldRowInstalled(decision->rowInstalled, decision->rowInstalledSeen, thisCtx);
+    decision->rowInstalled = folded.mask;
+    decision->rowInstalledSeen = true;
+    if (folded.mismatch) {
+      logLine("WARNING: the durable per-row install set has " + to_string(folded.mismatchAcc)
               + " byte(s) but this context declared " + to_string(thisCtx.size())
               + " row(s): the per-row set is cleared (fail-closed: nothing of it will be written)");
-      decision->rowInstalled.assign(thisCtx.size(), 0);
-      decision->rowInstalledSeen = true;
     }
     // W2 (decision B): the contexts that contributed, by the backend's own ordinal -- an IDENTITY
     // list.  It is what the decision log can print as "written by ctx 0,1" and what a LATE context is
