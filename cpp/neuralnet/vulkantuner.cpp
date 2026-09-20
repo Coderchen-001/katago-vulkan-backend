@@ -347,16 +347,33 @@ namespace VulkanTuner {
     // dropped, the gate would say yes and the file would carry `ROWS 0` with no NEGATIVE -- which the
     // reader treats as "this key is already decided", i.e. tuning suppressed for ever.
     //
-    // The filter IS the durable per-row set (decision C), and it applies ONLY when an install really
-    // happened (`rowInstalledSeen` AND a mask whose size matches).  Without that -- an IMPORTed set that
-    // was never installed, the EXPORT demonstration path, the self-test's synthetic decisions -- the
-    // DECLARED rows are returned exactly as before, so an absent mask can never silently turn an export
-    // into an empty file.  The CACHE path cannot reach the unfiltered case either: with no install the
-    // accounting is empty, the outcome stays "running", and the declared table refuses the write before
-    // either caller looks at the rows.
+    // 🔴 THREE states, and the third one is why this is not a two-line predicate:
+    //   Absent       (no install recorded)         -> the DECLARED rows.  The EXPORT demonstration path,
+    //                                                 an IMPORTed set that was never installed, the
+    //                                                 self-test's synthetic decisions: an ABSENT mask
+    //                                                 must never silently turn an export into an empty
+    //                                                 file.
+    //   Present      (mask and sizes match)        -> the rows the mask marks installed (decision C).
+    //   Inconsistent (mask, sizes DO NOT match)    -> the EMPTY set + loud.  This is an INTERNAL ERROR,
+    //                                                 and returning the declared rows here would write
+    //                                                 rows this process never installed -- exactly what
+    //                                                 section 5 item 4 / ruling D forbid.  The fold takes
+    //                                                 the same direction, and the two must not disagree:
+    //                                                 a fail-closed fold cancelled by a fail-open writer
+    //                                                 would be a fail-open feature with extra steps.
+    // The Inconsistent loud fires on each call (the gate and the formatter both ask).  That is accepted
+    // on purpose: it is an error that must be impossible, and "silent after the first line" is the
+    // failure mode this project keeps refusing.
     vector<vk_tune_row_spec> rowsForWrite(const Decision& d) {
-      if (!d.rowInstalledSeen || d.rowInstalled.size() != d.rows.size()) {
+      if (!d.rowInstalledSeen) {
         return d.rows;
+      }
+      if (d.rowInstalled.size() != d.rows.size()) {
+        logLine("WARNING: the durable per-row install mask has " + to_string(d.rowInstalled.size())
+                + " byte(s) for " + to_string(d.rows.size()) + " declared row(s): refusing to guess, so "
+                "NOTHING is written from this decision (fail-closed -- the mask and the row set must "
+                "describe the same set)");
+        return vector<vk_tune_row_spec>();
       }
       vector<vk_tune_row_spec> out;
       for (size_t i = 0; i < d.rows.size(); i++) {
