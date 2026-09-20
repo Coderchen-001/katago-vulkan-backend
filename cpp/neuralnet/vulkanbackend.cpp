@@ -2535,6 +2535,15 @@ struct ComputeHandle {
   ggml_tensor* outOwnership;
 
   bool padBatch;
+  // W2 (decision E, 2'): the eval point (`NeuralNet::getOutput`) needs THIS handle's own decision and a
+  // log channel.  Storing the decision beats looking it up by device index: "which device does this
+  // handle belong to" would then be a SECOND source of truth for a fact this object already has, and the
+  // lookup would need the map lock again.  The handle keeps the same lifetime assumptions as its
+  // `ctx`/`loadedModel` raw pointers.  `logger` is the evaluator channel the other five lines in this
+  // file already use (each guarded by `logger != NULL`); no new channel, and R41 anchors only the
+  // startup statement, so a seventh site is mechanically free.
+  Logger* logger;
+  std::shared_ptr<VulkanTuner::Decision> tuneDecision;
 
   ComputeHandle(ComputeContext* context, const LoadedModel* loaded, Logger* logger,
                 int maxBatch, bool requireExactNNLen, int deviceIdx)
@@ -2554,7 +2563,11 @@ struct ComputeHandle {
       outValue(NULL),
       outScoreValue(NULL),
       outOwnership(NULL),
-      padBatch(true)
+      padBatch(true),
+      // W2 (decision E, 2'): see the field comments.  `logger(logger)` is the parameter initialising the
+      // member of the same name -- deliberate, so the two cannot drift in spelling.
+      logger(logger),
+      tuneDecision(nullptr)
   {
     // B2a (next-temp §10.11): FA sites drop the mask tensor when the handle is
     // requireExactNNLen (mask provably all-ones, nneval hard-asserts full board).
@@ -2631,9 +2644,22 @@ struct ComputeHandle {
           ).first;
         }
         tuneDecision = it->second;
+        // W2 (decision E, 2'): the install runs under the SAME lock as the decision.  "Same" means
+        // WITHIN ONE ComputeContext -- a different ctx has its own tuneMutex and its own decisions; the
+        // Decision lives in THIS ctx's tuneDecisions map, and the handle that installs it was created
+        // by this ctx.  Why it has to be inside: installForHandle mutates the shared Decision (the
+        // per-row fold, the aggregates, the outcome, the ctx identity list, the once hook), and the
+        // eval point takes that hook and its snapshot under this same lock -- an unlocked install would
+        // make the snapshot a torn read.  The price is that a first eval may wait for an install that is
+        // compiling pipelines; both happen once, during startup.
+        if(tuneDecision != nullptr)
+          VulkanTuner::installForHandle(tuneDecision, backend);
+        // W2 (decision E, 2'): made reachable from the eval path only AFTER the install, so the two facts
+        // ("this handle has a decision" and "its rows were installed") are set together.  The eval point
+        // can then read "the hook has not even been assembled" as the monitored anomaly instead of
+        // assuming that install always precedes the first eval.
+        this->tuneDecision = tuneDecision;
       }
-      if(tuneDecision != nullptr)
-        VulkanTuner::installForHandle(tuneDecision, backend);
     }
 
     // --- Get the ONNX bytes (external .onnx shared, .bin.gz built here) ---
@@ -3017,6 +3043,58 @@ void NeuralNet::getOutput(
 ) {
   assert(numBatchEltsFilled <= inputBuffers->maxBatchSize);
   assert(numBatchEltsFilled > 0);
+
+  // --- W2 (decisions B/E, 2'): THE ONCE POINT -------------------------------------------------------
+  // The write belongs to "all contexts of this device have installed, and nothing has been evaluated
+  // yet", and the FIRST EVAL is that moment -- not the end of the constructor, where the later handles
+  // have not installed yet (their rows would be missed) and not the first lookup, which happens inside
+  // the FIRST handle's graph build (GV:10454-10461) and is therefore even earlier.
+  //
+  // This side only REPORTS the event: it takes the hook, calls it and lets the tuner's own body do the
+  // write.  No new interface name (R1: the hook is DATA on the Decision) and no control surface in the
+  // backend (R5/R6).
+  //
+  // 🔴 ONE critical section (2'): the hook is taken, CALLED and its tri-state recorded under the same
+  // lock that installForHandle now holds ("same" = within THIS ComputeContext; a different ctx has its
+  // own mutex).  Why not "take under the lock, call outside, re-lock": an install arriving in that gap
+  // would read writeState == NotAttempted, so its rows would be neither written nor reported as late --
+  // a silent omission, which is the one failure this design exists to remove.  The price is one small
+  // file write under the lock, once per device, and it is written down in w2-preview.md section 2/9E.
+  if(gpuHandle->tuneDecision != nullptr) {
+    const std::shared_ptr<VulkanTuner::Decision> tuneDecision = gpuHandle->tuneDecision;
+    bool beatItsOwnInstall = false;
+    {
+      std::lock_guard<std::mutex> tuneLock(gpuHandle->ctx->tuneMutex);
+      if(tuneDecision->onFirstEval) {
+        // "Trigger and consume": the hook is taken exactly ONCE, and a refusal inside it is final.
+        std::function<void(VulkanTuner::Decision&)> hook = std::move(tuneDecision->onFirstEval);
+        tuneDecision->onceHookTaken = true;
+        hook(*tuneDecision);
+      }
+      else if(!tuneDecision->onceHookTaken) {
+        // Empty AND never taken: this context's first eval beat its own install.  LOUD, because the
+        // alternative is a device that never writes and a log that cannot say why.  (Empty AND taken is
+        // the other thread having consumed it -- silent by design: N-1 extra lines would be noise, and a
+        // late install still gets its own line from the tuner.)
+        beatItsOwnInstall = true;
+      }
+    }
+    if(beatItsOwnInstall && gpuHandle->logger != NULL) {
+      // Same evaluator channel as the other lines in this file, and the same NULL guard they all use.
+      // No logger configured => this anomaly is silent; that is accepted and recorded in w2-preview.md
+      // section 4 rather than left as an assumption that "it always reports".
+      //
+      // 🔴 Identity: the CONTEXT ORDINAL is NOT reachable from this side.  It lives in the ggml-vulkan
+      // context (`tune_ctx_ordinal`, GV:2659), and asking for it here would mean a fifth interface name
+      // -- R1 forbids that, and the ordinal is a backend-side fact for exactly that reason.  So this line
+      // names the DEVICE, which is what this side knows; the ordinals appear on the tuner's own lines
+      // (`ggml_vk_tune_ctx_tag`).  Recorded in w2-preview.md section 4 rather than left implicit.
+      gpuHandle->logger->write("WARNING: Vulkan tuner device=" + tuneDecision->deviceName
+                               + ": this context's first eval ran BEFORE its own install, so NO cache "
+                                 "write was attempted for it (the write hook is assembled on the install "
+                                 "path, and it was not there yet); a later eval still writes it");
+    }
+  }
 
   const int batchSize = numBatchEltsFilled;
   // The ggml graph is fixed at maxBatchSize (FixedShape policy), so short

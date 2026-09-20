@@ -159,6 +159,22 @@ namespace VulkanTuner {
     // validation gate) and class (c) (timeout / IO failure / device lost / no winner) are
     // deliberately absent from it, so they cannot be written at all.
     std::string negativeReason;
+    // W2 (post-review): WHO put the marker above there, which is what decides who may take it away.
+    //   None      -- no marker.
+    //   FromFile  -- the LOADER read it from a file (the cache channel or an IMPORT; one entry point,
+    //                vulkantuner.cpp load path).  It is load-bearing: EXPORT re-emits the marker, and
+    //                the read-side legs assert "nothing to do means nothing written" byte for byte, so
+    //                the FINALIZER never touches it -- except for the ONE transition that makes it false
+    //                by this process's own account (a durable row was installed for this key), which it
+    //                retires loudly.
+    //   AllReject -- THIS process concluded "deterministically all-rejected" from the install
+    //                accounting.  The finalizer owns this one and recomputes it from scratch on every
+    //                call, so calling it twice can never leave a stale marker behind.
+    // The distinction is not cosmetic: one field with two writers and no record of who wrote it is
+    // exactly the silent sharing this project refuses, and the two markers are removed for different
+    // reasons (a loader's marker is superseded by a measurement; ours is retracted by our own rules).
+    enum class NegativeOrigin { None, FromFile, AllReject };
+    NegativeOrigin negativeOrigin = NegativeOrigin::None;
 
     // G-D20 (t3-shell-plan.md 6.9): "deterministically all-rejected" is a claim about the DEVICE
     // only when every rejection reason is a device property.  A rejection caused by OUR
@@ -221,6 +237,14 @@ namespace VulkanTuner {
     // An IDENTITY list, never a count: it is what lets a late install be told "this file does not
     // contain your rows" instead of guessing.
     std::vector<uint32_t> ctxOrdinals;
+    // W2 (post-review, 2026-09-20): did ANY context of this device install at least one row?
+    // DELIBERATELY an OR fold, NOT the AND fold `install.installed` uses: this answers "does this KEY
+    // have an injection slot at all", and ONE context proving that it does is enough.  It gates the
+    // NEGATIVE entry, because writing "no-injection-slot" for a key into which this very process
+    // installed rows (and hit them) is a self-refuting, sticky, key-scoped verdict -- measured in the
+    // first smoke run with the write live, where one key got `wrote 1 row(s)` from one leg and a
+    // `NEGATIVE no-injection-slot` from another.  Set in installForHandle; only ever turned ON.
+    bool anyRowInstalled = false;
     // W2 (decision E, AMENDED to 2' after source review): the once hook.  Its body lives entirely in
     // vulkantuner.cpp, so this stays DATA: no fifth interface name (R1), no control surface in the
     // backend (R5/R6).
@@ -252,6 +276,33 @@ namespace VulkanTuner {
     WriteState writeState = WriteState::NotAttempted;
     std::string writeRefusal;     // the gate that refused, when writeState == RefusedByGate
     std::string writeTarget;      // the path the once point wrote (or refused to write), for the log
+    // W2 (post-review): what the finalizer concluded, as a VALUE.  The finalizer itself is SILENT (it
+    // only computes), which is what makes "one event = one loud line" structural instead of a rule: the
+    // conclusion is reported by ONE function, and only when it CHANGES (see reportedVerdict).  The first
+    // smoke run with the write live printed every (a)/(b) NOTICE TWICE -- once from the install path and
+    // once from the once point -- because the finalizer both computed and printed.
+    //   Nothing                      -- nothing to conclude yet (declared == 0): the ordinary production
+    //                                   form of step 1b-2b, and never a loud line.
+    //   Measured                     -- at least one row is durable; the file (if any) carries rows.
+    //   ImportedRejected             -- an IMPORTed row set was all-rejected: (a) an import may not
+    //                                   create a durable verdict.
+    //   AnyRowInstalled              -- every declared row was rejected HERE, but some context of this
+    //                                   device installed a row for this SAME key: (b) the key-scoped
+    //                                   marker would be false by our own account.
+    //   OurGap                       -- all rejected, but not every reason is a device property (G-D20).
+    //   DeviceOnlyAllReject          -- all rejected, every reason a device property: the marker stands.
+    //   StaleFromFileNegativeRetired -- a row is durable, so a marker READ FROM A FILE was retired.
+    enum class FinalizeVerdict { Nothing, Measured, ImportedRejected, AnyRowInstalled, OurGap,
+                                 DeviceOnlyAllReject, StaleFromFileNegativeRetired };
+    // The last verdict REPORTED for this decision.  The finalizer runs more than once (once per context
+    // install, then once at the once point) and its answer may legitimately CHANGE between those calls,
+    // so "report only on a transition" is what makes a repeated line impossible WITHOUT also silencing
+    // the second, different conclusion.
+    // 🔴 Written only under the owning ComputeContext's tuneMutex -- and that is ONE lock, not two: a
+    // Decision lives in ONE (evaluator, device)'s tuneDecisions map (vulkanbackend.cpp:2434-2440), and
+    // every thread of that evaluator takes that ctx's tuneMutex for BOTH the install and the once point
+    // (vulkanbackend.cpp:2635 / :3067).  No second mutex on the Decision, deliberately.
+    FinalizeVerdict reportedVerdict = FinalizeVerdict::Nothing;
     std::string note;             // one short human-readable clause for the log line
   };
 

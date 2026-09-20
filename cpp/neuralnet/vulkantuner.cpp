@@ -1264,6 +1264,12 @@ namespace VulkanTuner {
   // Then it requires that nothing appeared at the probe path.  The four E2E legs that cannot be
   // written yet (timeout / io-error / device-lost / no-winner) are registered for step 5 WITH a
   // mandatory precondition: prove the failure happened first, then assert the file was not created.
+  // These are free functions in namespace VulkanTuner, so the ones the self-test drives have to be
+  // declared before it.  The finalizer is defined further down (it reads the install accounting, which
+  // is what the lower half of this file is organised around); reportVerdict is the ONE place its verdict
+  // is turned into a loud line.
+  Decision::FinalizeVerdict finalizeOutcome(Decision& d);
+
   void cacheWriteSelfTest(const TunePolicy & policy, const string & cacheDir) {
     TunePolicy readOnly = policy;
     readOnly.off = true;
@@ -1524,12 +1530,151 @@ namespace VulkanTuner {
       }
     }
 
+    // ── W2 (post-review): the finalizer's rules, asserted as JUDGEMENTS ────────────────────────────────
+    //
+    // Why these live here and not in a smoke leg: (b) needs an install to land between one context's
+    // first eval and a later context's install (timing-dependent), and the from-file retirement needs
+    // DECLARED rows on a key that also carries a from-file marker (only the enumerator can produce that
+    // today).  Neither is deterministically constructible, so both are registered as "no deterministic
+    // trigger" in t3-shell-plan.md section 4 rather than faked with a leg that would pass for the wrong
+    // reason.  Here the judgement is driven directly -- AND through the real writer, so a deleted branch
+    // shows up as a FAIL in this line instead of as a missing NOTICE in some future leg.
+    //
+    // The cases are the closed set of "what may happen to the marker": (a) an import may not create one,
+    // (b) one is not created when our own account refutes it, (c) a from-file marker is retired by a
+    // durable row, (d) a device-only all-reject DOES create one, (e) our-gap creates none.  (d) is the
+    // CONTROL: without it, a finalizer that simply never set a marker would pass all the others.
+    bool verdictOk = true;
+    string verdictBad;
+    auto verdictName = [](Decision::FinalizeVerdict v) -> const char * {
+      switch (v) {
+        case Decision::FinalizeVerdict::Nothing: return "Nothing";
+        case Decision::FinalizeVerdict::Measured: return "Measured";
+        case Decision::FinalizeVerdict::ImportedRejected: return "ImportedRejected";
+        case Decision::FinalizeVerdict::AnyRowInstalled: return "AnyRowInstalled";
+        case Decision::FinalizeVerdict::OurGap: return "OurGap";
+        case Decision::FinalizeVerdict::DeviceOnlyAllReject: return "DeviceOnlyAllReject";
+        case Decision::FinalizeVerdict::StaleFromFileNegativeRetired: return "StaleFromFileNegativeRetired";
+      }
+      return "?";
+    };
+    // `wantRefusal == nullptr` means "do not call the writer at all" -- used by the two cases in which a
+    // write would really produce a file (a durable row, or a legitimate marker): a self-test must not
+    // create state, and the `absent` assertion below is what proves it did not.
+    auto verdictCase = [&](const char * what, Decision & d, Decision::FinalizeVerdict want,
+                           Decision::FinalizeVerdict wantSecond, bool wantNegative,
+                           const char * wantRefusal) {
+      const Decision::FinalizeVerdict got = finalizeOutcome(d);
+      const bool negFirst = d.negative;
+      const Decision::FinalizeVerdict again = finalizeOutcome(d);   // idempotence, one call later
+      if (got != want || again != wantSecond || negFirst != wantNegative || d.negative != wantNegative) {
+        verdictOk = false;
+        if (verdictBad.empty()) {
+          verdictBad = string(what) + ": verdict " + verdictName(got) + "/" + verdictName(again)
+                     + " (want " + verdictName(want) + "/" + verdictName(wantSecond) + "), negative "
+                     + (negFirst ? "true" : "false") + "/" + (d.negative ? "true" : "false")
+                     + " (want " + (wantNegative ? "true" : "false") + " both times)";
+        }
+      }
+      if (wantRefusal != nullptr) {
+        string err;
+        const bool wrote = writeCacheIfAllowed(d, policy, err);
+        if (wrote || err.find(wantRefusal) == string::npos) {
+          verdictOk = false;
+          if (verdictBad.empty()) {
+            verdictBad = string(what) + ": the REAL writer "
+                       + (wrote ? string("wrote a file") : ("refused with '" + err + "'"))
+                       + " (want a refusal naming '" + wantRefusal + "')";
+          }
+        }
+      }
+    };
+    { // (a) an IMPORTed set may not create a durable verdict
+      Decision d;
+      d.deviceName = "self-test";
+      d.cachePath = probePath;
+      d.imported = true;
+      d.install.declared = 1;
+      d.install.installed = 0;
+      d.allRejectReasonsAreDevice = true;   // so the refusal comes from CONTENT, not from the state gate
+      verdictCase("(a) imported all-reject", d, Decision::FinalizeVerdict::ImportedRejected,
+                  Decision::FinalizeVerdict::ImportedRejected, false, "nothing to write");
+    }
+    { // (b) our own account refutes the marker
+      Decision d;
+      d.deviceName = "self-test";
+      d.cachePath = probePath;
+      d.anyRowInstalled = true;
+      d.install.declared = 1;
+      d.install.installed = 0;
+      d.allRejectReasonsAreDevice = true;
+      verdictCase("(b) self-falsified all-reject", d, Decision::FinalizeVerdict::AnyRowInstalled,
+                  Decision::FinalizeVerdict::AnyRowInstalled, false, "nothing to write");
+    }
+    { // (c) a from-file marker is retired by a durable row (one-way: the second call is `Measured`)
+      Decision d;
+      d.deviceName = "self-test";
+      d.cachePath = probePath;
+      d.negative = true;
+      d.negativeReason = "no-injection-slot";
+      d.negativeOrigin = Decision::NegativeOrigin::FromFile;
+      d.install.declared = 1;
+      d.install.installed = 1;
+      vk_tune_row_spec r {};
+      r.path = VK_TILE_PATH_SCALAR;
+      r.src0_type = 1;
+      r.src1_type = 0;
+      r.geom.BM = 64; r.geom.BN = 64; r.geom.BK = 0;
+      r.geom.WM = 32; r.geom.WN = 32; r.geom.WMITER = 1;
+      r.geom.TM = 4; r.geom.TN = 4; r.geom.BS = 128;
+      r.geom.pad = -1; r.geom.reshape = -1; r.geom.smaller = -1;
+      d.rows.push_back(r);
+      verdictCase("(c) from-file marker retired", d, Decision::FinalizeVerdict::StaleFromFileNegativeRetired,
+                  Decision::FinalizeVerdict::Measured, false, nullptr);
+      // The retirement has to be FOR a durable row, not for "nothing to write": this is that difference.
+      if (!cacheEntryWritable(d)) {
+        verdictOk = false;
+        if (verdictBad.empty()) {
+          verdictBad = "(c) the retirement left nothing to write (want the durable row to remain writable)";
+        }
+      }
+    }
+    { // (d) CONTROL: a device-only all-reject really does create the marker -- and keeps it
+      Decision d;
+      d.deviceName = "self-test";
+      d.cachePath = probePath;
+      d.install.declared = 1;
+      d.install.installed = 0;
+      d.allRejectReasonsAreDevice = true;
+      verdictCase("(d) device-only all-reject", d, Decision::FinalizeVerdict::DeviceOnlyAllReject,
+                  Decision::FinalizeVerdict::DeviceOnlyAllReject, true, nullptr);
+      if (!outcomeWritable(d) || !cacheEntryWritable(d)) {
+        verdictOk = false;
+        if (verdictBad.empty()) {
+          verdictBad = "(d) a device-only all-reject is not writable (the marker would never be written)";
+        }
+      }
+    }
+    { // (e) our own gap: the coarse outcome is recorded, and the TABLE refuses to write it (G-D20)
+      Decision d;
+      d.deviceName = "self-test";
+      d.cachePath = probePath;
+      d.install.declared = 1;
+      d.install.installed = 0;
+      d.install.dropped_unsupported_our_gap = 1;
+      d.allRejectReasonsAreDevice = false;
+      verdictCase("(e) our-gap all-reject", d, Decision::FinalizeVerdict::OurGap,
+                  Decision::FinalizeVerdict::OurGap, false, "not in a writable state");
+    }
+
     const bool absent = !FileUtils::exists(probePath);    logLine("cache write self-test: " + to_string(declared) + " outcome(s) declared, "
             + to_string(refused) + " refused by the state gate, " + to_string(allowed)
             + " state-writable; probe file " + (absent ? "absent" : "PRESENT")
             + "; encoding probe (non-ASCII name) written+read-back+removed ["
             + ((encWrote && encReadBack && encRemoved) ? "ok" : "FAIL") + "]"
-            + " [" + ((ok && absent && encWrote && encReadBack && encRemoved) ? "ok" : "FAIL") + "]"
+            + "; (a)(b) no marker / (c) from-file retirement / (d) control / (e) our-gap ["
+            + (verdictOk ? "ok" : "FAIL: " + verdictBad) + "]"
+            + " [" + ((ok && absent && encWrote && encReadBack && encRemoved && verdictOk) ? "ok" : "FAIL") + "]"
             + (ok ? "" : " first problem: " + firstBad));
   }
 
@@ -1857,6 +2002,12 @@ namespace VulkanTuner {
               // check the reason against the closed set.  In the "both ROW and NEGATIVE" case
               // below the reason is deliberately dropped with the stale entry.
               d->negativeReason = file.negativeReason;
+              // W2 (post-review): record WHO wrote this marker.  EXPORT re-emits it and the read-side
+              // legs assert that "nothing to do" means "nothing written", so the finalizer must be able
+              // to tell a marker it owns from one the loader handed it -- see Decision::NegativeOrigin.
+              // (`d->negative` is false on the other branch, where NegativeOrigin::None is already the
+              // value, so this one assignment is the only place a from-file origin can be born.)
+              d->negativeOrigin = Decision::NegativeOrigin::FromFile;
             }
             if (file.negative && !file.rows.empty()) {
               // Reachable only from a hand-edited or merged file: the writer refuses to emit
@@ -1941,26 +2092,110 @@ namespace VulkanTuner {
   // so no file appears -- and "the file was not written" must never be the only thing the log says.
   // The NEGATIVE ENTRY (negative + negativeReason) is set ONLY on the device-only branch: that marker
   // outlives the process, so our own implementation gap must never leave one behind.
-  void finalizeOutcome(Decision& d) {
+  //
+  // 🔴 POST-REVIEW (2026-09-20): this function COMPUTES and does not PRINT, and it only ever removes a
+  // marker it created itself.  Both halves are load-bearing:
+  //   * SILENT => the loud lines live at ONE reporting site (reportVerdict below), so a second call for
+  //     the same event cannot print the same conclusion twice.  The first smoke run with the write live
+  //     printed every (a)/(b) NOTICE exactly twice -- once from the install path, once from the once
+  //     point -- because this function both computed AND printed.  A finalizer that is not idempotent is
+  //     what made that possible; making it a pure function removes the whole class.
+  //   * NegativeOrigin::AllReject only => a marker READ FROM A FILE belongs to the loader (EXPORT
+  //     re-emits it; the read-side legs assert "nothing to do means nothing written"), so all this
+  //     function may do to it is RETIRE it on the one transition that makes it false by our own account
+  //     -- a durable row was installed for this key -- and say so as StaleFromFileNegativeRetired.
+  // Together those two rules make `formatRowsFileImpl`'s "both ROW and NEGATIVE" throw (:1078)
+  // UNREACHABLE from the write path instead of merely caught: rows are emitted only when a row is
+  // durable in EVERY context (`rowsForWrite` is the AND mask), which implies install.installed > 0,
+  // which is exactly the branch that retires a from-file marker before the write.
+  Decision::FinalizeVerdict finalizeOutcome(Decision& d) {
+    // Recompute OUR marker from scratch: the verdict below is a pure function of the accounting, so the
+    // same call on the same accounting must produce the same fields (and no leftover marker).
+    if (d.negativeOrigin == Decision::NegativeOrigin::AllReject) {
+      d.negative = false;
+      d.negativeReason.clear();
+      d.negativeOrigin = Decision::NegativeOrigin::None;
+    }
     if (d.install.installed > 0) {
       d.outcome = "measured";
-      return;
+      if (d.negativeOrigin == Decision::NegativeOrigin::FromFile) {
+        d.negative = false;
+        d.negativeReason.clear();
+        d.negativeOrigin = Decision::NegativeOrigin::None;
+        return Decision::FinalizeVerdict::StaleFromFileNegativeRetired;
+      }
+      return Decision::FinalizeVerdict::Measured;
     }
     if (d.install.declared > 0) {
       d.outcome = "structural-all-reject";
+      if (d.imported) {
+        // (a) An IMPORTed row set may not CREATE a durable verdict.  The product says so itself in the
+        // same runnable path ("IMPORT ... not evidence that we measured it"): a hand-off is a REQUEST,
+        // while the negative entry outlives the process.  Reading an existing file stays allowed; only
+        // concluding from an imported set is refused.  The write gate then refuses by itself (rows
+        // empty and no negative), which is also why no file appears.
+        return Decision::FinalizeVerdict::ImportedRejected;
+      }
+      if (d.anyRowInstalled) {
+        // (b) Self-falsification guard.  Some context of this device installed a row for this very key,
+        // so "this key has no injection slot" is false BY THIS PROCESS'S OWN ACCOUNT.  The trigger is
+        // candidate-scoped (that particular row's path, its shared-memory demand) while the negative
+        // entry is key-scoped and STICKY, so it must not be written.
+        return Decision::FinalizeVerdict::AnyRowInstalled;
+      }
       if (d.allRejectReasonsAreDevice) {
         d.negative = true;
         d.negativeReason = "no-injection-slot";
+        d.negativeOrigin = Decision::NegativeOrigin::AllReject;
+        return Decision::FinalizeVerdict::DeviceOnlyAllReject;
       }
-      else {
+      return Decision::FinalizeVerdict::OurGap;
+    }
+    return Decision::FinalizeVerdict::Nothing;
+  }
+
+  // THE ONE reporting site for the finalizer's verdict.  Called from BOTH finalize sites (the install
+  // path and the once point, both under the owning ComputeContext's tuneMutex) and it prints only when
+  // the verdict CHANGES: a repeat for the same event is silent (one event = one line), while a
+  // conclusion that really changed afterwards is still said out loud.
+  // `Nothing`, `Measured` and `DeviceOnlyAllReject` print nothing BY DESIGN -- their evidence is the
+  // decision line and the file itself -- and they are listed explicitly, with no `default:`, so that
+  // adding a verdict cannot compile without deciding what it says.
+  void reportVerdict(Decision& d, Decision::FinalizeVerdict v) {
+    if (v == d.reportedVerdict) {
+      return;
+    }
+    d.reportedVerdict = v;
+    switch (v) {
+      case Decision::FinalizeVerdict::Nothing:
+      case Decision::FinalizeVerdict::Measured:
+      case Decision::FinalizeVerdict::DeviceOnlyAllReject:
+        break;
+      case Decision::FinalizeVerdict::ImportedRejected:
+        logLine("NOTICE: " + d.deviceName + ": every imported row was rejected, but an IMPORT is not "
+                "evidence that we measured this key (it is a reflow/development channel): NO negative "
+                "entry is created -- nothing durable may be concluded from an imported set");
+        break;
+      case Decision::FinalizeVerdict::AnyRowInstalled:
+        logLine("NOTICE: " + d.deviceName + ": rows were rejected, but another context of this device "
+                "INSTALLED at least one row for this SAME key, so 'no-injection-slot' would be false: NO "
+                "negative entry is created (a candidate-scoped reason must not become a key-scoped, "
+                "sticky verdict)");
+        break;
+      case Decision::FinalizeVerdict::OurGap:
         logLine("NOTICE: " + d.deviceName + ": every declared row was rejected, but NOT every reason "
                 "is a device property (flag=false; our-gap=" + to_string(d.install.dropped_unsupported_our_gap)
                 + " illegal=" + to_string(d.install.dropped_illegal)
                 + " variant-failed=" + to_string(d.install.variant_failed) + "): the coarse outcome "
                 "'structural-all-reject' is recorded WITHOUT a negative entry, because our own "
                 "implementation gap is not a property of this device (G-D20)");
-      }
-      return;
+        break;
+      case Decision::FinalizeVerdict::StaleFromFileNegativeRetired:
+        logLine("NOTICE: " + d.deviceName + ": a row was installed for this key, so the NEGATIVE entry "
+                "this run READ FROM A FILE is retired before writing (a measurement supersedes a loaded "
+                "verdict: one file = one statement, so the marker is dropped instead of being written "
+                "next to rows)");
+        break;
     }
   }
 
@@ -2033,6 +2268,12 @@ namespace VulkanTuner {
     // list.  It is what the decision log can print as "written by ctx 0,1" and what a LATE context is
     // told about below.
     decision->ctxOrdinals.push_back(installed.ctx_ordinal);
+    // W2 (post-review): the OR fold.  `install.installed` is the AND fold -- a row is durable only if
+    // EVERY context installed it -- but "this key HAS an injection slot" is the OPPOSITE question, and
+    // one context that installed a row answers it for good.  Hence a separate flag that only goes ON.
+    if (installed.installed > 0) {
+      decision->anyRowInstalled = true;
+    }
     // G-D20 (t3-shell-plan.md 6.9): "deterministically all-rejected" is a claim about the DEVICE only
     // when no refusal came from OUR implementation gap.  The counts above are MAX-folded, so one
     // context is enough to disqualify the claim for the whole key -- the safe direction, the same one
@@ -2053,7 +2294,56 @@ namespace VulkanTuner {
     // (Not at the end of makeDecision: there the accounting is still empty -- no ComputeHandle exists
     // yet -- so every decision would stay in "running" for ever.)  The last install before the first
     // eval is what decides; the once body below re-finalizes so it stands on its own.
-    finalizeOutcome(*decision);
+    reportVerdict(*decision, finalizeOutcome(*decision));
+    // --- W2 (decision E, 2'): assemble the once hook.  Built HERE, on the install path, and that is
+    // the point: it is what makes an empty callback mean "this context's install has not run yet",
+    // which the backend's eval point MONITORS instead of assuming.  It is assembled only while the hook
+    // has NOT been taken -- re-arming a consumed hook would let a second eval write the same file again.
+    //
+    // The policy is captured BY VALUE (the body runs on the eval path, which knows nothing about
+    // policies), and NO shared_ptr is captured: the closure lives INSIDE the Decision, so capturing one
+    // would be a reference cycle, and the Decision arrives as the argument instead.
+    //
+    // The refusal chain, in one place: the backend zeroes the per-row buffer and REFUSES (rather than
+    // truncating) a buffer that cannot hold one byte per declared row; that refusal is an install
+    // failure, so this side folds nothing and fails open to the stock heuristic -- loudly, above.
+    if (!decision->onceHookTaken) {
+      const TunePolicy hookPolicy = decision->tunePolicy;
+      decision->onFirstEval = [hookPolicy](Decision& d) {
+        // (a) Finalize from the accounting, which the lock has frozen for this whole call, and REPORT
+        //     the verdict (the finalizer itself is silent -- see reportVerdict).
+        reportVerdict(d, finalizeOutcome(d));
+        // (b) The four write gates and the write itself.  writeCacheIfAllowed refuses a read-only mode,
+        //     a non-writable outcome (fail-closed through the declared table -- which is also what makes
+        //     the flag=false all-reject unwritable), an entry with nothing in it, and an unconcluded
+        //     kind; it emits exactly the durable per-row set (rowsForWrite).
+        // THE PRODUCTION CALL.  R16's second half pins the CALLERS of writeCacheIfAllowed, not just the
+        // writeFileAtomic inside it: exactly two roles may call it -- `self-test` (both calls inside
+        // cacheWriteSelfTest) and `production` (here) -- and the production call's return value must
+        // feed the tri-state below.  A new, undeclared caller (for instance "write on every eval")
+        // therefore cannot appear silently.  Registered in t3-shell-plan.md section 9.1 under R16.
+        // WRITE-PATH: production
+        string err;
+        const bool wrote = writeCacheIfAllowed(d, hookPolicy, err);
+        // (c) The TRI-STATE, written back BEFORE returning (2'): it is what a later install reads to say
+        //     the right thing.  "Trigger and consume": a refusal is FINAL and is never retried.
+        d.writeTarget = d.cachePath;
+        if (wrote) {
+          d.writeState = Decision::WriteState::Wrote;
+          d.writeRefusal.clear();
+          // The write-success line.  A COUNTED line (a smoke leg greps it), emitted in ONE statement
+          // through the shell's single-line writer, so nothing can interleave inside it.  The count is
+          // the rows ACTUALLY WRITTEN -- the durable per-row set -- not the declared count.
+          logLine("wrote " + to_string(rowsForWrite(d).size()) + " row(s) to " + d.cachePath);
+        }
+        else {
+          d.writeState = Decision::WriteState::RefusedByGate;
+          d.writeRefusal = err;
+          logLine("NOTICE: the cache write was refused for " + d.deviceName + ": " + err
+                  + " (final: this decision is consumed and is NOT retried)");
+        }
+      };
+    }
     if (decision->writeState != Decision::WriteState::NotAttempted) {
       logLine(string("WARNING: ctx=") + to_string(installed.ctx_ordinal)
               + " installed after the cache write for " + decision->deviceName + ": "
