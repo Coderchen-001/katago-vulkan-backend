@@ -210,6 +210,52 @@ namespace VulkanTuner {
     // why the key-scoped NEGATIVE entry is unreachable until then.  R42 counts the setters rather
     // than trusting this sentence: production 0, the self-test's one named fixture 1.
     std::string rowSource = "none";   // "none" / "cache" / "import" / "measured"
+    // W4b (⑤ first cut): WHICH SUBSET of the declared domain this process actually looked at, as THREE
+    // states rather than a bool.  "who measured it" (rowSource above) and "how much of the domain was
+    // covered" are ORTHOGONAL questions -- both must be answered before a NEGATIVE entry may be
+    // remembered, because "we sampled 6 presets and none worked" is not "this device has no injectable
+    // slot".  The third state is what makes this a three-state field and not a flag: a W3-P1 lesson --
+    // a bool here would create the illegal combination "not swept and not sampled" with nobody to refuse.
+    //   unknown -- nobody said.  The initial value is the FAIL-CLOSED one: `swept-here` tests for the
+    //              string "swept", so a decision nobody marked can never mint a durable verdict.
+    //   sampled -- a sampling surface: the enumerator walked the declared STOCK VECTOR SET (a strict
+    //              subset of the Cartesian domain the count-only probe reports), or any other proper
+    //              subset.  A legitimate way to search, and NOT a complete one -- which is all this
+    //              state has to mean, so it stays true whether the subset is the stock presets or a
+    //              chosen sample.
+    //   swept   -- every point of the declared domain was put through the predicate (nothing tonight
+    //              produces this: 72 > any sane N_max, which w4b-preview section 9 pre-registers as
+    //              "sample it").  It exists so the condition has a satisfying direction to test.
+    // It is NOT written into the file and does NOT enter the key on purpose: while sampling cannot
+    // produce a NEGATIVE entry, "a file carries NEGATIVE" already implies "swept", so a coverage
+    // header key would be a format event that says nothing.  🔴 THE TRIGGER: the day a sampled
+    // negative entry is allowed to land, a coverage field MUST be added in the same batch
+    // (t3-shell-plan.md F17).
+    std::string candidateCoverage = "unknown";   // "unknown" / "sampled" / "swept"
+    // W4b: WHAT the enumerated candidate set covered -- the kind TOKENS a NEGATIVE entry speaks for.
+    // It is the third axis of the same honesty question: `measured-here` says WHO produced the set,
+    // `candidateCoverage` says HOW MUCH of the domain it looked at, and this says WHICH KINDS the
+    // conclusion is about.  One file = one key, and a key can carry several kinds (mm today, fa
+    // later), so a bare `NEGATIVE <reason>` would assert a kind it never measured.
+    // The tokens come from TUNE_KINDS[] (the ONE kind registry); empty = "no scope stated", which
+    // the writer refuses on the durable channel rather than reading it as "all kinds".
+    std::vector<std::string> negativeScope;
+    // W4b (⑤ first cut): THE PRUNE LEDGER -- the names of the candidate-table rules that REALLY
+    // excluded a candidate from the set this run searched.  Why a ledger and not a flag: `MUST` and
+    // `PRUNE` are not the same claim.  A MUST rule names a configuration already proven unusable
+    // (it does not build, or it computes the wrong answer), so excluding it cannot make "nothing in
+    // this domain works" false.  A PRUNE rule is "legal but slow / not worth trying", so every one
+    // that BITES weakens a negative verdict -- and the refusal sentence has to be able to NAME which
+    // one (the W3b lesson: a refusal must point at the right clause).
+    // 🔴 EMPTY IS THE NORMAL STATE, and the condition reads the LEDGER, not the table: the table
+    // always contains PRUNE entries (declaring a sampling surface is itself a PRUNE decision), so
+    // "the table lists a PRUNE clause" would be permanently true and the gate would be welded shut.
+    // The mapping is therefore: `no-prune-in-effect` holds <=> pruneExcluded.empty().
+    // What does NOT belong here: a value that was never declared at all (BK=16/32 on cm2 are legal
+    // but absent from the stock literals).  That is a COVERAGE matter -- a narrower domain, which is
+    // exactly what `candidateCoverage == "sampled"` already reports -- not a rule that excluded
+    // something.  Counting it here would be the mirror image of "listed but never wired".
+    std::vector<std::string> pruneExcluded;
     // What the decision line prints for "which mode is running" (auto(cfg) / off(cfg)): without
     // it the log cannot prove which mode was in effect, and "auto" vs "off" is exactly the
     // difference between "we tried to tune" and "we deliberately did not".

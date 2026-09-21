@@ -72,13 +72,21 @@ namespace VulkanTuner {
     // migration and none is needed: no production cache file existed before this (EXPORT was
     // the only writer and only tests asked for it).  A VERSION 1 file is refused loudly,
     // which is right for a file whose rows were not keyed to the name they live under.
-    const int SCHEMA_VERSION = 4;   // was 3: the REQUIRED header-key set changed (MODE added;
+    const int SCHEMA_VERSION = 5;   // was 4: the NEGATIVE LINE gained a required SCOPE token
+                                    // (`NEGATIVE <reason> <kind>[,<kind>...]`), so an older file's
+                                    // marker does not say which kind it is about -- and under this
+                                    // batch's rule an unscoped marker would have to be read as
+                                    // "some kind", which is exactly the fail-open default the closed
+                                    // set refuses.  The REQUIRED header-key set is UNCHANGED: this
+                                    // bump is the "same keys, different meaning" case section 1
+                                    // describes, which is what VERSION tracks.
+                                    // was 3: the REQUIRED header-key set changed (MODE added;
                                     // VERSION/TUNER_VERSION promoted to required).  A file that
                                     // does not declare the new set must not be read as if it did.
     // TUNER_VERSION = the ENUMERATOR's version: it changes when the way candidates are
-    // enumerated/measured changes.  This cut adds header fields, not enumeration, so it stays
-    // while SCHEMA_VERSION moves.
-    const int TUNER_VERSION = 2;
+    // enumerated/measured changes.  This cut is the ENUMERATOR ITSELF (its first writer: the
+    // stock-preset catalogue and the measured row source), so it moves with SCHEMA_VERSION.
+    const int TUNER_VERSION = 3;
 
     // The policy baseline counter (t1-schema.md section 4, "baselineVersion").
     //
@@ -333,6 +341,32 @@ namespace VulkanTuner {
       return false;
     }
 
+    // W4b: is this a kind this build knows?  The registry and its membership test live HERE, next to
+    // NEGATIVE_REASONS and for the same reason: they are the second closed set the file format depends on
+    // (the first is the reason), and BOTH the parser (which reads a NEGATIVE line's scope) and the
+    // candidate catalogue (which declares the search domain per kind) need them.  Putting the registry
+    // here rather than inside the completeness-gate block below is what keeps those two from growing a
+    // SECOND kind list -- F17's "the value domain comes from declared data" applies to the closed set of
+    // kind names exactly as it does to the axis values.
+    struct TuneKindSpec {
+      const char* name;
+    };
+    const TuneKindSpec TUNE_KINDS[] = {
+      { "mm" },   // matmul rows: the only kind this tuner can produce so far (FA adds a row)
+    };
+    const size_t TUNE_KIND_COUNT = sizeof(TUNE_KINDS) / sizeof(TUNE_KINDS[0]);
+
+    // Fail-closed: an unknown kind is never known, so a hand-edited scope cannot name a kind this build
+    // would silently accept as "some kind".
+    bool tuneKindKnown(const string & kind) {
+      for (const TuneKindSpec & k : TUNE_KINDS) {
+        if (kind == k.name) {
+          return true;
+        }
+      }
+      return false;
+    }
+
     // ── W3-P1: PROVENANCE -- "this candidate set is THIS process's own measurement" ────────────────
     // "This key has no injection slot" is a KEY-SCOPED and STICKY claim: once it is in the cache the
     // key is skipped until the file's invalidation rule voids it.  It may therefore only be concluded
@@ -391,6 +425,36 @@ namespace VulkanTuner {
                + "'), and only a candidate set THIS process measured may be remembered as a durable "
                  "verdict -- a file says what some other run saw, and a hand-made or reflowed file says "
                  "nothing at all";
+        } },
+      { "swept-here", [](const Decision & x) { return x.candidateCoverage == "swept"; },
+        [](const Decision & x) {
+          // W4b.  The sentence has to name the COVERAGE, because the generic state-gate text is false
+          // here in the same way it was false for provenance and for our-gap: the outcome it refuses
+          // is the one that sentence says may be remembered.  And the misleading reading is specific
+          // and predictable -- "we tried a handful of candidate geometries and none was usable" is
+          // NOT "this device has no injectable slot", so the refusal says which of the two happened.
+          return "the candidate set is a SAMPLING SURFACE (coverage '" + x.candidateCoverage
+               + "'), not a sweep of the declared domain: a sampled all-reject means only that the "
+                 "SAMPLED geometries were rejected, so the coarse outcome 'structural-all-reject' is "
+                 "recorded WITHOUT a durable verdict (t3-shell-plan.md F17)";
+        } },
+      { "no-prune-in-effect", [](const Decision & x) { return x.pruneExcluded.empty(); },
+        [](const Decision & x) {
+          // W4b.  🔴 It NAMES the rules that bit, one by one.  A refusal that only said "a prune was
+          // in effect" would send the next reader to the rule table to guess which one; the W3b
+          // lesson is that a refusal has to point at the clause that owns it.  The distinction the
+          // sentence carries is the whole reason this condition exists: a MUST rule rejects a
+          // configuration already proven unusable, while a PRUNE rule only says "not worth trying",
+          // so only the latter can make "nothing here works" false.
+          string names;
+          for (size_t i = 0; i < x.pruneExcluded.size(); i++) {
+            names += (i ? ", " : "") + x.pruneExcluded[i];
+          }
+          return "a PRUNE rule (not a MUST rule) excluded " + to_string(x.pruneExcluded.size())
+               + " candidate(s) from the set this run searched [" + names
+               + "]: a prune is 'legal but not worth trying', so 'nothing in the domain works' is "
+                 "NOT established -- the coarse outcome 'structural-all-reject' is recorded WITHOUT a "
+                 "durable verdict (w4b-preview section 1.7)";
         } },
     };
 
@@ -521,16 +585,31 @@ namespace VulkanTuner {
       bool writable;
       // The EXTRA conditions on top of `writable`, as a comma-separated LIST from the closed set in
       // `CONDITION_SPECS`: "" = none, "device-only" = every rejection reason must be a device property
-      // (G-D20), "measured-here" = the candidate set must be this process's own measurement (W3-P1).
-      // They live in the table on purpose -- a condition expressed as a branch on `klass`, or as a
-      // clause inside one of the gates, would let a rename or a refactor silently change what may be
+      // (G-D20), "measured-here" = the candidate set must be this process's own measurement (W3-P1),
+      // "swept-here" = it must cover the declared domain rather than a sampling surface (W4b),
+      // "no-prune-in-effect" = no PRUNE rule may have excluded a candidate from what was searched
+      // (W4b).  They live in the table on purpose -- a condition expressed as a branch on `klass`, or as
+      // a clause inside one of the gates, would let a rename or a refactor silently change what may be
       // written, which is the "implicit knowledge in a branch" the first design rule bans.  The
       // writer reports the FIRST named condition that does not hold, so a refusal names its clause.
       const char* condition;
     };
     const DecisionOutcomeSpec DECISION_OUTCOMES[] = {
-      { "structural-all-reject", "structural",  true,  "device-only,measured-here" },
-      { "measured",              "completed",   true,  ""            },
+      // A structural all-reject is a KIND-LEVEL, STICKY claim ("this key has no injectable slot"), so
+      // it needs all four: the reasons must be about the DEVICE (device-only), the candidate set must
+      // be OURS (measured-here), it must be a SWEEP rather than a sample (swept-here), and no PRUNE
+      // may have narrowed what we searched (no-prune-in-effect).  The last two are ORTHOGONAL to the
+      // first two -- who produced the set, and how completely it was searched, are different
+      // questions -- and W4b's measured answer is that this build can satisfy neither tonight: the
+      // catalogue is a sampling surface, so no durable all-reject verdict is reachable yet.
+      { "structural-all-reject", "structural",  true,  "device-only,measured-here,swept-here,no-prune-in-effect" },
+      // A completed measurement writes ROWS, not a verdict about what does not exist.  The two W4b
+      // conditions are named here TOO, deliberately: the coverage question is not about the outcome
+      // name but about the candidate set, and leaving them off this row would mean an unmarked or
+      // pruned run could write rows as if the set had been swept -- the same silent drift, one row
+      // over.  Today this row cannot fire either (nothing installs a row yet); it is what keeps the
+      // rule attached to the SET rather than to one outcome's spelling.
+      { "measured",              "completed",   true,  "measured-here,swept-here,no-prune-in-effect" },
       { "gate-reject",           "gate",        false, ""            },
       { "running",               "measurement", false, ""            },
       { "timeout",               "measurement", false, ""            },
@@ -635,6 +714,22 @@ namespace VulkanTuner {
       { "smaller", VK_TILE_AXIS_SMALLER, CM2_SMALLER_VALUES, 2 },
     };
     const size_t CM2_DOMAIN_SIZE = sizeof(CM2_DOMAIN) / sizeof(CM2_DOMAIN[0]);
+
+    // W4b commit 2: THE STOCK PRESET VECTORS, as literals.  These are the five-element vectors
+    // ggml-vulkan.cpp builds its cm2 pipelines from (:5142-5160) and they are TRANSCRIBED rather than
+    // re-derived, because an expression here would be the "second spelling of the domain" F17 bans.  The
+    // exact value sets are re-derived from those very lines by guardrail R44, and the DISTINCT tuples are
+    // covered by R44's matching clause, so a typo in this table is a red guardrail rather than a silently
+    // narrower search.  They are DISTINCT (the mmq_k family is a byte-for-byte copy of mmq), which is
+    // what makes "how many presets were searched" a number worth stating on its own line.
+    const uint32_t CM2_PRESET_VECTORS[][5] = {
+      { 256, 128, 256, 64, 1 },   // l_warptile      / l_warptile_mmq      / l_warptile_mmq_k   (:5142/:5150/:5158)
+      { 256, 128, 128, 64, 0 },   // m_warptile                                                     (:5143)
+      { 128,  64,  64, 64, 0 },   // s_warptile                                                     (:5144)
+      { 256, 128, 128, 64, 1 },   // m_warptile_mmq  / m_warptile_mmq_k                             (:5151/:5159)
+      { 256,  32,  64, 128, 0 },  // s_warptile_mmq  / s_warptile_mmq_k                             (:5152/:5160)
+    };
+    const size_t CM2_PRESET_COUNT = sizeof(CM2_PRESET_VECTORS) / sizeof(CM2_PRESET_VECTORS[0]);
 
     // The values the domain does NOT sweep: the shader's own defaults (mul_mm_cm2.comp:31-36).
     vk_tile_geometry cm2BaseGeometry() {
@@ -752,6 +847,445 @@ namespace VulkanTuner {
       return os.str();
     }
 
+    // ── W4b (⑤ first cut, COMMIT 2): THE CANDIDATE CATALOGUE, THE PRUNE LEDGER, AND THE WRITER ─────
+    // The probe above only COUNTS the declared domain and reports the predicate's kill distribution.  This
+    // is the part that actually SEARCHES -- and therefore the part that has to state, mechanically, HOW
+    // MUCH it searched and WHICH rules narrowed the search, because those two facts are exactly what
+    // decide whether an all-reject may be remembered (DECISION_OUTCOMES' four conditions).
+    //
+    // KINDS: the search domain is declared PER KIND, and `mm` is the only kind this tuner has.  The
+    // distinction is load-bearing rather than decorative: `mmq`/`mmq_k` above are real geometry families
+    // in the stock sources, but a family whose KIND is not registered here has no domain at all, so
+    // nothing about it can be searched, sampled, or concluded.  That is what keeps "not applicable to
+    // this binary" from quietly becoming "an empty family that proves something".
+    // 🔴 Why the quant families are out of scope is a KIND statement, not a geometry statement:
+    // tune-overview.md section 7.2 -- the id path and the quant paths are not touched at all.  Do NOT
+    // restate it as "their vectors have six elements" or "their first element is an expression"; those are
+    // shape arguments, and a shape argument invites somebody to widen the shape later.
+    struct GeometryFamily {
+      const char* name;      // "non-quant" / "mmq" / "mmq_k"
+      const char* kind;      // a TUNE_KINDS[] name.  A family whose kind is not registered is NOT searched.
+      const AxisDomain* axes;
+      size_t axisCount;
+      // 🔴 WHICH STOCK VECTORS BELONG TO THIS FAMILY.  Membership is DATA, not a derivation: the vectors
+      // above are the deduplicated literals of ggml-vulkan.cpp:5142-5160, and "which of them does this
+      // family build" is a fact about those source lines, not something the axis-value sets can answer.
+      // An earlier draft filtered the whole vector list by the family's declared values, which put
+      // `s_warptile_mmq` (BK=128) into the non-quant family -- a wrong answer that only showed up as an
+      // off-by-one in the catalogue's counts.
+      const size_t* presetIndices;
+      size_t presetCount;
+      bool applicable;       // per THIS binary: a fixed predicate (policy), never a runtime sample
+      const char* note;      // why it is applicable or not -- printed, so it cannot be silently dropped
+    };
+
+    // The stock cm2 vector list above, indexed.  `l/m/s_warptile` are the non-quant family; `mmq` and
+    // `mmq_k` build from their own five (three shared with the non-quant family by having the same values,
+    // two of their own).
+    const size_t CM2_PRESETS_NONQUANT[] = { 0, 1, 2 };
+    const size_t CM2_PRESETS_MMQ[]      = { 0, 1, 2, 3, 4 };
+    const size_t CM2_PRESETS_MMQ_K[]    = { 0, 1, 2, 3, 4 };
+
+    // The non-quant cm2 family is the one whose geometry this binary really can select: four src0-type
+    // pipelines (f32 / f32_f16 / f16 / f16_f32) are created from ONE warptile vector set
+    // (ggml-vulkan.cpp:5724-5727), and each of them is created twice, for the {f16,f32} accumulator
+    // (CREATE_MM2, :5710-5713).  The accumulation axis therefore does NOT split the domain -- the same
+    // five-element vector feeds every variant -- which is why the declaration is per GEOMETRY family and
+    // not per (src0 type, acc) pair, and why no accumulator has to be guessed here.
+    // 🔴 The quant families are NOT applicable to this binary, and the reason is a fact about what it
+    // compiles (tune-overview.md section 7.2 / :262: KataGo's weights are f16 and the mmq/q8_1 pipelines
+    // are never built here), not a shape argument about their vectors.  They are DECLARED rather than
+    // omitted so the catalogue's line says "0 searched, and here is why" instead of staying silent.
+    const GeometryFamily GEOMETRY_FAMILIES[] = {
+      { "non-quant", "mm", CM2_DOMAIN, CM2_DOMAIN_SIZE,
+        CM2_PRESETS_NONQUANT, sizeof(CM2_PRESETS_NONQUANT) / sizeof(CM2_PRESETS_NONQUANT[0]), true,
+        "cm2's f32/f32_f16/f16/f16_f32 pipelines are created from ONE warptile vector set "
+        "(ggml-vulkan.cpp:5724-5727) in both f16acc and f32acc variants (:5710-5713), so this domain "
+        "covers every accumulation variant this binary can select" },
+      { "mmq", "mm", CM2_DOMAIN, CM2_DOMAIN_SIZE,
+        CM2_PRESETS_MMQ, sizeof(CM2_PRESETS_MMQ) / sizeof(CM2_PRESETS_MMQ[0]), false,
+        "KataGo never compiles the quantization pipelines (its weights are f16), so no row this tuner "
+        "could install would reach them: out of scope by tune-overview.md section 7.2" },
+      { "mmq_k", "mm", CM2_DOMAIN, CM2_DOMAIN_SIZE,
+        CM2_PRESETS_MMQ_K, sizeof(CM2_PRESETS_MMQ_K) / sizeof(CM2_PRESETS_MMQ_K[0]), false,
+        "same as mmq: Qi_K quantization, not compiled on this backend" },
+    };
+    const size_t GEOMETRY_FAMILY_COUNT = sizeof(GEOMETRY_FAMILIES) / sizeof(GEOMETRY_FAMILIES[0]);
+
+    // ── the CANDIDATE-TABLE VERDICTS, as DATA ────────────────────────────────────────────────────────
+    // The predicate (`vk_tile_candidate_reason`) answers "is this geometry SELF-CONSISTENT".  It says so
+    // itself, in its own header: "Bounds beyond these sanity checks (BK sweep verdict, bucket membership)
+    // belong to the candidate table, not here" (vulkan-tile-validity.h:270-271).  This IS that table --
+    // the first two entries of it -- and it exists as DATA for one reason: a rule that lives only in a
+    // comment cannot be checked, and R44's second clause has to be able to say "the declared values
+    // satisfy the candidate table's verdicts".
+    //
+    // THE TWO DIRECTIONS ARE NOT THE SAME CLAIM, and conflating them is what makes a negative entry
+    // false.  A MUST rule names a configuration ALREADY PROVEN unusable (it does not build, or it
+    // computes the wrong answer) -- excluding it cannot make "nothing in this domain works" false.  A
+    // PRUNE rule means "legal, but not worth trying", so every PRUNE that really BITES narrows what we
+    // searched and weakens the verdict; that is what `pruneExcluded` records and what the
+    // `no-prune-in-effect` condition reads.
+    //
+    //   C4 (t1-predicate.md:105, measured in census-t05-shapes.md section 4.4): the BK axis's useful
+    //     values are {64} on cm2's stock geometry.  BK=128 is LEGAL (the predicate accepts it, and stock
+    //     itself builds `s_warptile_mmq` with BK=128) but it measured 33 ms pathological vs 1579.8 us at
+    //     BK=64 -- a PERFORMANCE verdict, therefore PRUNE, and its exclusion is the ledger's first real
+    //     entry.  "Unlock it" needs one experiment: a BK sweep on THIS device with this geometry, i.e.
+    //     re-run census-t05-shapes.md section 4.4 the day somebody suspects BK matters here.
+    //   E1 (t1-predicate.md:136): `WM == 16 && WN == 16 && BS >= 256` HUNG THE DRIVER, and the custom:
+    //     parser lets it through.  A MUST rule (an unusable configuration), and it is already covered by
+    //     "skip that combination" rather than by vk_tile_candidate_reason -- which is exactly why it has
+    //     to live here.  🔴 NOT REACHED by tonight's catalogue (the geometry presets never carry WM/WN,
+    //     and the five-axis domain does not sweep them), so it is RECORDED as data now and MUST land
+    //     before the SCALAR domain is ever widened: that is where those two axes become enumerable.
+    // A rule is one of two SHAPES, and which one it is determines how it is checked -- so the shape is a
+    // tag on the data rather than a name the checker compares against.  (The first draft switched on
+    // `r.name`, which meant a second rule could never be added without editing the checker; a rule table
+    // that only works for the rules already in it is a table nobody can extend.)
+    enum class RuleShape { AxisValue, ForbiddenCombo };
+    struct AxisValueRule {
+      const int* allowed;
+      size_t count;
+    };
+    struct ForbiddenCombo {
+      const int* values;   // three ints: fieldA, fieldB, and the floor on fieldC
+    };
+    struct CandidateRule {
+      const char* name;
+      const char* kind;
+      RuleShape shape;
+      const char* axis;    // the axis fieldA names; the exclusion sentence says which value was dropped
+      AxisValueRule values;      // shape == AxisValue
+      ForbiddenCombo combo;      // shape == ForbiddenCombo
+      bool prune;          // true = "legal but not worth trying"; false = MUST
+      const char* evidence;  // where the verdict comes from
+      const char* unlock;    // what experiment would lift it (PRUNE entries must name one)
+    };
+    const int C4_BK_ALLOWED[] = { 64 };
+    // The E1 blacklist, as data: {WM, WN, BS floor} -- the combination that hung the driver.
+    const int E1_FORBIDDEN[] = { 16, 16, 256 };
+    const CandidateRule CANDIDATE_RULES[] = {
+      { "C4-BK", "mm", RuleShape::AxisValue, "BK", { C4_BK_ALLOWED, 1 }, { nullptr }, true,
+        "census-t05-shapes.md section 4.4: mm total 64=1579.8us vs 128=2792.2us with 33 ms pathological "
+        "samples (BK=128 legal, just not worth trying)",
+        "re-run the BK sweep of census-t05-shapes.md section 4.4 on this device" },
+      { "E1-blacklist", "mm", RuleShape::ForbiddenCombo, nullptr, { nullptr, 0 },
+        { E1_FORBIDDEN }, false,
+        "t1-predicate.md:136 (E1): WM==16 && WN==16 && BS>=256 hung the driver, and the custom: "
+        "validation lets it through; the predicate does not cover the WM/WN axes at all",
+        nullptr },
+    };
+    const size_t CANDIDATE_RULE_COUNT = sizeof(CANDIDATE_RULES) / sizeof(CANDIDATE_RULES[0]);
+
+    // The geometry + the rule outcome of ONE candidate.  `ok` is exactly `negativeProvable`'s input: a
+    // candidate the rules rejected may not be measured, so it is neither legal nor excluded.
+    struct Candidate {
+      vk_tile_geometry geom;
+      bool legal;
+      string exclusion;   // empty = no PRUNE rule bit; otherwise the candidate-level exclusion sentence
+    };
+
+    bool axisValueAllowed(const int* values, size_t n, int v) {
+      for (size_t i = 0; i < n; i++) {
+        if (values[i] == v) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    // ONE reader for "the value of the named axis in this geometry".  The axis is spelled as the DATA
+    // spells it (the same names CM2_DOMAIN uses), so a rule and the domain cannot use two vocabularies.
+    // Returns 0 for an axis this build does not know, which every rule treats as "cannot judge" (skip).
+    int ruleAxisValue(const vk_tile_geometry& g, const char* axis) {
+      if (axis == nullptr) {
+        return 0;
+      }
+      const string a(axis);
+      if (a == "BS")      { return (int) g.BS; }
+      if (a == "BM")      { return (int) g.BM; }
+      if (a == "BN")      { return (int) g.BN; }
+      if (a == "BK")      { return (int) g.BK; }
+      if (a == "smaller") { return (int) g.smaller; }
+      if (a == "WM")      { return (int) g.WM; }
+      if (a == "WN")      { return (int) g.WN; }
+      return 0;
+    }
+
+    // The candidate-table verdicts for ONE geometry, into the out-parameters the catalogue carries.
+    //   `pruneName`  non-empty <=> a PRUNE rule rejected it.  The LEDGER entry (the rule's own name:
+    //                "which rule bit" is the question the `no-prune-in-effect` sentence answers).
+    //   `pruneDetail` the candidate-level sentence ("... excludes BK=128"): which VALUE it dropped, which
+    //                is what a reader needs in the log.
+    //   `mustName`   non-empty <=> a MUST rule rejected it.  An unusable configuration, not a preference.
+    // 🔴 `resolution` says whether the geometry is ADMISSIBLE, and it is a separate out-parameter for a
+    // reason this batch paid for: the first version returned `mustName.empty()`, so a PRUNE rule set
+    // `pruneName` and the function still said "fine".  The ledger filled up while 36 pre-defined
+    // candidates sailed through the gate they had just been excluded by -- and NOTHING in the line could
+    // tell that apart from "no rule bit".  Both directions now come out of ONE function, so the two
+    // readers (the ledger and the skip) cannot disagree.
+    //   "admissible" = admitted by the MUST rules AND not excluded by a PRUNE rule.  A MUST violation is
+    //   NOT an exclusion: it is unusable, so it belongs in neither the ledger nor the candidate set.
+    enum class RuleResolution { Admissible, ExcludedByPrune, RejectedByMust };
+
+    RuleResolution candidateRuleVerdict(const vk_tile_geometry& g, string& pruneName, string& pruneDetail,
+                                        string& mustName) {
+      pruneName.clear();
+      pruneDetail.clear();
+      mustName.clear();
+      for (size_t i = 0; i < CANDIDATE_RULE_COUNT; i++) {
+        const CandidateRule& r = CANDIDATE_RULES[i];
+        if (r.name == nullptr) {
+          continue;
+        }
+        if (r.shape == RuleShape::AxisValue) {
+          const int v = ruleAxisValue(g, r.axis);
+          if (v == 0 || axisValueAllowed(r.values.allowed, r.values.count, v)) {
+            continue;
+          }
+          if (r.prune) {
+            pruneName = r.name;
+            pruneDetail = string(r.name) + " excludes " + r.axis + "=" + to_string(v);
+          }
+          else {
+            mustName = r.name;
+          }
+        }
+        else if (r.shape == RuleShape::ForbiddenCombo) {
+          const int a = ruleAxisValue(g, "WM");
+          const int b = ruleAxisValue(g, "WN");
+          const int c = ruleAxisValue(g, "BS");
+          if (a != r.combo.values[0] || b != r.combo.values[1] || c < r.combo.values[2]) {
+            continue;
+          }
+          if (r.prune) {
+            pruneName = r.name;
+            pruneDetail = string(r.name) + " excludes WM=" + to_string(a) + " WN=" + to_string(b)
+                        + " BS=" + to_string(c);
+          }
+          else {
+            mustName = r.name;
+          }
+        }
+      }
+      // The MUST verdict wins: an unusable geometry is not "excluded by a preference", so a rule table
+      // that somehow hit both must not file it in the ledger.
+      if (!mustName.empty()) {
+        return RuleResolution::RejectedByMust;
+      }
+      if (!pruneName.empty()) {
+        return RuleResolution::ExcludedByPrune;
+      }
+      return RuleResolution::Admissible;
+    }
+
+    // The catalogue for ONE geometry family: it walks the DECLARED stock vector set (not the Cartesian
+    // product -- that is the probe's counting surface) and puts every preset through the REAL predicate and
+    // then through the candidate table.  It builds nothing: no pipeline, no file, no measurement.
+    //
+    // `d` receives the two facts the write side needs: `candidateCoverage` (HOW MUCH was searched) and
+    // `pruneExcluded` (which PRUNE rules really bit).  Both are set HERE and nowhere else, which is what
+    // makes them a property of the enumeration rather than of whoever calls it.
+    vector<Candidate> runCandidateCatalog(Decision* d) {
+      vector<Candidate> out;
+      const int path = VK_TILE_PATH_CM2;
+      for (size_t f = 0; f < GEOMETRY_FAMILY_COUNT; f++) {
+        const GeometryFamily& fam = GEOMETRY_FAMILIES[f];
+        if (!fam.applicable || !tuneKindKnown(fam.kind)) {
+          continue;   // not this binary's family / not a registered kind: nothing is searched or concluded
+        }
+        string bad;
+        if (!auditDomain(fam.axes, fam.axisCount, path, bad)) {
+          // LOUD.  A domain that cannot be audited must never read as "this family has no candidates".
+          if (d != nullptr) {
+            d->note = string("the ") + fam.name + " candidate domain was REFUSED by the M1 audit: " + bad;
+          }
+          continue;
+        }
+        vector<string> scopeHere;
+        for (size_t k = 0; k < sizeof(TUNE_KINDS) / sizeof(TUNE_KINDS[0]); k++) {
+          scopeHere.push_back(TUNE_KINDS[k].name);
+        }
+        // 🔴 THE LEDGER IS FILLED BY THE WALK BELOW, AND ONLY BY IT.  The first version of this looked at
+        // the DECLARED axis values as well ("does a rule reject a value this family declares") and that was
+        // wrong in a way worth recording: it made the ledger report an exclusion that had not narrowed the
+        // SEARCH, which is the one thing `no-prune-in-effect` exists to measure.  A rule "bites" exactly
+        // when it removes a candidate from the set this run considered -- and then that candidate is
+        // skipped, which is what the `continue` below encodes.
+        for (size_t pk = 0; pk < fam.presetCount; pk++) {
+          // 🔴 THE SEARCH DOMAIN IS THIS FAMILY'S OWN STOCK VECTORS, NOT THE CARTESIAN PRODUCT AND NOT the
+          // whole vector list.  An earlier draft walked the product here and reported `presets=72` (the
+          // two-answers failure this batch is about: the product is what the count-only probe reports as
+          // `declared`), and the draft after that filtered the WHOLE list by the family's axis values,
+          // which silently pulled the quant family's `s_warptile_mmq` into the non-quant search.  The
+          // membership is declared data now (see CM2_PRESETS_*), so neither mistake can recur.
+          const uint32_t* pv = CM2_PRESET_VECTORS[fam.presetIndices[pk]];
+          vk_tile_geometry g = cm2BaseGeometry();
+          g.BS      = pv[0];
+          g.BM      = pv[1];
+          g.BN      = pv[2];
+          g.BK      = pv[3];
+          g.smaller = (int) pv[4];
+          Candidate c;
+          c.geom = g;
+          c.legal = false;
+          string pruneName, pruneDetail, mustName;
+          const RuleResolution verdict = candidateRuleVerdict(g, pruneName, pruneDetail, mustName);
+          if (verdict == RuleResolution::RejectedByMust) {
+            continue;   // unusable: it belongs in neither the ledger nor the set this run searched
+          }
+          if (verdict == RuleResolution::ExcludedByPrune) {
+            // 🔴 THE LEDGER, and the candidate is SKIPPED in the same breath.  A rule "bites" exactly when
+            // it removes a candidate from the set this run considered -- so recording it and still
+            // considering the candidate would make `no-prune-in-effect` a statement about the table rather
+            // than about the search, which is the one thing it exists to measure.
+            if (d != nullptr) {
+              bool seen = false;
+              for (size_t k = 0; k < d->pruneExcluded.size(); k++) {
+                if (d->pruneExcluded[k] == pruneName) { seen = true; break; }
+              }
+              if (!seen) {
+                d->pruneExcluded.push_back(pruneName);
+              }
+            }
+            continue;
+          }
+          if (vk_tile_candidate_reason(path, g, vk_tile_wave_for(32)) != nullptr) {
+            continue;
+          }
+          c.legal = true;
+          c.exclusion = pruneDetail;
+          out.push_back(c);
+        }
+        // The coverage of THIS run, and the kinds it covered: the stock vector set is a SAMPLING SURFACE,
+        // not a sweep of the Cartesian domain the probe counts.  Set here, at the one place that knows what
+        // was searched -- and OUTSIDE the `if (d != nullptr)` guard's subject, because the guard belongs on
+        // the WRITE to the Decision, not on the walk that decides what was searched.
+        // ⚠️ `negativeScope` is latent tonight and that is stated rather than hidden: no write path can
+        // emit a marker yet (the conditions refuse one, and the completeness gate refuses the file), so
+        // this value is not read by anything today.  It is set because it is a FACT ABOUT THE SEARCH, and
+        // because the writer refuses an unscoped marker -- when a marker does become reachable, the scope
+        // it needs is already the truthful one instead of a literal somebody picks.
+        if (d != nullptr) {
+          // 🔴 THE PRODUCTION SETTER OF `rowSource = "measured"` (W4b commit 2).  It is the whole point of
+          // this batch's write side: the enumerator is the ONLY thing that may say "these candidates are
+          // this process's own measurement", and until this cut nothing did (R42 counted 0 production
+          // setters and the self-test's named helper was the only way to mint the state).  Set here, in the
+          // same breath as the coverage, because the two are one claim: THIS process produced THIS set.
+          d->rowSource = "measured";
+          d->candidateCoverage = "sampled";
+          if (d->negativeScope.empty()) {
+            d->negativeScope = scopeHere;
+          }
+        }
+        break;   // ONE live family today; a second one joins with its own kind and its own coverage rule
+      }
+      return out;
+    }
+
+    // The catalogue's own line (the probe above reports the DECLARED domain; this reports the SEARCH).
+    // Full lines only, never truncated: a dropped entry would read as "not excluded", which is the one
+    // direction this line must not fail in.
+    string formatCandidateCatalog(const Decision& d, const vector<Candidate>& cands) {
+      // The declared / post-rule pair PER FAMILY, recomputed from the declaration and the rule table
+      // rather than stored, so the two numbers can never disagree with what they describe.  Per family
+      // and not in one running variable: with three families in the table, a single pair would report
+      // the LAST family's numbers against every family's name.
+      size_t declaredCount[GEOMETRY_FAMILY_COUNT] = {};
+      size_t postRuleCount[GEOMETRY_FAMILY_COUNT] = {};
+      size_t calls = 0, ruleRefused = 0, bkSurvived = 0, inconsistent = 0;
+      for (size_t f = 0; f < GEOMETRY_FAMILY_COUNT; f++) {
+        const GeometryFamily& fam = GEOMETRY_FAMILIES[f];
+        if (!fam.applicable || !tuneKindKnown(fam.kind)) {
+          continue;
+        }
+        size_t prod = 1;
+        for (size_t i = 0; i < fam.axisCount; i++) {
+          prod *= fam.axes[i].count;
+        }
+        declaredCount[f] = prod;
+        // Re-walk the product so the "after the rules" number is measured, not derived from the ledger.
+        for (size_t v0 = 0; v0 < fam.axes[0].count; v0++) {
+          for (size_t v1 = 0; v1 < fam.axes[1].count; v1++) {
+            for (size_t v2 = 0; v2 < fam.axes[2].count; v2++) {
+              for (size_t v3 = 0; v3 < fam.axes[3].count; v3++) {
+                for (size_t v4 = 0; v4 < fam.axes[4].count; v4++) {
+                  vk_tile_geometry g = cm2BaseGeometry();
+                  g.BS      = fam.axes[0].values[v0];
+                  g.BM      = fam.axes[1].values[v1];
+                  g.BN      = fam.axes[2].values[v2];
+                  g.BK      = fam.axes[3].values[v3];
+                  g.smaller = (int) fam.axes[4].values[v4];
+                  string pruneName, pruneDetail, mustName;
+                  calls++;
+                  const RuleResolution v = candidateRuleVerdict(g, pruneName, pruneDetail, mustName);
+                  // 🔴 A PERMANENT cross-check, and it stays: this line's whole subject is "how much did
+                  // the rules take away", and the failure this batch hit was exactly a disagreement between
+                  // "a rule named a candidate" and "the candidate was skipped" (the first version's
+                  // `return mustName.empty()` admitted everything a PRUNE had just excluded, so the ledger
+                  // filled while the count did not move).  The two halves are asserted against EACH OTHER
+                  // here, offline, forever -- a rule table whose `prune` flag stops matching the skip is a
+                  // red line rather than a plausible-looking number.
+                  if (v == RuleResolution::ExcludedByPrune) {
+                    if (pruneName.empty()) { inconsistent++; }
+                    ruleRefused++;
+                    continue;
+                  }
+                  if (v == RuleResolution::RejectedByMust) {
+                    if (mustName.empty()) { inconsistent++; }
+                    ruleRefused++;
+                    continue;
+                  }
+                  if (!pruneName.empty() || !mustName.empty()) { inconsistent++; }
+                  if (g.BK == 128) { bkSurvived++; }
+                  // `postRule` counts what survives the CANDIDATE TABLE, MUST and PRUNE alike -- it is the
+                  // domain this build would be willing to build, before any question of provenance or
+                  // coverage.  Counting only what the predicate also accepts would make this number equal
+                  // to `legal` below and hide the effect of the rules, which is the one thing the pair
+                  // `declared -> postRule` exists to show.
+                  postRuleCount[f]++;
+                }
+              }
+            }
+          }
+        }
+      }
+      size_t legal = 0;
+      for (size_t i = 0; i < cands.size(); i++) {
+        if (cands[i].legal) {
+          legal++;
+        }
+      }
+      ostringstream os;
+      os << "candidate catalog: path=cm2";
+      for (size_t f = 0; f < GEOMETRY_FAMILY_COUNT; f++) {
+        const GeometryFamily& fam = GEOMETRY_FAMILIES[f];
+        os << " family=" << fam.name << " kind=" << fam.kind
+           << (fam.applicable && tuneKindKnown(fam.kind) ? " applicable=1" : " applicable=0")
+           << " declared=" << declaredCount[f]
+           << " postRule=" << postRuleCount[f];
+      }
+      os << " presets=" << cands.size() << " legal=" << legal
+         << " excluded=" << d.pruneExcluded.size() << " by-rule:";
+      if (d.pruneExcluded.empty()) {
+        os << " none";
+      }
+      else {
+        for (size_t i = 0; i < d.pruneExcluded.size(); i++) {
+          os << " " << d.pruneExcluded[i] << ";";
+        }
+      }
+      os << " coverage=" << d.candidateCoverage
+         << " remaining=unknown (the format carries no coverage field while sampling cannot be remembered)";
+      // The offline cross-check, on the SAME line so the two readings cannot be compared from different
+      // runs: `calls` = geometries the candidate table judged, `ruleRefused` = how many it took away, and
+      // `inconsistent` = 0 means the rule function's verdict and its out-parameters agreed every time.
+      os << " (postRule-check calls=" << calls << " ruleRefused=" << ruleRefused
+         << " bk128Admitted=" << bkSurvived << " inconsistent=" << inconsistent << ")";
+      return os.str();
+    }
+
     // ---- the KIND registry and the completeness gate (C4) --------------------------------
     // A cache file is a statement about the WHOLE key, so it may only be written when every kind
     // this identity can select for has a CONCLUSION in this decision: rows this process really
@@ -770,13 +1304,8 @@ namespace VulkanTuner {
     // that adding one cannot be done without a rule here.  A kind with no arm below is an INTERNAL
     // error and refuses the write loudly -- "treat it as concluded" is the one behaviour that
     // would turn the whole rule into a decoration.
-    struct TuneKindSpec {
-      const char* name;
-    };
-    const TuneKindSpec TUNE_KINDS[] = {
-      { "mm" },   // matmul rows: the only kind this tuner can produce so far (FA adds a row)
-    };
-
+    // The KIND registry itself (TUNE_KINDS + tuneKindKnown) is declared next to NEGATIVE_REASONS at the
+    // top of this namespace: the parser and the candidate catalogue both need it, and it must be ONE list.
     // The name of the first declared kind that has NO conclusion, or nullptr when complete.
     // `internal` separates "this measurement is partial" (a legitimate state, and the caller says
     // so) from "this build has no rule for that kind" (a defect): both refuse the write.
@@ -999,6 +1528,10 @@ namespace VulkanTuner {
       vector<vk_tune_row_spec> rows;
       bool negative = false;
       string negativeReason;
+      // W4b: WHICH KINDS the NEGATIVE line speaks for, from the closed set of TUNE_KINDS[] names.  It is
+      // REQUIRED on the line (an unscoped marker would have to be read as "some kind", the fail-open
+      // default the closed set refuses), so an empty vector here can only mean "no NEGATIVE line".
+      vector<string> negativeScope;
       // Human-readable keys that were ABSENT; the caller logs them as "not key-checked"
       // rather than pretending the check happened.
       vector<string> absentKeys;
@@ -1263,11 +1796,58 @@ namespace VulkanTuner {
           // and an arbitrary sentence are not the same assertion, and only one of them is safe to
           // act on.  Declaring the rule per reason is what keeps a FUTURE reason with a different
           // lifetime from being added without saying so (R17 pins both fields).
-          const string reason = line.substr(9);
+          // W4b: the line is `NEGATIVE <reason> <kind>[,<kind>...]` and BOTH tokens are closed sets --
+          // the reason from NEGATIVE_REASONS (what the claim MEANS, and how long it lives) and the scope
+          // from TUNE_KINDS (which kinds it is ABOUT).  The scope is what keeps a key-level marker from
+          // asserting a kind this run never measured; it is REQUIRED rather than optional, because an
+          // absent scope would have to be read as "all kinds" -- a fail-open default with the same shape
+          // as accepting an unknown reason.  A malformed line (missing scope, empty token, repeated kind)
+          // is refused for the same reason an unknown key is: a claim we cannot interpret must not load
+          // as if it had said nothing.
+          const string payload = line.substr(9);
+          const size_t sp = payload.find(' ');
+          const string reason = (sp == string::npos) ? payload : payload.substr(0, sp);
+          const string scopeText = (sp == string::npos) ? string() : payload.substr(sp + 1);
           if (!negativeReasonKnown(reason)) {
             err = "NEGATIVE line " + to_string(lineNo) + ": unknown reason '" + reason
                 + "' (the reason is a closed set; see NEGATIVE_REASONS)";
             return false;
+          }
+          if (scopeText.empty()) {
+            err = "NEGATIVE line " + to_string(lineNo) + ": no scope (expected 'NEGATIVE <reason> "
+                  "<kind>[,<kind>...]'): an unscoped marker does not say which kind it is about, and "
+                  "reading it as 'all kinds' would assert kinds this run never measured";
+            return false;
+          }
+          out.negativeScope.clear();
+          {
+            string cur;
+            for (size_t i = 0; i <= scopeText.size(); i++) {
+              if (i == scopeText.size() || scopeText[i] == ',') {
+                if (cur.empty()) {
+                  err = "NEGATIVE line " + to_string(lineNo) + ": empty kind in scope '" + scopeText + "'";
+                  return false;
+                }
+                if (!tuneKindKnown(cur)) {
+                  err = "NEGATIVE line " + to_string(lineNo) + ": unknown kind '" + cur
+                      + "' in scope (the kind set is TUNE_KINDS; a marker about a kind this build does "
+                        "not know must not load)";
+                  return false;
+                }
+                for (size_t k = 0; k < out.negativeScope.size(); k++) {
+                  if (out.negativeScope[k] == cur) {
+                    err = "NEGATIVE line " + to_string(lineNo) + ": kind '" + cur
+                        + "' repeated in scope '" + scopeText + "'";
+                    return false;
+                  }
+                }
+                out.negativeScope.push_back(cur);
+                cur.clear();
+              }
+              else {
+                cur.push_back(scopeText[i]);
+              }
+            }
           }
           out.negative = true;
           out.negativeReason = reason;
@@ -1381,9 +1961,42 @@ namespace VulkanTuner {
       // W2: this test now runs on the rows actually emitted.  When every row was dropped the emitted
       // set is EMPTY and a NEGATIVE-only file is exactly the right statement -- which is the
       // structural-all-reject outcome; the old `d.rows` spelling would have refused to write it.
+      //
+      // 🔴 W4b: the refusal is limited to the SAME KIND, and the general rule is now stated (rather than
+      // left to be re-derived): a file may carry ROW lines of one kind AND a NEGATIVE entry about
+      // ANOTHER, because those are statements about DIFFERENT kinds and the scope on the NEGATIVE line is
+      // what keeps them from contradicting each other.  What the format forbids is one kind being both
+      // "here are the rows" and "there is nothing here".  Since rows are mm rows today and TUNE_KINDS has
+      // exactly one member, every existing shape is still refused exactly as before -- the behaviour is
+      // unchanged, and adding `fa` will not need a second SCHEMA_VERSION bump to make mixing legal.
+      auto rowsKind = [](const vk_tune_row_spec& r) -> const char* {
+        // The row's kind is implied by which row family it is.  Today one family, so one answer; the
+        // mapping belongs HERE, next to the writer that has to decide, and it must move with TUNE_KINDS.
+        (void) r;
+        return "mm";
+      };
       if (!rows.empty() && d.negative) {
-        throw StringError("VulkanTuner: refusing to write a file with both ROW and NEGATIVE"
-                          " (one file = one key: the two are exclusive statements)");
+        bool sameKind = false;
+        for (size_t i = 0; i < d.negativeScope.size(); i++) {
+          for (size_t r = 0; r < rows.size(); r++) {
+            if (d.negativeScope[i] == rowsKind(rows[r])) {
+              sameKind = true;
+              break;
+            }
+          }
+          if (sameKind) {
+            break;
+          }
+        }
+        // An UNSCOPED marker cannot be told apart from one about the rows' own kind, so it is refused
+        // too: the safe direction is the one that cannot write a self-contradicting file.  (The writer
+        // refuses an empty scope outright further down; this branch is what keeps the CONTENT rule
+        // fail-closed rather than depending on which check happens to run first.)
+        if (d.negativeScope.empty() || sameKind) {
+          throw StringError("VulkanTuner: refusing to write a file with both ROW and NEGATIVE for the "
+                            "SAME kind (one file = one key: for one kind the two are exclusive "
+                            "statements; rows of one kind next to a marker about ANOTHER are allowed)");
+        }
       }
       // The writer enforces the SAME cap the parser does (MAX_ROWS_PER_FILE).  Refusing to
       // write an over-cap set is the only honest option: writing it would produce a file
@@ -1417,7 +2030,31 @@ namespace VulkanTuner {
                             + d.negativeReason + "' (it is not in the closed set, and a file this "
                             "tuner cannot re-read must not be written)");
         }
-        os << "NEGATIVE " << d.negativeReason << "\n";
+        // W4b: the SCOPE is mandatory and closed-set too, and the writer enforces it for the same reason
+        // the parser does -- a file this tuner produces must be one it can read back.  Duplicates are
+        // collapsed AFTER checking, so the emitted line is canonical without the writer having to trust
+        // whatever built the Decision.
+        if (d.negativeScope.empty()) {
+          throw StringError("VulkanTuner: refusing to write an UNSCOPED NEGATIVE entry (reason '"
+                            + d.negativeReason + "'): the marker must name the kinds it is about, "
+                            "because 'no scope' cannot be read as 'all kinds'");
+        }
+        string scopeLine;
+        for (size_t i = 0; i < d.negativeScope.size(); i++) {
+          if (!tuneKindKnown(d.negativeScope[i])) {
+            throw StringError("VulkanTuner: refusing to write a NEGATIVE entry whose scope names the "
+                              "unknown kind '" + d.negativeScope[i] + "' (the kind set is TUNE_KINDS)");
+          }
+          bool seen = false;
+          for (size_t k = 0; k < i; k++) {
+            if (d.negativeScope[k] == d.negativeScope[i]) { seen = true; break; }
+          }
+          if (seen) {
+            continue;
+          }
+          scopeLine += (scopeLine.empty() ? "" : ",") + d.negativeScope[i];
+        }
+        os << "NEGATIVE " << d.negativeReason << " " << scopeLine << "\n";
       }
       return os.str();
     }
@@ -1705,14 +2342,30 @@ namespace VulkanTuner {
     // a comment.  A named helper rather than inline assignments keeps the count a count of STATES
     // rather than of text occurrences.
     auto aMeasuredSet = [](Decision & x) { x.rowSource = "measured"; };
+    // W4b: the other two states the four-condition row needs, minted the same way.  They must be set
+    // EXPLICITLY even though their satisfying values are "swept" and "empty": `candidateCoverage` starts
+    // at the fail-closed "unknown" and `pruneExcluded` starts empty, so a fixture that only relied on the
+    // defaults would satisfy `no-prune-in-effect` for the wrong reason -- and the breaker for that
+    // condition (below) exists precisely because a condition whose default is "satisfied" is the one that
+    // can decay into a comment.
+    auto aSweptSet = [](Decision & x) { x.candidateCoverage = "swept"; };
 
     // One breaker per condition NAME in the closed set: the refusing direction of a condition can only
     // be tested by making THAT condition false.  A name with no breaker returns false, and the caller
     // turns that into a FAIL rather than a skip -- an untestable condition is precisely what this loop
     // exists to prevent (a declared condition that nothing can falsify is a comment with a name).
+    // 🔴 W4b: `no-prune-in-effect` is the one condition whose SATISFYING direction is the DEFAULT (an
+    // empty ledger), so its breaker has to CONSTRUCT a non-empty one.  A breaker that merely cleared the
+    // vector would be a no-op on a fixture whose vector is already empty -- it would "test" the condition
+    // without ever falsifying it, which is the failure mode condition (b) of the mutation list is aimed at.
     auto breakCondition = [](const string & name, Decision & x) {
       if (name == "device-only")   { x.allRejectReasonsAreDevice = false; return true; }
       if (name == "measured-here") { x.rowSource = "none";                 return true; }
+      if (name == "swept-here")    { x.candidateCoverage = "sampled";      return true; }
+      if (name == "no-prune-in-effect") {
+        x.pruneExcluded.push_back("C4-BK excludes BK=128");
+        return true;
+      }
       return false;
     };
 
@@ -1738,12 +2391,21 @@ namespace VulkanTuner {
         // a fixture that only met `device-only` would fail this loop's positive direction, which is
         // how "the table gained a condition nobody's fixture knows about" announces itself.
         aMeasuredSet(d);
+        // W4b: the row now names FOUR, and the scope is mandatory for the writer, so the fixture carries
+        // it.  Each new condition gets its state set HERE rather than left to a default: the positive
+        // direction of this loop is what makes forgetting one of them a FAIL instead of a silent pass
+        // (the same position W3-P1 landed in, one condition ago).
+        aSweptSet(d);
+        d.negativeScope.clear();
+        d.negativeScope.push_back("mm");
       }
       else if (o.writable && string(o.klass) == "completed") {
         // The rows-file shape: one legal row, so the CONTENT gate passes and only the state gate
         // is left to check.  The geometry is the one the smoke's A3 leg proves legal, and the
         // verdict below re-checks it against the rule table -- a self-test whose own fixture went
         // illegal would otherwise test nothing while looking green.
+        aMeasuredSet(d);
+        aSweptSet(d);
         vk_tune_row_spec r {};
         r.path = VK_TILE_PATH_SCALAR;
         r.src0_type = 1;
@@ -1848,7 +2510,10 @@ namespace VulkanTuner {
       // W3-P1: provenance is satisfied for BOTH readings, so the only thing they differ in is
       // `device-only` -- which is what makes this leg a test of G-D20 rather than of the table as a
       // whole (with the candidates unmet, both readings would be false and the leg would prove nothing).
+      // W4b: the other conditions are satisfied for the same reason -- this leg is about ONE of the four,
+      // and a leg that left two others unmet would go green for the wrong cause.
       aMeasuredSet(d);
+      aSweptSet(d);
       d.allRejectReasonsAreDevice = false;   // one reason came from our own gap
       const bool refusedOurGap = !outcomeWritable(d);
       d.allRejectReasonsAreDevice = true;    // every reason is a device property
@@ -2059,10 +2724,14 @@ namespace VulkanTuner {
       d.install.declared = 1;
       d.install.installed = 0;
       d.allRejectReasonsAreDevice = true;
-      // W3-P1: the control must satisfy BOTH conditions, or it would not be a control -- it would be a
+      // W3-P1: the control must satisfy the OTHER conditions, or it would not be a control -- it would be a
       // second refusal case.  With provenance met, the marker is writable: that is the positive half the
-      // table still has to allow, and (i) below is its mirror image.
+      // table still has to allow, and (i) below is its mirror image.  W4b raised the count from two to
+      // four, so all four are set here; the scope is what makes the writer accept the marker at all.
       aMeasuredSet(d);
+      aSweptSet(d);
+      d.negativeScope.clear();
+      d.negativeScope.push_back("mm");
       verdictCase("(d) device-only all-reject", d, Decision::FinalizeVerdict::DeviceOnlyAllReject,
                   Decision::FinalizeVerdict::DeviceOnlyAllReject, true, nullptr);
       if (!outcomeWritable(d) || !cacheEntryWritable(d)) {
@@ -2208,12 +2877,53 @@ namespace VulkanTuner {
       }
     }
 
+    { // (j) D3b: THE WRITE PATH IS EXCEPTION-SAFE, and this case is the only executor that clause has.
+      // The shape it builds is one the FORMATTER refuses by throwing (a marker AND a row for the SAME
+      // kind), and the point is that the refusal comes back as a REFUSAL rather than as an exception out
+      // of the shell.  Every other case above either has no rows or a marker of another kind, so without
+      // this one the `try`/`catch` around the export and cache paths would be a clause nothing could
+      // falsify -- which is the "declared but never executed" gap this project refuses to ship.  The
+      // criterion is the refusal's OWN prefix: a writer that crashed would not produce a string at all.
+      Decision d;
+      d.deviceName = "self-test";
+      d.cachePath = probePath;
+      d.outcome = "structural-all-reject";
+      d.negative = true;
+      d.negativeReason = "no-injection-slot";
+      d.negativeOrigin = Decision::NegativeOrigin::AllReject;
+      aMeasuredSet(d);
+      aSweptSet(d);
+      d.allRejectReasonsAreDevice = true;   // or the FIRST unmet condition refuses, and the formatter is never reached
+      d.negativeScope.clear();
+      d.negativeScope.push_back("mm");   // the SAME kind the row below carries: the formatter refuses that
+      d.install.declared = 1;
+      d.install.installed = 1;
+      vk_tune_row_spec r {};
+      r.path = VK_TILE_PATH_SCALAR;
+      r.src0_type = 1;
+      r.src1_type = 0;
+      r.geom.BM = 64; r.geom.BN = 64; r.geom.BK = 0;
+      r.geom.WM = 32; r.geom.WN = 32; r.geom.WMITER = 1;
+      r.geom.TM = 4; r.geom.TN = 4; r.geom.BS = 128;
+      r.geom.pad = -1; r.geom.reshape = -1; r.geom.smaller = -1;
+      d.rows.push_back(r);
+      string jErr;
+      const bool jWrote = writeCacheIfAllowed(d, policy, jErr);
+      if (jWrote || jErr.find("the cache entry was refused") == string::npos) {
+        verdictOk = false;
+        if (verdictBad.empty()) {
+          verdictBad = string("(j) the formatter's refusal did not come back as a refusal: wrote=")
+                     + (jWrote ? "YES (BUG)" : "no") + ", err='" + jErr + "'";
+        }
+      }
+    }
+
     const bool absent = !FileUtils::exists(probePath);    logLine("cache write self-test: " + to_string(declared) + " outcome(s) declared, "
             + to_string(refused) + " refused by the state gate, " + to_string(allowed)
             + " state-writable; probe file " + (absent ? "absent" : "PRESENT")
             + "; encoding probe (non-ASCII name) written+read-back+removed ["
             + ((encWrote && encReadBack && encRemoved) ? "ok" : "FAIL") + "]"
-            + "; (a)(b) no marker / (c) from-file retirement / (d) measured control / (e) our-gap / (f) all-reject->measured retracts / (g)(h) fold AND+mismatch / (i) unmeasured marker refused by name ["
+            + "; (a)(b) no marker / (c) from-file retirement / (d) measured control / (e) our-gap / (f) all-reject->measured retracts / (g)(h) fold AND+mismatch / (i) unmeasured marker refused by name / (j) the formatter's throw is contained ["
             + (verdictOk ? "ok" : "FAIL: " + verdictBad) + "]"
             + " [" + ((ok && absent && encWrote && encReadBack && encRemoved && verdictOk) ? "ok" : "FAIL") + "]"
             + (ok ? "" : " first problem: " + firstBad));
@@ -2356,6 +3066,11 @@ namespace VulkanTuner {
           // gets its OWN line so the two self-tests stay distinguishable in the evidence.  It writes
           // nothing, so it cannot be mistaken for a decision.
           logLine("candidate enumeration: " + enumerateCandidateCounts(d->deviceSubgroupSize));
+          // W4b commit 2: the SEARCH itself, on a second line -- the probe above says how big the declared
+          // domain is, this says what was actually looked at and which rules narrowed it.  Kept separate on
+          // purpose: one line, one question (the probe is the declaration's business, the catalogue is the
+          // search's), and the smoke asserts the grammar of each independently.
+          logLine(formatCandidateCatalog(*d, runCandidateCatalog(d.get())));
         }
       }
 
@@ -2537,6 +3252,56 @@ namespace VulkanTuner {
             if (fromImport) {
               d->importedFrom = loadPath;
             }
+            // W4b: THE SCOPE CHECK, and it is DEEPENED DEFENCE rather than a production guard -- stated
+            // here so nobody strengthens the claim later by accident.  Two INDEPENDENT reasons make a
+            // mismatching file unreachable from our own writer:
+            //   (i) the kind SET is a function of the IDENTITY (KATAGO_VK_FA* is a POLICY knob, and POLICY
+            //       is a header key), so one identity never alternates between "mm only" and "mm+fa" --
+            //       two different identities are two different files;
+            //   (ii) the completeness gate (allKindsConcluded) requires a file to cover EVERY registered
+            //       kind, so the writer cannot produce a subset-scoped one.
+            // It is still checked, because the file is not always ours: a hand-edited or reflowed file can
+            // say anything, and a marker that does not cover a kind this run can select must not suppress
+            // that kind's measurement.  A marker about FEWER kinds than this build has is therefore
+            // refused; one about MORE kinds cannot exist today, since the parser's closed set IS
+            // TUNE_KINDS (the `tuneKindKnown` call above), and the day a kind is removed from the registry
+            // this comparison has to be revisited with it.
+            if (file.negative) {
+              string uncovered;
+              for (size_t k = 0; k < sizeof(TUNE_KINDS) / sizeof(TUNE_KINDS[0]); k++) {
+                bool covered = false;
+                for (size_t i = 0; i < file.negativeScope.size(); i++) {
+                  if (file.negativeScope[i] == TUNE_KINDS[k].name) { covered = true; break; }
+                }
+                if (!covered) {
+                  uncovered = TUNE_KINDS[k].name;
+                  break;
+                }
+              }
+              if (!uncovered.empty()) {
+                string declared;
+                for (size_t i = 0; i < file.negativeScope.size(); i++) {
+                  declared += (i ? "," : "") + file.negativeScope[i];
+                }
+                // The refusal takes the same shape as every other rejection above: NOTE is set, and
+                // nothing about the file reaches the Decision.  In particular the ROWS are dropped too
+                // -- a file whose own marker does not speak for this build is not a file to half-trust,
+                // and "rows win, loudly" is reserved for the ROW+NEGATIVE-SAME-KIND case below, which is
+                // a statement the format itself forbids rather than one this build cannot interpret.
+                refuseLoad(loadKind, "NEGATIVE scope [" + declared + "] does not cover the kind '"
+                                    + uncovered + "' this build can select (the marker does not speak "
+                                      "for it, so it must not suppress it)");
+                d->cacheState = "rejected";
+                d->note = string(loadKind) + " carries a marker that does not speak for this run";
+                d->rows.clear();
+                d->rowCount = 0;
+                d->negative = false;
+                d->negativeScope.clear();
+                d->negativeReason.clear();
+                d->rowSource = "none";
+              }
+            }
+            if (d->cacheState != "rejected") {
             d->rows = file.rows;
             d->rowCount = d->rows.size();
             d->rowSource = fromImport ? "import" : "cache";
@@ -2547,6 +3312,12 @@ namespace VulkanTuner {
             const bool adoptedNegative = negativeAdoptable(file, fromImport);
             d->cacheState = adoptedNegative ? "negative" : "loaded";
             d->negative = adoptedNegative;
+            if (adoptedNegative) {
+              // W4b: the SCOPE travels with the marker.  EXPORT re-emits the line, so dropping it here
+              // would make the round trip lose the very field this batch added -- and the cache writer
+              // refuses an unscoped marker, so a loaded-then-exported file would become unwritable.
+              d->negativeScope = file.negativeScope;
+            }
             if (fromImport && file.negative && file.rows.empty()) {
               // The marker is NOT adopted, and that must be LOUD: with an empty row set this file is
               // byte-shape-identical to the trap file that says neither ROW nor NEGATIVE, so
@@ -2578,6 +3349,7 @@ namespace VulkanTuner {
               // The rows are the useful thing, so they win -- but saying nothing would turn
               // "we wrote NEGATIVE and it still installed rows" into a mystery (lesson #46).
               d->cacheState = "loaded";
+              d->negativeScope.clear();
               logLine("WARNING: " + string(loadKind) + " has both ROW and NEGATIVE for this key"
                       " (the writer never emits that); using the " + to_string(d->rowCount)
                       + " row(s) and treating the negative entry as stale");
@@ -2594,6 +3366,7 @@ namespace VulkanTuner {
               d->note = string(loadKind) + " loaded: " + to_string(d->rowCount) + " row(s)"
                       + keyNote;
             }
+            }
           }
         }
       }
@@ -2602,15 +3375,36 @@ namespace VulkanTuner {
       // the format's round trip is exercised on every run that asks for it (and so a failed
       // write is loud rather than a missing file nobody notices).
       if (!exportEnv.empty()) {
-        const string content = formatRowsFile(*d);
-        const string path = exportEnv;
+        // W4b (D3b): the EXPORT path is wrapped in its own protection, because `formatRowsFile` REFUSES
+        // some decisions by THROWING (a NEGATIVE entry whose reason or scope is outside its closed set,
+        // more rows than the cap, ROW and NEGATIVE for the same kind).  Until this batch that refusal
+        // escaped to makeDecision's outer catch and killed the run after the work was already done; the
+        // contract every other write path already states -- "every load failure is fail-open + loud, never
+        // an exception out of the hook" -- applies to a write path at least as much, since a tuner that
+        // can take down a search is worse than no tuner.  Same shape as the cache path: convert to an
+        // error string and say so, loudly, rather than propagating.
+        // R16's clause about this: EVERY declared write path must be exception-safe, export and cache
+        // alike -- the declaration is what makes the next write path have to answer the same question.
+        string path = exportEnv;
         string err;
+        string content;
         // WRITE-PATH: export
         // Declared for guardrail R16.  An export writes a file the OPERATOR named, never the
         // cache, so it is allowed even in read-only mode (vulkanTune=off) -- which is why this
         // is the one write path that does not have to sit behind a policy.off gate.  The cache
         // write path (step 3) carries its own tag and MUST be gated.
-        if (writeFileAtomic(path, content, err)) {
+        bool wrote = false;
+        try {
+          content = formatRowsFile(*d);
+          wrote = writeFileAtomic(path, content, err);
+        }
+        catch (const std::exception& e) {
+          wrote = false;
+          err = string("the export was refused by the formatter: ") + e.what();
+        }
+        // ONE reporting site for both outcomes, so the success line and the failure line cannot drift
+        // apart and neither can be forgotten.
+        if (wrote) {
           logLine("export path=" + path + " rows=" + to_string(d->rowCount)
                   + " bytes=" + to_string(content.size()) + " ok");
         }
