@@ -597,6 +597,161 @@ namespace VulkanTuner {
       return nullptr;
     }
 
+    // ── W4b (⑤ 第一刀): THE DECLARED VALUE DOMAIN AND THE COUNT-ONLY PROBE ──────────────────────────
+    // Why this exists before anything is measured: the enumerator's job is to answer "is there ANY
+    // geometry this device can install", and an honest answer has to say HOW MUCH was searched.  The count
+    // is what decides whether the declared domain can be swept or has to be sampled (w4b-preview.md §9),
+    // and it must come from the REAL predicate -- a second implementation in a script would be the second
+    // derivation that R34 and F17 forbid.
+    //
+    // WHERE THE NUMBERS COME FROM (both READ from the source, not guessed):
+    //   * the values are the distinct LITERAL entries of the stock `*_warptile*` tables in
+    //     ggml-vulkan.cpp (:5142-5160 for the cm2 branch);
+    //   * the five-element ORDER is {BLOCK_SIZE, BM, BN, BK, enable_smaller_matrices}, pinned by
+    //     mul_mm_cm2.comp:31-36 (the spec constant ids) and spelled out at ggml-vulkan.cpp:5055 -- and
+    //     independently by the validity header's own note (vulkan-tile-validity.h:42-44).
+    // 🔴 The scalar and cm1 paths have NO declared domain ON PURPOSE: their stock tables are built from
+    // dynamic expressions (`subgroup_size_8`, `tm_l`, `s_warptile_wm`, ...), so their numeric domains cannot
+    // be read off as literals -- and inventing them here would be exactly the "second spelling of the
+    // domain" F17 bans.  The probe reports them LOUDLY as undeclared instead of counting a guess.
+    // The fields the domain does not sweep come from the SHADER's own declared defaults
+    // (mul_mm_cm2.comp:31-36), which is the one legal source for a value nobody enumerates.
+    struct AxisDomain {
+      const char* name;
+      int axis;
+      const uint32_t* values;
+      size_t count;
+    };
+    const uint32_t CM2_BS_VALUES[]      = { 128, 256 };
+    const uint32_t CM2_BM_VALUES[]      = { 32, 64, 128 };
+    const uint32_t CM2_BN_VALUES[]      = { 64, 128, 256 };
+    const uint32_t CM2_BK_VALUES[]      = { 64, 128 };
+    const uint32_t CM2_SMALLER_VALUES[] = { 0, 1 };
+    const AxisDomain CM2_DOMAIN[] = {
+      { "BS",      VK_TILE_AXIS_BS,      CM2_BS_VALUES,      2 },
+      { "BM",      VK_TILE_AXIS_BM,      CM2_BM_VALUES,      3 },
+      { "BN",      VK_TILE_AXIS_BN,      CM2_BN_VALUES,      3 },
+      { "BK",      VK_TILE_AXIS_BK,      CM2_BK_VALUES,      2 },
+      { "smaller", VK_TILE_AXIS_SMALLER, CM2_SMALLER_VALUES, 2 },
+    };
+    const size_t CM2_DOMAIN_SIZE = sizeof(CM2_DOMAIN) / sizeof(CM2_DOMAIN[0]);
+
+    // The values the domain does NOT sweep: the shader's own defaults (mul_mm_cm2.comp:31-36).
+    vk_tile_geometry cm2BaseGeometry() {
+      vk_tile_geometry g = {};
+      g.BM = 64; g.BN = 64; g.BK = 16;
+      g.WM = 32; g.WN = 32; g.WMITER = 2;
+      g.TM = 4;  g.TN = 2;  g.BS = 256;
+      g.pad = -1; g.reshape = -1; g.smaller = -1;
+      return g;
+    }
+
+    // M1 (t1-predicate.md §0, first meta-discipline).  BOTH directions, because each one alone lies:
+    //   (a) an axis we intend to sweep must BE enumerable for the path: sweeping a PINNED or INERT axis is
+    //       a no-op that would inflate the count and prove nothing;
+    //   (b) every ENUMERABLE axis of the path must HAVE a declared domain: that half is what keeps a missing
+    //       declaration from looking like a complete enumeration, and a silent under-count is exactly the
+    //       failure F17's completeness predicate exists to prevent.
+    bool auditDomain(const AxisDomain* dom, size_t n, int path, string& bad) {
+      for (size_t i = 0; i < n; i++) {
+        if (vk_tile_axis_class(path, dom[i].axis) != VK_TILE_AXIS_ENUMERABLE) {
+          bad = string(dom[i].name) + " is declared but is not ENUMERABLE on this path";
+          return false;
+        }
+      }
+      static const int ALL_AXES[] = { VK_TILE_AXIS_BS, VK_TILE_AXIS_BM, VK_TILE_AXIS_BN, VK_TILE_AXIS_BK,
+                                      VK_TILE_AXIS_WM, VK_TILE_AXIS_WN, VK_TILE_AXIS_WMITER, VK_TILE_AXIS_TM,
+                                      VK_TILE_AXIS_TN, VK_TILE_AXIS_WARP, VK_TILE_AXIS_SPEC_PAD,
+                                      VK_TILE_AXIS_SPEC_RESHAPE, VK_TILE_AXIS_SMALLER };
+      for (size_t a = 0; a < sizeof(ALL_AXES) / sizeof(ALL_AXES[0]); a++) {
+        if (vk_tile_axis_class(path, ALL_AXES[a]) != VK_TILE_AXIS_ENUMERABLE) {
+          continue;
+        }
+        bool declared = false;
+        for (size_t i = 0; i < n; i++) {
+          if (dom[i].axis == ALL_AXES[a]) { declared = true; break; }
+        }
+        if (!declared) {
+          bad = "axis id " + to_string(ALL_AXES[a]) + " is ENUMERABLE on this path but has NO declared "
+                "domain (a sweep would silently under-count)";
+          return false;
+        }
+      }
+      return true;
+    }
+
+    // The count-only probe: the FULL Cartesian product over the declared domain, every geometry put through
+    // the REAL predicate (`vk_tile_candidate_reason`, the shared header's ONE implementation), with refusals
+    // bucketed by the predicate's own reason string -- that distribution is the evidence for how the domain
+    // should be declared at all (w4b-preview.md §9, "每谓词杀伤分布").
+    // It builds NOTHING and writes NOTHING: no pipeline, no file, no decision.  That is what makes it usable
+    // before any of the format work, and why it cannot crash a device the way a build can.
+    string enumerateCandidateCounts(uint32_t deviceSubgroupSize) {
+      const int path = VK_TILE_PATH_CM2;
+      string bad;
+      if (!auditDomain(CM2_DOMAIN, CM2_DOMAIN_SIZE, path, bad)) {
+        // LOUD and explicit: a failed audit must never read as "nothing to report".
+        return string("cm2 domain REFUSED by the M1 audit: ") + bad
+             + " (nothing was counted; fix the declaration, do not lower the audit)";
+      }
+      size_t domainSize = 1;
+      for (size_t i = 0; i < CM2_DOMAIN_SIZE; i++) {
+        domainSize *= CM2_DOMAIN[i].count;
+      }
+      vector<pair<string, size_t>> kills;   // reason -> count
+      size_t legal = 0;
+      for (size_t i0 = 0; i0 < CM2_DOMAIN[0].count; i0++) {
+        for (size_t i1 = 0; i1 < CM2_DOMAIN[1].count; i1++) {
+          for (size_t i2 = 0; i2 < CM2_DOMAIN[2].count; i2++) {
+            for (size_t i3 = 0; i3 < CM2_DOMAIN[3].count; i3++) {
+              for (size_t i4 = 0; i4 < CM2_DOMAIN[4].count; i4++) {
+                vk_tile_geometry g = cm2BaseGeometry();
+                g.BS      = CM2_DOMAIN[0].values[i0];
+                g.BM      = CM2_DOMAIN[1].values[i1];
+                g.BN      = CM2_DOMAIN[2].values[i2];
+                g.BK      = CM2_DOMAIN[3].values[i3];
+                g.smaller = (int) CM2_DOMAIN[4].values[i4];
+                const char* why = vk_tile_candidate_reason(path, g, vk_tile_wave_for(deviceSubgroupSize));
+                if (why == nullptr) {
+                  legal++;
+                }
+                else {
+                  const string r(why);
+                  bool seen = false;
+                  for (size_t k = 0; k < kills.size(); k++) {
+                    if (kills[k].first == r) { kills[k].second++; seen = true; break; }
+                  }
+                  if (!seen) {
+                    kills.push_back(make_pair(r, (size_t) 1));
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      // Highest kill count first: "which clause is doing the cutting" should be the first thing a reader
+      // sees.  A selection sort over a handful of reasons is honest and has no hidden cap.
+      for (size_t i = 0; i + 1 < kills.size(); i++) {
+        for (size_t j = i + 1; j < kills.size(); j++) {
+          if (kills[j].second > kills[i].second) { swap(kills[i], kills[j]); }
+        }
+      }
+      ostringstream os;
+      os << "path=cm2 wave=" << vk_tile_wave_for(deviceSubgroupSize) << " axes=" << CM2_DOMAIN_SIZE << " domain=" << domainSize
+         << " legal=" << legal << " killed=" << (domainSize - legal);
+      if (!kills.empty()) {
+        os << " by reason:";
+        for (size_t i = 0; i < kills.size(); i++) {
+          os << " [" << kills[i].second << "] " << kills[i].first << ";";
+        }
+      }
+      // The undeclared paths are NAMED, not omitted: "we did not count it" and "it has no candidates" must
+      // never read the same (lesson #46).
+      os << " undeclared=scalar,cm1 (their stock tables are dynamic expressions, not literals)";
+      return os.str();
+    }
+
     // ---- the KIND registry and the completeness gate (C4) --------------------------------
     // A cache file is a statement about the WHOLE key, so it may only be written when every kind
     // this identity can select for has a CONCLUSION in this decision: rows this process really
@@ -2196,6 +2351,11 @@ namespace VulkanTuner {
         bool expected = false;
         if (selfTested.compare_exchange_strong(expected, true)) {
           cacheWriteSelfTest(policy, cacheRoot);
+          // W4b (⑤ first cut): the count-only enumeration probe.  It shares the bit because it is the same
+          // subject (the tuned-row surface) and it is the same "once per process, under a probe" shape; it
+          // gets its OWN line so the two self-tests stay distinguishable in the evidence.  It writes
+          // nothing, so it cannot be mistaken for a decision.
+          logLine("candidate enumeration: " + enumerateCandidateCounts(d->deviceSubgroupSize));
         }
       }
 
