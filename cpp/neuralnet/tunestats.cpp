@@ -361,12 +361,18 @@ namespace TuneStats {
     double runRate(size_t trials, size_t pairs, double base, double sigmaRel, double spikeProb,
                    double spikeLo, double spikeHi, double effect, double alpha,
                    unsigned long long seed, Pred pred, double* widthOut) {
-      Rng rng(seed);
+      // PER-TRIAL SEED DERIVATION (2026-09-21, correction batch): the random stream must be a
+      // function of the TRIAL, not of the call.  With one Rng carried across trials, an arm with more
+      // pairs consumes more of it per trial, so from trial 2 onwards the two arms sit at different
+      // positions in the stream -- which makes "the same seed for both arms" a NAME rather than common
+      // random numbers, and their difference as noisy as two independent runs.  Deriving the stream per
+      // trial makes both arms see the SAME draws for every pair they share.
       vector<double> d;
       size_t hit = 0;
       vector<double> widths;
       if (widthOut != nullptr) widths.reserve(trials);
       for (size_t t = 0; t < trials; t++) {
+        Rng rng(seed + 0x9E3779B97F4A7C15ULL * (unsigned long long)(t + 1));
         synthDifferences(d, pairs, base, sigmaRel, spikeProb, spikeLo, spikeHi, effect, rng);
         const PairedResult r = pairedSignedRank(d, alpha);
         if (pred(r)) hit++;
@@ -483,10 +489,13 @@ namespace TuneStats {
     // (2) OUT OF SAMPLE: the same six criteria on shapes and seeds around the measured one, with no
     //     re-selection, plus the gate row check.
     bool envPass[8];
+    bool envPass16[8];
     bool envExpect[8];
     ostringstream env;
+    ostringstream pf;
     int envOkCount = 0;
     int envMismatch = 0;
+    int pfBothFailInsideGate = 0, pfFailInsideGate = 0, pfFailAboveGate = 0, pfPassAll = 0;
     for (int i = 0; i < 8; i++) {
       const Rates r = measure(trials, pairs, alpha, tolerance, sigmaRel, ENV_CASES[i].p,
                               ENV_CASES[i].lo, ENV_CASES[i].hi, base, seed + ENV_CASES[i].seedOff);
@@ -494,6 +503,29 @@ namespace TuneStats {
       if (envPass[i]) envOkCount++;
       envExpect[i] = (ENV_CASES[i].p <= SPIKE_RATE_GATE);
       if (envExpect[i] != envPass[i]) envMismatch++;
+      // THE SAME STREAM FOR BOTH ARMS (see runRate): with per-trial seed derivation, n=16 and n=25 see
+      // the same draws for the pairs they share, so this is common random numbers rather than "the same
+      // seed, twice".  The question is deliberately BINARY -- does 16 pass the six criteria on the rows
+      // at or below the gate -- because the CONTINUOUS difference is unanswerable (its sign flips
+      // between seeds).  Nothing here is asserted: it is evidence, classified into the four
+      // pre-registered verdicts so that nobody can report a single convenient row.
+      const Rates r16e = measure(trials, 16, alpha, tolerance, sigmaRel, ENV_CASES[i].p,
+                                 ENV_CASES[i].lo, ENV_CASES[i].hi, base, seed + ENV_CASES[i].seedOff);
+      envPass16[i] = passes(r16e);
+      // The rows ABOVE the gate are NEGATIVE CONTROLS: n25 is REQUIRED to fail there, so "both failed"
+      // carries no information about the floor.  Only a both-fail INSIDE the gate would be a problem --
+      // with the floor, or with the gate itself.  (First version classified outside-gate both-fails and
+      // therefore always reported gate-problem, which is a verdict that can never be acted on.)
+      if (ENV_CASES[i].p <= SPIKE_RATE_GATE) {
+        if (!envPass[i] && !envPass16[i]) pfBothFailInsideGate++;
+        else if (!envPass16[i]) pfFailInsideGate++;
+        else pfPassAll++;
+      } else {
+        if (!envPass16[i]) pfFailAboveGate++;
+        else pfPassAll++;
+      }
+      pf << (i ? "," : "") << ENV_CASES[i].name << ":n16=" << (envPass16[i] ? "OK" : "FAIL")
+         << "/n25=" << (envPass[i] ? "OK" : "FAIL");
       env << (i ? "," : "") << ENV_CASES[i].name << (envPass[i] ? ":OK" : ":FAIL")
           << "(cov=" << setprecision(3) << r.coverage << " pn=" << r.powerNoise
           << " snF=" << r.sentinelFalse << " snP=" << r.sentinelPower
@@ -514,9 +546,14 @@ namespace TuneStats {
     //     separates 16 from 25 (0.010-0.012 needs ~20000 trials for 4 sigma), and a "must be below"
     //     clause would be red ~22% of the time.  What catches a floor lowered to 16 is the
     //     DECLARATION (smoke A44 pins pairs_floor=25), not a statistic.
+    // se25 is a PLUG-IN estimate: it uses the coverage THIS run measured, not the target -- which is
+    // exactly why the resulting floor floats with the observation.  State that as the REASON, and quote
+    // the printed min_ok= instead of hand-computing the number (two reviewers have now got it wrong by
+    // hand; the print is the only trustworthy source).
     const double se25 = sqrt(n25.coverage * (1.0 - n25.coverage) / (double)trials);
     const double covMinOk = COVERAGE_TARGET - 3.0 * se25;
     const bool n25CoverageOk = n25.coverage >= covMinOk;
+    const bool loose = trials < (size_t)COVERAGE_STRICT_MIN_TRIALS;
     const double se16 = sqrt(n16.coverage * (1.0 - n16.coverage) / (double)trials);
     const double vsTarget16 = se16 > 0.0 ? (n16.coverage - COVERAGE_TARGET) / se16 : 0.0;
     const double deltaN = n25.coverage - n16.coverage;
@@ -524,7 +561,17 @@ namespace TuneStats {
     const double sigmaDelta = seDelta > 0.0 ? deltaN / seDelta : 0.0;
 
     const bool n9FailsAsExpected = !passes(n9);
+    // The four pre-registered classes must PARTITION the eight rows: a report whose own classes do not
+    // add up is the quiet version of a wrong verdict.
+    const int pfClassTotal = pfBothFailInsideGate + pfFailInsideGate + pfFailAboveGate + pfPassAll;
+    const char* pairVerdict =
+      (pfBothFailInsideGate > 0) ? "gate-problem" :
+      (pfFailInsideGate > 0) ? "25-has-support" :
+      (pfPassAll == 8)       ? "25-is-declaration-only" :
+                               "no-support-above-gate-only";
+
     const bool selfOk = passes(n25) && n25CoverageOk && n9FailsAsExpected && envMismatch == 0 && tErr < 1e-4 &&
+                        pfClassTotal == 8 &&
                         envPass[0] && envPass[1] && envPass[2] && envPass[3];
 
     ostringstream os;
@@ -547,9 +594,12 @@ namespace TuneStats {
        << " pass=" << (passes(n25) ? 1 : 0)
        << " | coverage[nominal=" << (1.0 - alpha) << " effective=" << n25.coverage << "]"
        << " | coverage_target[target=" << COVERAGE_TARGET << " min_ok=" << covMinOk
-       << " se_cov=" << se25 << " trials_used=" << trials << "]"
+       << " se_cov=" << se25 << " trials_used=" << trials << (loose ? " LOOSE" : "") << "]"
        << " | reps[formula_0.1pct=" << bud.repsFormula[0] << " formula_1pct=" << bud.repsFormula[1]
        << " floor=" << bud.floorReps << " required=" << bud.repsRequired[0] << "/" << bud.repsRequired[1] << "]"
+       << " | pairfloor[" << pf.str() << " inside_gate_fail=" << pfFailInsideGate
+       << " above_gate_fail=" << pfFailAboveGate << " both_fail_in_gate=" << pfBothFailInsideGate
+       << " verdict=" << pairVerdict << "]"
        << " | env[" << env.str() << "] ok_env=" << envOkCount << "/8 expect_mismatch=" << envMismatch
        << " | " << (selfOk ? "ok" : "FAILED");
     if (!selfOk) {

@@ -29,16 +29,28 @@
 // Gaussian z would claim more confidence than the data supports).  Deleting them also removed about
 // 95% of this self-test's cost (the bootstrap sorted 400 Walsh medians per trial; a probe leg that
 // took 225 s now takes seconds).  The generator and the six criteria stay, so either interval can be
-// put back as a candidate and re-measured.  The pair-count floor was re-measured on the NEW interval
-// and did NOT move down: at n=16 the out-of-sample reading is 0.927 / 0.933 (1000 / 4000 trials,
-// logs-t3/stats-v3-sweep-*.txt), i.e. ON the 0.93 line, while n=25 sits at 0.943-0.945 -- so 25 stays
-// as a deliberately conservative floor whose cost is counted (about 3.5-5 s per tune).
+// put back as a candidate and re-measured.
+//
+// WHY THE FLOOR IS 25 (corrected 2026-09-21, third review round -- this text used to claim "16 sits on
+// the line, 25 has margin", and our own four-seed readings REFUTED that): n=16 and n=25 are NOT
+// DISTINGUISHABLE in this experiment.  The out-of-sample gap is +0.0180 on the default seed and
+// -0.0040 on seed 0x1234 (16 HIGHER), i.e. its SIGN is unstable, and the continuous comparison would
+// need ~20000 trials for 4 sigma -- so it is not a criterion.  25 is a DECLARED value plus a
+// CONSERVATIVE choice, and what it buys is MARGIN AGAINST THE UNVERIFIED PART OF THE ENVELOPE (the
+// harsh 20% row does collapse), NOT "16 is worse".  Its cost is counted: +9 pairs, about 2.4 s ->
+// 3.5-5 s per tune.  The answerable question is binary -- does 16 pass the six criteria on the rows at
+// or below the gate -- and the self-test measures exactly that (pairfloor[...], four pre-registered
+// verdicts in stats-followup-preview.md section 12.5).  What catches a floor quietly lowered to 16 is
+// the DECLARATION (smoke A44 pins pairs_floor=25), not a statistic.  And because no statistical reason
+// exists in either direction, lowering it back to 16 later is EQUALLY defensible: that is a
+// declared-value change plus a cost/benefit account, not a technical impossibility.
 //
 // WHAT THE t MULTIPLIER IS, AND WHAT IT IS NOT (review point, 2026-09-21): the sampling distribution
 // of a MEDIAN is not Student's t.  1.4826 and 1.2533 are NORMAL-world consistency factors, and
 // t_{n-1} is a HEURISTIC that pays back the fact that the scale was estimated from the same n pairs.
 // Its warrant is therefore MEASURED coverage (n=25: 0.9450 / 0.9430 over 1000 / 4000 trials), NOT
-// distribution theory -- and n=16 reaching only 0.927 / 0.933 (it does not pay back cleanly) is
+// distribution theory -- and n=16 landing anywhere from 0.927 to 0.943 across seeds (it does not
+// pay back cleanly) is
 // precisely the evidence that it is not a theoretical solution.  Nobody may argue "theory says it
 // should be t, so the floor can go back to 16": that needs new READINGS, not an argument.
 //
@@ -47,12 +59,18 @@ namespace TuneStats {
 
   // ---- the DECLARED protocol constants: ONE source, so the probe batch cannot re-copy them ----
   constexpr double MIN_BLOCK_TIME_MS = 2.0;  // declared block; the us clock's 0.19% quantisation stays under the 0.1% sigma budget
-  constexpr long   PAIRS_FLOOR = 25;         // MEASURED floor: n=16 is on the 0.93 line, n=25 is 0.943-0.945 (logs-t3/stats-v3-sweep-*.txt)
+  constexpr long   PAIRS_FLOOR = 25;         // DECLARED + conservative: 16 and 25 are indistinguishable here (see the header)
   constexpr double ALPHA = 0.05;             // declared, not hidden inside a formula
   constexpr double TOLERANCE = 0.01;         // 1% : the product tolerance
   constexpr double SPIKE_RATE_GATE = 0.15;   // MEASURED bound: 15% passes, 18% fails on THREE criteria at once (the rate12/15/18 sweep)
   constexpr long   REPS_MAX = 512;
   constexpr long   DEV_TRIALS_DEFAULT = 200; // the self-test's size when KATAGO_VK_TUNE_STATS_TRIALS is unset
+  // The trial count below which the coverage assertion is LOOSE, and SAYS SO in the printed line.  With
+  // the SE taken from the measured coverage (a plug-in estimate -- that is WHY the line floats with the
+  // observation), "TARGET - 3*SE" admits 89.1% at 200 trials and 91.9% at 4000: a default run can pass
+  // it without really testing anything.  The marker is a READING with a criterion on both sides (smoke
+  // A44: a >=1000-trial leg must carry NO marker, the 200-trial leg must carry one), not a comment.
+  constexpr long   COVERAGE_STRICT_MIN_TRIALS = 1000;
   // The effective-coverage TARGET: the line the pair-count floor has to clear.  Three things are
   // written down here, because a bare 0.93 in prose is how a threshold becomes homeless:
   //   (i)   it is OUR requirement for "the interval really covers", and it is NOT the band's lower
