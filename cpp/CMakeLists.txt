@@ -854,6 +854,7 @@ elseif(USE_BACKEND STREQUAL "VULKAN")
   set(NEURALNET_BACKEND_SOURCES
     neuralnet/vulkanbackend.cpp
     neuralnet/vulkantuner.cpp
+    neuralnet/tunestats.cpp
     )
 # --------------------------- ROCM backend (AMD GPU / HIP + MIOpen) ---------------------------
 elseif(USE_BACKEND STREQUAL "ROCM")

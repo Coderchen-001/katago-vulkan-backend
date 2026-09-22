@@ -1,6 +1,7 @@
 #ifdef USE_VULKAN_BACKEND
 
 #include "../neuralnet/vulkantuner.h"
+#include "../neuralnet/tunestats.h"
 
 #include "../core/fileutils.h"
 #include "../core/makedir.h"
@@ -3061,6 +3062,12 @@ namespace VulkanTuner {
         bool expected = false;
         if (selfTested.compare_exchange_strong(expected, true)) {
           cacheWriteSelfTest(policy, cacheRoot);
+          // 2026-09-21 (project-max-principle.md section 9: "the algorithm IS the core of tuning"):
+          // the comparison algorithm's own self-test.  It injects KNOWN GROUND TRUTH on the CPU --
+          // no device, no files -- and prints coverage / power / spike-robustness / sentinel numbers,
+          // because "anti-jitter + accurate" has to be MEASURED rather than claimed.  Its own line, so
+          // the three self-tests stay distinguishable in the evidence, and it writes nothing.
+          logLine("tune stats self-test: " + TuneStats::selfTestSummary());
           // W4b (⑤ first cut): the count-only enumeration probe.  It shares the bit because it is the same
           // subject (the tuned-row surface) and it is the same "once per process, under a probe" shape; it
           // gets its OWN line so the two self-tests stay distinguishable in the evidence.  It writes
