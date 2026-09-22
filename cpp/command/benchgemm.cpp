@@ -90,6 +90,12 @@ namespace {
     int dtype = 0;         // 0 = f16 x f32 (trunk, production); 1 = f16 x f16 (attention); 2 = q8f32 (Q1b: Q8_0 x F32 -> mmq)
     bool cpuRef = false;   // compare vs CPU reference (bit-equal probe; f16f32/f16f16 only)
     bool verbose = false;
+    // Slice 0 of W4e (w4e-preview.md section 2): the protocol decides from the PAIRED
+    // difference d = t_A - t_B inside one session, and sigma_d = 1.4826*MAD(d) sizes R.
+    bool pair = false;      // paired mode: two entries, per-object warmup, rotation
+    int reps = 8;           // timed PAIRS (warmup blocks are extra, per object)
+    bool alternate = true;  // interleave the two entries (else sequential arms)
+    bool raw = false;       // print every block in time order
   };
 
   bool getInt64(const vector<string>& args, const string& key, int64_t& out) {
@@ -155,6 +161,14 @@ namespace {
     getInt(args, "-seed", a.seed);
     getBool(args, "-cpu-ref", a.cpuRef);
     getBool(args, "-verbose", a.verbose);
+    getBool(args, "-pair", a.pair);
+    getInt(args, "-reps", a.reps);
+    getBool(args, "-raw", a.raw);
+    { bool noAlt = false; if(getBool(args, "-no-alternate", noAlt)) a.alternate = false; }
+    if(a.pair && a.reps < 2) {
+      cerr << "benchgemm: -pair needs -reps >= 2 (a paired scale from one pair is degenerate)" << endl;
+      return 1;
+    }
     for(size_t i = 0; i < args.size(); i++) {
       if(args[i] == "-dtype" && i + 1 < args.size()) {
         const string& d = args[i+1];
@@ -287,19 +301,113 @@ namespace {
     auto nowMs = []() { return std::chrono::duration_cast<std::chrono::microseconds>(
       std::chrono::high_resolution_clock::now().time_since_epoch()).count() / 1000.0; };
 
-    for(int w = 0; w < a.warmup; w++) {
+    for(int w = 0; w < (a.pair ? 0 : a.warmup); w++) {
       ggml_backend_graph_compute(backend, graph);
       ggml_backend_synchronize(backend);
     }
 
     vector<double> totalsMs;
-    for(int t = 0; t < a.iterations; t++) {
+    for(int t = 0; t < (a.pair ? 0 : a.iterations); t++) {
       double t0 = nowMs();
       ggml_backend_graph_compute(backend, graph);
       ggml_backend_synchronize(backend);
       double t1 = nowMs();
       totalsMs.push_back(t1 - t0);
     }
+    // ---- PAIRED MODE (slice 0 of W4e; see w4e-preview.md section 2 and tune-measurement.md
+    // ---- sections 2.2/2.3/2.5) ------------------------------------------------------------
+    // WHY IT EXISTS: the protocol decides from the PAIRED difference d = t_A - t_B measured in
+    // ONE session (2.1) and sigma_d = 1.4826*MAD(d) is what sizes R (2.3).  The single-arm path
+    // above cannot produce that -- it times one graph repeatedly -- so the only scale it can
+    // report is a single arm's, and cross-process samples carry exactly the session drift that
+    // interleaving is supposed to cancel.
+    // Today BOTH entries are the SAME graph: that is the A/A sentinel exactly ("two entries
+    // pointing to the same pipeline", 2.3), and it is the one paired comparison available before
+    // a candidate row can be installed.  A later slice swaps graphs[1] for a candidate.
+    // Warmup is PER OBJECT (2.2, ruled 2026-09-21) and the object order is shifted by one every
+    // rep (rotation, ruled 2026-09-21: R is small, so a balanced deterministic rotation beats
+    // randomisation, which would need more reps than we have to balance position effects).
+    //   -pair           pair mode (A/A today)      -reps R      timed pairs (default 8)
+    //   -no-alternate   sequential arms instead of interleaved (calibration item (2))
+    //   -raw            print every block's per-dispatch time, in time order
+    if(a.pair) {
+      ggml_cgraph* graphs[2] = { graph, graph };
+      const char* names[2] = { "A", "B" };
+      const int nblocks = a.warmup + a.reps;
+      vector< vector<double> > tms(2);
+      tms[0].reserve((size_t)nblocks); tms[1].reserve((size_t)nblocks);
+      const char* tileEnvP = getenv("KATAGO_VK_MM_TILE") != nullptr ? getenv("KATAGO_VK_MM_TILE") : "(default)";
+      const char* prEnvP = getenv("KATAGO_VK_PRE_RECORD") != nullptr ? getenv("KATAGO_VK_PRE_RECORD") : "(unset=on)";
+      cout << "PAIRSHAPE," << (devName ? devName : "?") << ",M=" << M << ",K=" << K << ",N=" << Ndim
+           << ",batch=" << a.batch << "," << dtypeLabel << "," << tileEnvP
+           << ",PRE_RECORD=" << prEnvP
+           << ",shots=" << a.N << ",warmup=" << a.warmup << ",reps=" << a.reps
+           << ",alternate=" << (a.alternate ? 1 : 0) << "," << BENCHGEMM_GIT_REVISION << endl;
+      // schedule as two parallel vectors: (block index, entry).  Interleaved => both entries
+      // inside every block index; sequential => all of entry A, then all of entry B.
+      vector<int> sb, so;
+      if(a.alternate) {
+        for(int b = 0; b < nblocks; b++) for(int k = 0; k < 2; k++) { sb.push_back(b); so.push_back((b + k) % 2); }
+      } else {
+        for(int o = 0; o < 2; o++) for(int b = 0; b < nblocks; b++) { sb.push_back(b); so.push_back(o); }
+      }
+      for(size_t i = 0; i < sb.size(); i++) {
+        const int o = so[i];
+        const double t0 = nowMs();
+        ggml_backend_graph_compute(backend, graphs[o]);
+        ggml_backend_synchronize(backend);
+        const double t1 = nowMs();
+        const double per = (t1 - t0) * 1000.0 / (double)a.N;   // per dispatch
+        tms[o].push_back(per);
+        if(a.raw)
+          cout << "PAIRRAW," << names[o] << "," << (sb[i] + 1) << "," << fixed << setprecision(4) << per << endl;
+      }
+      // median + 1.4826*MAD, the protocol's estimators (2.3); the first `warmup` blocks of each
+      // entry are dropped from the statistics but kept in the printout above.
+      auto medianOf = [](vector<double> v) { sort(v.begin(), v.end()); return v[v.size() / 2]; };
+      auto madOf = [&](const vector<double>& v) {
+        const double m = medianOf(v); vector<double> dev;
+        for(size_t i = 0; i < v.size(); i++) dev.push_back(fabs(v[i] - m));
+        return medianOf(dev);
+      };
+      vector<double> A(tms[0].begin() + a.warmup, tms[0].end());
+      vector<double> B(tms[1].begin() + a.warmup, tms[1].end());
+      const double medA = medianOf(A), medB = medianOf(B);
+      const double sigA = 1.4826 * madOf(A), sigB = 1.4826 * madOf(B);
+      vector<double> d;
+      for(size_t i = 0; i < A.size() && i < B.size(); i++) d.push_back(A[i] - B[i]);
+      const double medD = d.empty() ? 0.0 : medianOf(d);
+      const double sigD = d.empty() ? 0.0 : 1.4826 * madOf(d);
+      // spike census against each object's OWN median (2.3's rule is REPLACE, never min-of-2)
+      const double kSpike = 5.0;
+      int spikeA = 0, spikeB = 0;
+      for(size_t i = 0; i < A.size(); i++) if(fabs(A[i] - medA) > kSpike * (sigA > 0 ? sigA : 1e-9)) spikeA++;
+      for(size_t i = 0; i < B.size(); i++) if(fabs(B[i] - medB) > kSpike * (sigB > 0 ? sigB : 1e-9)) spikeB++;
+      // half-split self-check ingredients: only meaningful at R >= 4 (below that the criterion
+      // is a constant comparison, 2.3); half_k is reported so the record can check it directly.
+      const size_t h = d.size() / 2;
+      double ma = 0.0, mb = 0.0;
+      for(size_t i = 0; i < h; i++) ma += d[i];
+      for(size_t i = h; i < d.size(); i++) mb += d[i];
+      ma = h ? ma / (double)h : 0.0;
+      mb = (d.size() - h) ? mb / (double)(d.size() - h) : 0.0;
+      const double seHalf = (sigD > 0.0 && h > 0) ? sigD / sqrt((double)h) : 0.0;
+      const double kHalf = (seHalf > 0.0) ? fabs(ma - mb) / seHalf : 0.0;
+      bool ddOk = true;
+      (void)ddOk;
+      cout << "PAIRSUMMARY,A,median_us=" << fixed << setprecision(4) << medA
+           << ",sigma_us=" << sigA << ",spikes=" << spikeA
+           << ",B,median_us=" << medB << ",sigma_us=" << sigB << ",spikes=" << spikeB
+           << ",pairs=" << d.size() << ",median_d_us=" << medD << ",sigma_d_us=" << sigD
+           << ",sigma_d_pct=" << setprecision(3) << (medA > 0 ? 100.0 * sigD / medA : 0.0)
+           << ",half_a_us=" << ma << ",half_b_us=" << mb << ",half_k=" << kHalf << setprecision(4)
+           << ",first_blocks_us=" << tms[0][0] << "/" << tms[1][0] << endl;
+      ggml_backend_buffer_free(buf);
+      ggml_free(ctx);
+      ggml_backend_free(backend);
+      return 0;
+    }
+
     sort(totalsMs.begin(), totalsMs.end());
     double medTotal = totalsMs[totalsMs.size() / 2];
     double perGemmUs = medTotal * 1000.0 / (double)a.N;   // per node
