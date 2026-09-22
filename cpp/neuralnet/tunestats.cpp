@@ -433,19 +433,28 @@ namespace TuneStats {
              r.sentinelFalse <= 0.05 && r.sentinelPower >= 0.80;
     }
 
-    // WHICH criterion refused this row, BY NAME.  The pair-floor conclusion has to be able to say what
-    // n=25 buys, and "n=16 fails" alone is a generalisation: with a wider interval the EQUIVALENCE
-    // check is the first to go, so the interesting question is whether it is the sentinel (snF) or the
-    // others.  Measured (logs-t3/stats-correction-spread-postcommit.txt), it is snF -- i.e. what 25
-    // buys is sentinel trustworthiness at spike rates near the gate, not "accuracy" in general.
-    const char* firstFailingCriterion(const Rates& r) {
-      if (r.coverage < 0.90 || r.coverage > 0.99) return "cov";
-      if (r.powerTol < 0.80) return "pw";
-      if (r.powerNoise > 0.20) return "pn";
-      if (fabs(r.spikesWith - r.spikesWithout) > 0.05) return "sp";
-      if (r.sentinelFalse > 0.05) return "snF";
-      if (r.sentinelPower < 0.80) return "snP";
-      return "none";
+    // EVERY criterion this row violates, from a FIXED list -- not just the first one checked.
+    //
+    // The single-name version this replaces was ORDER-DEPENDENT, and that is not a wording problem: on
+    // the gate row n=16 misses coverage by 0.001 and the sentinel by ~78%, so "refused_by=cov" and
+    // "refused_by=snF" are the SAME row depending on which check runs first.  One of those readings says
+    // "precision is slightly off" and the other says "sentinel trustworthiness is far off", and they
+    // support different sentences about what the floor of 25 buys.  Membership is the meaning; the order
+    // is fixed only so two runs of the same row print the same string.
+    //
+    // The separator is '+' and NOT a comma: the pairfloor block is comma-separated, so a comma inside a
+    // field would break every parser that keys on that shape.
+    std::string failingCriteria(const Rates& r) {
+      std::string s;
+      auto add = [&s](const char* name) { if (!s.empty()) s += "+"; s += name; };
+      if (r.coverage < 0.90 || r.coverage > 0.99) add("cov");
+      if (r.powerTol < 0.80) add("pw");
+      if (r.powerNoise > 0.20) add("pn");
+      if (fabs(r.spikesWith - r.spikesWithout) > 0.05) add("sp");
+      if (r.sentinelFalse > 0.05) add("snF");
+      if (r.sentinelPower < 0.80) add("snP");
+      if (s.empty()) s = "none";
+      return s;
     }
 
     // The applicability ENVELOPE: the conclusion only holds inside the noise shapes that were
@@ -544,7 +553,7 @@ namespace TuneStats {
       if (!envPass16[i]) {
         // The MEASUREMENTS, not just the verdict: an OK/FAIL alone cannot support a sentence about what
         // the floor buys.  Appended AFTER the n16/n25 pair so the parsers keyed on that shape keep working.
-        pf << " n16_fail=" << firstFailingCriterion(r16e)
+        pf << " n16_fail=" << failingCriteria(r16e)
            << " n16_cov=" << setprecision(3) << r16e.coverage
            << " n16_pn=" << r16e.powerNoise
            << " n16_snF=" << r16e.sentinelFalse
