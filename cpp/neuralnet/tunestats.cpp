@@ -243,6 +243,9 @@ namespace TuneStats {
       //   t_{n-1}: the scale is ESTIMATED from these n pairs, so the Gaussian z would claim more
       //            confidence than the data supports.  This is a small-sample CORRECTION, not a fit:
       //            the degrees of freedom follow from n, and alpha is the declared one.
+      //            WHAT IT IS NOT: a median's sampling distribution is not t, and 1.4826/1.2533 are
+      //            normal-world consistency factors -- the multiplier is a HEURISTIC whose warrant is
+      //            MEASURED coverage.  "Theory says t, so n=16 is fine" is not an argument here.
       // The only quantity the sweep chooses is the pair count, and that choice is then re-tested OUT
       // OF SAMPLE (another seed, shapes around the measured one) before anything calls it validated.
       const double sig = madScale(d);
@@ -296,6 +299,14 @@ namespace TuneStats {
       b.totalReps += req;
     }
     return b;
+  }
+
+  unsigned long long devSeed() {
+    const unsigned long long kDefault = 0x5EEDC0DEULL;
+    const char* v = getenv("KATAGO_VK_TUNE_STATS_SEED");
+    if (v == nullptr || v[0] == '\0') return kDefault;
+    const unsigned long long parsed = strtoull(v, nullptr, 0);   // base 0: accepts 0x... and decimal
+    return parsed == 0ull ? kDefault : parsed;
   }
 
   long devTrials() {
@@ -408,6 +419,9 @@ namespace TuneStats {
     // threshold here is a fitted scale, which is what lets the same function judge shapes that were
     // never used to pick the pair count.
     bool passes(const Rates& r) {
+      // 0.90 here is the BAND'S LOWER EDGE for the six criteria -- NOT COVERAGE_TARGET (0.93), which
+      // is a separate requirement asserted in the self-test with a trial-count-scaled margin.  Two
+      // numbers, two meanings, two names: do not merge them.
       return r.coverage >= 0.90 && r.coverage <= 0.99 && r.powerTol >= 0.80 &&
              r.powerNoise <= 0.20 && fabs(r.spikesWith - r.spikesWithout) <= 0.05 &&
              r.sentinelFalse <= 0.05 && r.sentinelPower >= 0.80;
@@ -438,7 +452,9 @@ namespace TuneStats {
     const double base = 1.0;
     const size_t trials = (size_t)devTrials();
     const size_t pairs = (size_t)PAIRS_FLOOR;
-    const unsigned long long seed = 0x5EEDC0DEULL;
+    // The BASE seed is a dev knob: every seed below is DERIVED from it, so one env value re-runs the
+    // whole self-test out of sample -- the "re-verify under another seed" discipline, executable.
+    const unsigned long long seed = devSeed();
 
     // (0) the multiplier against PUBLISHED table values: the t quantile is a textbook part, and this
     //     is what stops it from being a claim.  The tolerance separates it from a wrong multiplier
@@ -492,8 +508,23 @@ namespace TuneStats {
     sig.push_back(0.01);       // 1%   : a scale an order of magnitude worse, i.e. formula-bound
     const Budget bud = allocateReps(sig, tolerance, alpha, PAIRS_FLOOR, REPS_MAX);
 
+    // (4) the coverage TARGET, asserted with the SE of THIS run's trial count: a fixed 0.93 would be
+    //     a coin flip at the default 200 trials (17.6% false red) and trivially green at 4000.  n=16
+    //     is only REPORTED, with its distance to the target in sigmas: no practical assertion
+    //     separates 16 from 25 (0.010-0.012 needs ~20000 trials for 4 sigma), and a "must be below"
+    //     clause would be red ~22% of the time.  What catches a floor lowered to 16 is the
+    //     DECLARATION (smoke A44 pins pairs_floor=25), not a statistic.
+    const double se25 = sqrt(n25.coverage * (1.0 - n25.coverage) / (double)trials);
+    const double covMinOk = COVERAGE_TARGET - 3.0 * se25;
+    const bool n25CoverageOk = n25.coverage >= covMinOk;
+    const double se16 = sqrt(n16.coverage * (1.0 - n16.coverage) / (double)trials);
+    const double vsTarget16 = se16 > 0.0 ? (n16.coverage - COVERAGE_TARGET) / se16 : 0.0;
+    const double deltaN = n25.coverage - n16.coverage;
+    const double seDelta = sqrt(se25 * se25 + se16 * se16);
+    const double sigmaDelta = seDelta > 0.0 ? deltaN / seDelta : 0.0;
+
     const bool n9FailsAsExpected = !passes(n9);
-    const bool selfOk = passes(n25) && n9FailsAsExpected && envMismatch == 0 && tErr < 1e-4 &&
+    const bool selfOk = passes(n25) && n25CoverageOk && n9FailsAsExpected && envMismatch == 0 && tErr < 1e-4 &&
                         envPass[0] && envPass[1] && envPass[2] && envPass[3];
 
     ostringstream os;
@@ -506,18 +537,24 @@ namespace TuneStats {
        << " | t_inv[" << tt.str() << " max_err=" << scientific << setprecision(2) << tErr << fixed << setprecision(4) << "]"
        << " | n9[cov=" << n9.coverage << " snF=" << n9.sentinelFalse
        << " sp=" << fabs(n9.spikesWith - n9.spikesWithout) << "] must-fail=" << (n9FailsAsExpected ? 1 : 0)
-       << " | n16_altseed[cov=" << n16.coverage << " pw=" << n16.powerTol << "]"
+       << " | n16_altseed[cov=" << n16.coverage << " pw=" << n16.powerTol
+       << " vs_target=" << setprecision(2) << vsTarget16 << "sigma]" << setprecision(4)
+       << " | n16_minus_n25[delta=" << deltaN << " se_diff=" << seDelta
+       << " sig=" << setprecision(2) << sigmaDelta << "sigma]" << setprecision(4)
        << " | n25[cov=" << n25.coverage << " pw=" << n25.powerTol << " pn=" << n25.powerNoise
        << " sp=" << fabs(n25.spikesWith - n25.spikesWithout) << " snF=" << n25.sentinelFalse
        << " snP=" << n25.sentinelPower << " snP_half=" << n25.sentinelPowerHalf << " w=" << n25.ciWidth << "]"
        << " pass=" << (passes(n25) ? 1 : 0)
        << " | coverage[nominal=" << (1.0 - alpha) << " effective=" << n25.coverage << "]"
+       << " | coverage_target[target=" << COVERAGE_TARGET << " min_ok=" << covMinOk
+       << " se_cov=" << se25 << " trials_used=" << trials << "]"
        << " | reps[formula_0.1pct=" << bud.repsFormula[0] << " formula_1pct=" << bud.repsFormula[1]
        << " floor=" << bud.floorReps << " required=" << bud.repsRequired[0] << "/" << bud.repsRequired[1] << "]"
        << " | env[" << env.str() << "] ok_env=" << envOkCount << "/8 expect_mismatch=" << envMismatch
        << " | " << (selfOk ? "ok" : "FAILED");
     if (!selfOk) {
-      os << " (n25_pass=" << (passes(n25) ? 1 : 0) << " n9_fails=" << (n9FailsAsExpected ? 1 : 0)
+      os << " (n25_pass=" << (passes(n25) ? 1 : 0) << " cov_ok=" << (n25CoverageOk ? 1 : 0)
+         << " n9_fails=" << (n9FailsAsExpected ? 1 : 0)
          << " t_err=" << tErr << " env_mismatch=" << envMismatch << ")";
     }
     return os.str();

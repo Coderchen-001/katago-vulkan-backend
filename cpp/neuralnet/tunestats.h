@@ -33,6 +33,15 @@
 // and did NOT move down: at n=16 the out-of-sample reading is 0.927 / 0.933 (1000 / 4000 trials,
 // logs-t3/stats-v3-sweep-*.txt), i.e. ON the 0.93 line, while n=25 sits at 0.943-0.945 -- so 25 stays
 // as a deliberately conservative floor whose cost is counted (about 3.5-5 s per tune).
+//
+// WHAT THE t MULTIPLIER IS, AND WHAT IT IS NOT (review point, 2026-09-21): the sampling distribution
+// of a MEDIAN is not Student's t.  1.4826 and 1.2533 are NORMAL-world consistency factors, and
+// t_{n-1} is a HEURISTIC that pays back the fact that the scale was estimated from the same n pairs.
+// Its warrant is therefore MEASURED coverage (n=25: 0.9450 / 0.9430 over 1000 / 4000 trials), NOT
+// distribution theory -- and n=16 reaching only 0.927 / 0.933 (it does not pay back cleanly) is
+// precisely the evidence that it is not a theoretical solution.  Nobody may argue "theory says it
+// should be t, so the floor can go back to 16": that needs new READINGS, not an argument.
+//
 // See tune-algorithm-audit.md section 7 for the delete list this file implements.
 namespace TuneStats {
 
@@ -44,6 +53,21 @@ namespace TuneStats {
   constexpr double SPIKE_RATE_GATE = 0.15;   // MEASURED bound: 15% passes, 18% fails on THREE criteria at once (the rate12/15/18 sweep)
   constexpr long   REPS_MAX = 512;
   constexpr long   DEV_TRIALS_DEFAULT = 200; // the self-test's size when KATAGO_VK_TUNE_STATS_TRIALS is unset
+  // The effective-coverage TARGET: the line the pair-count floor has to clear.  Three things are
+  // written down here, because a bare 0.93 in prose is how a threshold becomes homeless:
+  //   (i)   it is OUR requirement for "the interval really covers", and it is NOT the band's lower
+  //         edge inside passes() -- that one is 0.90 and means "this row of the six criteria passed";
+  //   (ii)  the self-test asserts n=25 >= TARGET - 3*SE with SE computed from THIS run's trial count.
+  //         A fixed 0.93 would be a coin flip at the default 200 trials (17.6% false red; the
+  //         arithmetic is tabulated in stats-followup-preview.md section 7) and trivially green at
+  //         4000 -- one assertion, three trial counts, one meaning;
+  //   (iii) NO practical assertion separates n=16 from n=25: the measured gap is 0.010-0.012, which
+  //         needs about 20000 trials for 4 sigma (4000 trials gives 1.85).  The floor of 25 is
+  //         therefore a DECLARED value backed by the recorded readings and the cost account; what
+  //         catches a floor quietly lowered to 16 is the DECLARATION (smoke A44 pins pairs_floor=25),
+  //         not a statistic.  n=16 is accordingly REPORTED with its distance to the target and never
+  //         asserted: a "must be below" clause would be red about 22% of the time.
+  constexpr double COVERAGE_TARGET = 0.93;
 
   // ---- descriptive: REPORTING only.  No threshold hangs on these. ----
   double median(std::vector<double> v);
@@ -52,6 +76,7 @@ namespace TuneStats {
   // Student's t quantile -- the small-sample multiplier for an interval whose scale is ESTIMATED.
   // Textbook part with no fitted constant: inverted from the regularised incomplete beta (Lentz
   // continued fraction) by bisection, and pinned against published table values by the self-test.
+  // Its ROLE here is the heuristic described in the header comment, not a claim about the median.
   double tQuantile(double p, double df);
 
   // ---- the paired decision machinery ----
@@ -61,7 +86,8 @@ namespace TuneStats {
     std::size_t pairs;        // usable pairs (exact zeros dropped, the signed-rank convention)
     std::size_t zerosDropped;
     double hl;                // Hodges-Lehmann estimate of the median difference (Walsh averages)
-    double ciLow;             // hl - t_{n-1,1-alpha/2} * 1.2533 * MAD / sqrt(n)
+    double ciLow;             // hl - t_{n-1,1-alpha/2} * 1.2533 * MAD / sqrt(n); the multiplier is the
+                              // HEURISTIC from the header, and its warrant is MEASURED coverage
     double ciHigh;
     bool ciOk;                // false when n cannot support an interval at all (fail closed)
     double pValue;            // two-sided Wilcoxon signed-rank
@@ -97,6 +123,13 @@ namespace TuneStats {
   // Logging/flow only -- it cannot change what the tuner may select, so it is NOT a policy knob and
   // deliberately does not enter policyFingerprint.
   long devTrials();
+
+  // The sibling DEV knob: the self-test's BASE SEED (default 0x5EEDC0DE; accepts 0x... or decimal;
+  // 0 means default).  Every seed inside the self-test is DERIVED from it, so changing it re-runs the
+  // whole thing out of sample -- which is what turns "re-verify under another seed" into a command
+  // instead of a source edit, and a source edit is the shape that produced this session's -dirty
+  // stamp incident twice.  Same class as the trial count: logging/flow only, never a policy knob.
+  unsigned long long devSeed();
 
   // ---- the self-test: known ground truth, pure CPU, deterministic ----
   // Returns ONE line; the shell logs it (the shell owns the logging conventions).
