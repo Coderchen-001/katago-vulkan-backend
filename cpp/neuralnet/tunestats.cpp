@@ -271,6 +271,15 @@ namespace TuneStats {
     return r.ciLow >= -tolerance && r.ciHigh <= tolerance;
   }
 
+  bool decisionUnstable(const PairedResult& r, double tolerance, double alpha) {
+    if (!r.ciOk || r.pairs < 2) return true;                    // no interval => nothing is decided
+    const double tq = tQuantile(1.0 - alpha / 2.0, (double)r.pairs - 1.0);
+    if (!(tq > 0.0)) return true;
+    const double se = (r.ciHigh - r.ciLow) / (2.0 * tq);         // half-width = t * SE
+    if (!(se > 0.0)) return true;
+    return fabs(r.ciLow + tolerance) <= STABILITY_BOUNDARY_SE * se;
+  }
+
   // ---------------------------------------------------------------- the budget
   Budget allocateReps(const vector<double>& sigmaRel, double tolerance, double alpha,
                       long floorReps, long maxReps) {
@@ -596,6 +605,34 @@ namespace TuneStats {
     const double seDelta = sqrt(se25 * se25 + se16 * se16);
     const double sigmaDelta = seDelta > 0.0 ? deltaN / seDelta : 0.0;
 
+    // (5) THE STABILITY RULE, PROVED IN BOTH DIRECTIONS (2026-09-21): a borderline series must be
+    //     flagged as UNRESOLVED and a comfortable one must NOT be -- a rule that flags everything, or
+    //     nothing, would pass a one-sided test.  The effects are built in units of the run's own SE,
+    //     recovered from a pilot interval (half-width / t), and the borderline case uses t*SE: with
+    //     `CI_low + tol ~ (k - t) * SE` and t_24 ~ 2.06, a k of 1 would land at 1.06*SE and NOT be
+    //     flagged -- a mistake worth leaving in the comment.
+    double stabilityBorder = 0.0, stabilityClear = 0.0;
+    {
+      Rng rngPilot(seed + 0x51ABull);
+      vector<double> dPilot;
+      synthDifferences(dPilot, pairs, base, sigmaRel, 0.106, 0.4, 1.0, -tolerance, rngPilot);
+      const PairedResult rPilot = pairedSignedRank(dPilot, alpha);
+      const double tq = tQuantile(1.0 - alpha / 2.0, (double)pairs - 1.0);
+      const double sePilot = rPilot.ciOk ? (rPilot.ciHigh - rPilot.ciLow) / (2.0 * tq) : 0.0;
+      size_t nb = 0, nc = 0;
+      for (size_t t = 0; t < trials; t++) {
+        vector<double> d1, d2;
+        Rng r1(seed + 0xB0A1ull + t);
+        synthDifferences(d1, pairs, base, sigmaRel, 0.106, 0.4, 1.0, -(tolerance - tq * sePilot), r1);
+        if (decisionUnstable(pairedSignedRank(d1, alpha), tolerance, alpha)) nb++;
+        Rng r2(seed + 0xC1EAull + t);
+        synthDifferences(d2, pairs, base, sigmaRel, 0.106, 0.4, 1.0, -(tolerance - 4.0 * tq * sePilot), r2);
+        if (decisionUnstable(pairedSignedRank(d2, alpha), tolerance, alpha)) nc++;
+      }
+      stabilityBorder = (double)nb / (double)trials;
+      stabilityClear  = (double)nc / (double)trials;
+    }
+
     const bool n9FailsAsExpected = !passes(n9);
     // The four pre-registered classes must PARTITION the eight rows: a report whose own classes do not
     // add up is the quiet version of a wrong verdict.
@@ -607,6 +644,7 @@ namespace TuneStats {
                                "no-support-above-gate-only";
 
     const bool selfOk = passes(n25) && n25CoverageOk && n9FailsAsExpected && envMismatch == 0 && tErr < 1e-4 &&
+                        stabilityBorder >= 0.50 && stabilityClear <= 0.05 &&
                         pfClassTotal == 8 &&
                         envPass[0] && envPass[1] && envPass[2] && envPass[3];
 
@@ -633,6 +671,8 @@ namespace TuneStats {
        << " se_cov=" << se25 << " trials_used=" << trials << (loose ? " LOOSE" : "") << "]"
        << " | reps[formula_0.1pct=" << bud.repsFormula[0] << " formula_1pct=" << bud.repsFormula[1]
        << " floor=" << bud.floorReps << " required=" << bud.repsRequired[0] << "/" << bud.repsRequired[1] << "]"
+       << " | stability[k=" << setprecision(1) << STABILITY_BOUNDARY_SE << setprecision(4)
+       << " border_unresolved=" << stabilityBorder << " clear_unresolved=" << stabilityClear << "]"
        << " | pairfloor[" << pf.str() << " inside_gate_fail=" << pfFailInsideGate
        << " above_gate_fail=" << pfFailAboveGate << " both_fail_in_gate=" << pfBothFailInsideGate
        << " verdict=" << pairVerdict << "]"
@@ -640,6 +680,7 @@ namespace TuneStats {
        << " | " << (selfOk ? "ok" : "FAILED");
     if (!selfOk) {
       os << " (n25_pass=" << (passes(n25) ? 1 : 0) << " cov_ok=" << (n25CoverageOk ? 1 : 0)
+         << " stab_border=" << stabilityBorder << " stab_clear=" << stabilityClear
          << " n9_fails=" << (n9FailsAsExpected ? 1 : 0)
          << " t_err=" << tErr << " env_mismatch=" << envMismatch << ")";
     }

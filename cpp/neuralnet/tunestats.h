@@ -90,6 +90,18 @@ namespace TuneStats {
   //         is 0.921-0.928, i.e. 0.4-2.1 sigma of headroom -- making it a coin flip there.  Those
   //         rows are judged by passes()'s six criteria, which is what the envelope was MEASURED with.
   constexpr double COVERAGE_TARGET = 0.93;
+  // THE STABILITY BOUNDARY (2026-09-21): how close to the decision line a PASS may sit before the
+  // verdict is recorded as UNRESOLVED (outcome `unstable`, nothing written) instead of being written.
+  //
+  // It is a DECLARED choice, and the number it implies is part of the declaration: a pass means
+  // `CI_low + tolerance > k * SE`, so the probability that a re-measurement does NOT re-confirm it is
+  // about P(Z < -k) -- k=1 ~= 16%, k=2 ~= 2.3%, k=3 ~= 0.13%.  We take k = 1.0 BECAUSE an unresolved
+  // verdict does not erase anything (no conclusion => no write): the cost of a flip is "not
+  // re-confirmed", not "the decision was reversed".  The 16% is written down so the next reader knows
+  // what is being accepted; anyone who wants ~2.3% moves this one number and re-runs the pairfloor
+  // table, because it is a decision rule (the build revision already covers the identity -- it does NOT
+  // need a KNOBS[] entry).
+  constexpr double STABILITY_BOUNDARY_SE = 1.0;
 
   // ---- descriptive: REPORTING only.  No threshold hangs on these. ----
   double median(std::vector<double> v);
@@ -126,6 +138,12 @@ namespace TuneStats {
   bool notWorseThan(const PairedResult& r, double tolerance);
   bool equivalentWithin(const PairedResult& r, double tolerance);
   bool intervalCovers(const PairedResult& r, double value);
+
+  // TRUE when the decision is too close to the line to be written (see STABILITY_BOUNDARY_SE): the
+  // residual `CI_low + tolerance` is within k * SE of zero.  SE needs no new instrument -- the interval
+  // half-width IS t_{n-1,1-alpha/2} * SE, so it is recovered from the same interval the decision reads.
+  // Fails closed: no interval (or too few pairs) means nothing is decided, hence unresolved.
+  bool decisionUnstable(const PairedResult& r, double tolerance, double alpha);
 
   // ---- the budget: solved ONCE, up front (no optional stopping) ----
   struct Budget {
