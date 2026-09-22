@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <iomanip>
 #include <sstream>
 
@@ -29,8 +30,8 @@ namespace TuneStats {
       }
     };
 
-    // Acklam's inverse normal CDF: the allocator and the intervals need z_{1-alpha/2} for a DECLARED
-    // alpha, and a hard-coded 1.96 would quietly contradict that declaration.
+    // Acklam's inverse normal CDF: the ALLOCATOR needs z_{1-alpha/2} for a DECLARED alpha, and a
+    // hard-coded 1.96 would quietly contradict that declaration.
     double normInv(double p) {
       static const double a[6] = {-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
                                    1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00};
@@ -59,6 +60,49 @@ namespace TuneStats {
              (((((b[0]*r + b[1])*r + b[2])*r + b[3])*r + b[4])*r + 1.0);
     }
 
+    // Regularised incomplete beta I_x(a,b), Lentz continued fraction (the textbook standard part).
+    // Needed to invert Student's t: the interval's scale is ESTIMATED from the same n pairs, so the
+    // multiplier must be the small-sample one, and t's CDF is exactly this beta.
+    double betacf(double a, double b, double x) {
+      const int MAXIT = 300;
+      const double EPS = 3.0e-14, FPMIN = 1.0e-300;
+      const double qab = a + b, qap = a + 1.0, qam = a - 1.0;
+      double c = 1.0;
+      double d = 1.0 - qab * x / qap;
+      if (fabs(d) < FPMIN) d = FPMIN;
+      d = 1.0 / d;
+      double h = d;
+      for (int m = 1; m <= MAXIT; m++) {
+        const double m2 = 2.0 * m;
+        double aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+        d = 1.0 + aa * d; if (fabs(d) < FPMIN) d = FPMIN;
+        c = 1.0 + aa / c; if (fabs(c) < FPMIN) c = FPMIN;
+        d = 1.0 / d; h *= d * c;
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+        d = 1.0 + aa * d; if (fabs(d) < FPMIN) d = FPMIN;
+        c = 1.0 + aa / c; if (fabs(c) < FPMIN) c = FPMIN;
+        d = 1.0 / d;
+        const double del = d * c; h *= del;
+        if (fabs(del - 1.0) < EPS) break;
+      }
+      return h;
+    }
+
+    double betai(double a, double b, double x) {
+      if (x <= 0.0) return 0.0;
+      if (x >= 1.0) return 1.0;
+      const double bt = exp(lgamma(a + b) - lgamma(a) - lgamma(b) + a * log(x) + b * log(1.0 - x));
+      if (x < (a + 1.0) / (a + b + 2.0)) return bt * betacf(a, b, x) / a;
+      return 1.0 - bt * betacf(b, a, 1.0 - x) / b;
+    }
+
+    // P(T <= t) for Student's t with df degrees of freedom.
+    double tCdf(double t, double df) {
+      const double x = df / (df + t * t);
+      const double half = 0.5 * betai(0.5 * df, 0.5, x);
+      return t > 0.0 ? 1.0 - half : half;
+    }
+
     vector<double> walshAverages(const vector<double>& d) {
       vector<double> w;
       w.reserve(d.size() * (d.size() + 1) / 2);
@@ -67,12 +111,6 @@ namespace TuneStats {
           w.push_back(0.5 * (d[i] + d[j]));
       sort(w.begin(), w.end());
       return w;
-    }
-
-    double walshMedian(const vector<double>& d) {
-      if (d.empty()) return 0.0;
-      vector<double> w = walshAverages(d);
-      return median(w);
     }
 
     // Exact two-sided signed-rank p-value from the null distribution of W+ (no ties assumed): a DP
@@ -98,15 +136,6 @@ namespace TuneStats {
     }
   }
 
-  const char* intervalName(Interval iv) {
-    switch (iv) {
-      case CI_MAD: return "mad";
-      case CI_WILCOXON: return "wilcoxon";
-      case CI_BOOTSTRAP: return "bootstrap";
-    }
-    return "?";
-  }
-
   // ---------------------------------------------------------------- descriptive
   double median(vector<double> v) {
     if (v.empty()) return 0.0;
@@ -124,13 +153,31 @@ namespace TuneStats {
     return 1.4826 * median(dev);
   }
 
+  double tQuantile(double p, double df) {
+    if (df <= 0.0) df = 1.0;
+    if (p <= 0.0) return -1e9;
+    if (p >= 1.0) return 1e9;
+    if (p == 0.5) return 0.0;
+    // Bisection, not an asymptotic expansion: the CDF is monotone, a bracket is found by doubling,
+    // and the result is then good to the double's own resolution.  NO fitted constant enters here.
+    const bool upper = p > 0.5;
+    const double target = upper ? p : 1.0 - p;
+    double lo = 0.0, hi = 1.0;
+    while (tCdf(hi, df) < target && hi < 1e12) hi *= 2.0;
+    for (int it = 0; it < 300; it++) {
+      const double mid = 0.5 * (lo + hi);
+      if (tCdf(mid, df) < target) lo = mid; else hi = mid;
+      if (hi - lo <= 1e-14 * (1.0 + hi)) break;
+    }
+    const double q = 0.5 * (lo + hi);
+    return upper ? q : -q;
+  }
+
   // ---------------------------------------------------------------- the paired test
-  PairedResult pairedSignedRank(const vector<double>& dIn, double alpha, unsigned long long seed) {
+  PairedResult pairedSignedRank(const vector<double>& dIn, double alpha) {
     PairedResult r;
     r.pairs = 0; r.zerosDropped = 0; r.hl = 0.0;
-    r.ciLowMad = r.ciHighMad = 0.0; r.madOk = false;
-    r.ciLowWil = r.ciHighWil = 0.0; r.wilOk = false;
-    r.ciLowBoot = r.ciHighBoot = 0.0; r.bootOk = false;
+    r.ciLow = r.ciHigh = 0.0; r.ciOk = false;
     r.pValue = 1.0; r.pExact = false; r.wPlus = 0.0;
 
     vector<double> d;
@@ -184,98 +231,41 @@ namespace TuneStats {
     }
 
     // ---- the estimate ----
-    const vector<double> w = walshAverages(d);
-    r.hl = median(w);
+    r.hl = median(walshAverages(d));
 
     if (n >= 4) {
-      // (a) CI_MAD: the median +- z_{1-alpha/2} * 1.2533 * MAD / sqrt(n).
-      //     NEITHER constant is fitted, and that matters: a multiplier tuned against the same spike
-      //     model that validates it would make "n=16 passes" an in-sample claim.
-      //       1.4826 = 1 / Phi^-1(0.75): the MAD's consistency factor for a normal scale (textbook)
-      //       1.2533 = sqrt(pi/2): SE(median) / SE(mean) for a normal distribution, since
-      //                SE(median) = 1/(2 f(0) sqrt(n)) and f(0) = 1/(sigma sqrt(2 pi))
-      //     z comes from the CALLER's declared alpha.  The only quantity the sweep below chooses is
-      //     the pair count, and that choice is then re-tested OUT OF SAMPLE (other spike shapes and
-      //     another seed) before anything is allowed to call it validated.
+      // CI: the median +- t_{n-1,1-alpha/2} * 1.2533 * MAD / sqrt(n).
+      // NEITHER scale constant is fitted, and that matters: a multiplier tuned against the same
+      // spike model that validates it would make "n=25 passes" an in-sample claim.
+      //   1.4826 = 1 / Phi^-1(0.75): the MAD's consistency factor for a normal scale (textbook)
+      //   1.2533 = sqrt(pi/2): SE(median) / SE(mean) for a normal distribution, since
+      //            SE(median) = 1/(2 f(0) sqrt(n)) and f(0) = 1/(sigma sqrt(2 pi))
+      //   t_{n-1}: the scale is ESTIMATED from these n pairs, so the Gaussian z would claim more
+      //            confidence than the data supports.  This is a small-sample CORRECTION, not a fit:
+      //            the degrees of freedom follow from n, and alpha is the declared one.
+      // The only quantity the sweep chooses is the pair count, and that choice is then re-tested OUT
+      // OF SAMPLE (another seed, shapes around the measured one) before anything calls it validated.
       const double sig = madScale(d);
-      const double half = normInv(1.0 - alpha / 2.0) * 1.2533 * sig / sqrt((double)n);
-      r.ciLowMad = r.hl - half;
-      r.ciHighMad = r.hl + half;
-      r.madOk = true;
-
-      // (b) CI_WILCOXON: the distribution-free signed-rank interval -- order statistics of the Walsh
-      //     averages, trimmed at each end by the alpha/2 quantile of W+.  With ties the critical
-      //     value comes from the normal approximation with the ties correction (the standard
-      //     practical form).  This interval assumes NOTHING about the noise shape.
-      const long N = (long)w.size();
-      const double z = normInv(1.0 - alpha / 2.0);
-      long k = (long)floor(meanW - z * sqrt(varW > 0.0 ? varW : 0.0));
-      if (k < 0) k = 0;
-      if (2 * k < N) {
-        r.ciLowWil = w[(size_t)k];
-        r.ciHighWil = w[(size_t)(N - 1 - k)];
-        r.wilOk = true;
-      }
-
-      // (c) CI_BOOTSTRAP: kept only so its measured failure stays on the record.
-      {
-        const int B = 400;
-        vector<double> hlB;
-        hlB.reserve(B);
-        Rng rng(seed);
-        vector<double> sample(n, 0.0);
-        for (int b = 0; b < B; b++) {
-          for (size_t kk = 0; kk < n; kk++) sample[kk] = d[(size_t)(rng.next() % n)];
-          hlB.push_back(walshMedian(sample));
-        }
-        sort(hlB.begin(), hlB.end());
-        const size_t lo = (size_t)floor((alpha / 2.0) * B);
-        const size_t hi = (size_t)ceil((1.0 - alpha / 2.0) * B) - 1;
-        r.ciLowBoot = hlB[min(lo, hlB.size() - 1)];
-        r.ciHighBoot = hlB[min(hi, hlB.size() - 1)];
-        r.bootOk = true;
-      }
+      const double half = tQuantile(1.0 - alpha / 2.0, (double)n - 1.0) * 1.2533 * sig / sqrt((double)n);
+      r.ciLow = r.hl - half;
+      r.ciHigh = r.hl + half;
+      r.ciOk = true;
     }
     return r;
   }
 
-  bool intervalCovers(const PairedResult& r, Interval iv, double value) {
-    switch (iv) {
-      case CI_MAD: return r.madOk && r.ciLowMad <= value && r.ciHighMad >= value;
-      case CI_WILCOXON: return r.wilOk && r.ciLowWil <= value && r.ciHighWil >= value;
-      case CI_BOOTSTRAP: return r.bootOk && r.ciLowBoot <= value && r.ciHighBoot >= value;
-    }
-    return false;
+  bool intervalCovers(const PairedResult& r, double value) {
+    return r.ciOk && r.ciLow <= value && r.ciHigh >= value;
   }
 
-  bool notWorseThan(const PairedResult& r, double tolerance, Interval iv) {
-    switch (iv) {
-      case CI_MAD:
-        if (!r.madOk) return false;               // fail closed: no interval, no claim
-        return r.ciLowMad >= -tolerance;
-      case CI_WILCOXON:
-        if (!r.wilOk) return false;
-        return r.ciLowWil >= -tolerance;
-      case CI_BOOTSTRAP:
-        if (!r.bootOk) return false;
-        return r.ciLowBoot >= -tolerance;
-    }
-    return false;
+  bool notWorseThan(const PairedResult& r, double tolerance) {
+    if (!r.ciOk) return false;               // fail closed: no interval, no claim
+    return r.ciLow >= -tolerance;
   }
 
-  bool equivalentWithin(const PairedResult& r, double tolerance, Interval iv) {
-    switch (iv) {
-      case CI_MAD:
-        if (!r.madOk) return false;
-        return r.ciLowMad >= -tolerance && r.ciHighMad <= tolerance;
-      case CI_WILCOXON:
-        if (!r.wilOk) return false;
-        return r.ciLowWil >= -tolerance && r.ciHighWil <= tolerance;
-      case CI_BOOTSTRAP:
-        if (!r.bootOk) return false;
-        return r.ciLowBoot >= -tolerance && r.ciHighBoot <= tolerance;
-    }
-    return false;
+  bool equivalentWithin(const PairedResult& r, double tolerance) {
+    if (!r.ciOk) return false;
+    return r.ciLow >= -tolerance && r.ciHigh <= tolerance;
   }
 
   // ---------------------------------------------------------------- the budget
@@ -285,6 +275,11 @@ namespace TuneStats {
     b.floorReps = floorReps;
     b.totalReps = 0;
     b.anyClampedAtMax = false;
+    // The FORMULA is the Gaussian face of the same problem (z, not t) and it is REPORTED, not obeyed:
+    // under our measured spikes it is systematically optimistic (the scale the formula assumes is the
+    // one the spikes inflate), which is exactly why the REQUIRED count is the max with the MEASURED
+    // floor.  Printing both is what keeps "the floor is doing the work here" visible instead of
+    // implied by a single number that looks like a formula's output.
     const double z = normInv(1.0 - alpha / 2.0);
     for (size_t s = 0; s < sigmaRel.size(); s++) {
       long reps;
@@ -293,12 +288,26 @@ namespace TuneStats {
         const double need = (z * sigmaRel[s] / tolerance);
         reps = (long)ceil(need * need);
       }
-      if (reps < floorReps) reps = floorReps;
-      if (reps > maxReps) { reps = maxReps; b.anyClampedAtMax = true; }
-      b.repsPerShape.push_back(reps);
-      b.totalReps += reps;
+      if (reps < 1) reps = 1;
+      b.repsFormula.push_back(reps);
+      long req = reps < floorReps ? floorReps : reps;
+      if (req > maxReps) { req = maxReps; b.anyClampedAtMax = true; }
+      b.repsRequired.push_back(req);
+      b.totalReps += req;
     }
     return b;
+  }
+
+  long devTrials() {
+    long t = DEV_TRIALS_DEFAULT;
+    const char* v = getenv("KATAGO_VK_TUNE_STATS_TRIALS");
+    if (v != nullptr && v[0] != '\0') {
+      const long parsed = strtol(v, nullptr, 10);
+      if (parsed > 0) t = parsed;
+    }
+    if (t < 10) t = 10;
+    if (t > 20000) t = 20000;
+    return t;
   }
 
   // ---------------------------------------------------------------- the self-test
@@ -307,9 +316,10 @@ namespace TuneStats {
   //   power_at_tol: how often a candidate 1.01x the tolerance worse is refused
   //   power@noise : how often a candidate only noise-level worse is refused (should be LOW)
   //   spikes+-    : whether the verdict agrees with the spike-free verdict
-  //   sentinel    : how often an honest A/A comparison is declared broken (should be LOW)
-  // and the sweep runs every (interval, pairs) combination, so the choice is made by measurement --
-  // the first run's bootstrap collapse is exactly why this loop exists.
+  //   sentinel    : how often an honest A/A comparison is declared broken (should be LOW) AND how
+  //                 often a REAL bias at the tolerance is caught (should be HIGH -- a sentinel with
+  //                 no power is indistinguishable from a device that is never biased)
+  // ...and the pair-count choice is re-tested on shapes and seeds the sweep did not select on.
   namespace {
     // One synthetic pair difference: two independent blocks, each base*(1 + N(0,sigma) + spike).
     // Both arms draw their spike uniforms even when spikeProb is 0, so the spike-free variant sees
@@ -339,7 +349,7 @@ namespace TuneStats {
     template <typename Pred>
     double runRate(size_t trials, size_t pairs, double base, double sigmaRel, double spikeProb,
                    double spikeLo, double spikeHi, double effect, double alpha,
-                   unsigned long long seed, Pred pred, double* widthOut, Interval widthIv) {
+                   unsigned long long seed, Pred pred, double* widthOut) {
       Rng rng(seed);
       vector<double> d;
       size_t hit = 0;
@@ -347,39 +357,34 @@ namespace TuneStats {
       if (widthOut != nullptr) widths.reserve(trials);
       for (size_t t = 0; t < trials; t++) {
         synthDifferences(d, pairs, base, sigmaRel, spikeProb, spikeLo, spikeHi, effect, rng);
-        const PairedResult r = pairedSignedRank(d, alpha, seed + 7919ull * (unsigned long long)(t + 1));
+        const PairedResult r = pairedSignedRank(d, alpha);
         if (pred(r)) hit++;
-        if (widthOut != nullptr) {
-          // the width of the interval UNDER TEST (reporting another one is how a record starts lying)
-          if (widthIv == CI_WILCOXON && r.wilOk) widths.push_back(r.ciHighWil - r.ciLowWil);
-          else if (widthIv == CI_BOOTSTRAP && r.bootOk) widths.push_back(r.ciHighBoot - r.ciLowBoot);
-          else if (widthIv == CI_MAD && r.madOk) widths.push_back(r.ciHighMad - r.ciLowMad);
-        }
+        if (widthOut != nullptr && r.ciOk) widths.push_back(r.ciHigh - r.ciLow);
       }
       if (widthOut != nullptr) *widthOut = median(widths);
       return (double)hit / (double)trials;
     }
 
-    Rates measure(Interval iv, size_t trials, size_t pairs, double alpha, double tolerance,
-                  double sigmaRel, double spikeProb, double spikeLo, double spikeHi, double base,
+    Rates measure(size_t trials, size_t pairs, double alpha, double tolerance, double sigmaRel,
+                  double spikeProb, double spikeLo, double spikeHi, double base,
                   unsigned long long seed) {
       Rates r;
       const double effectCover = 0.002;
       r.coverage = runRate(trials, pairs, base, sigmaRel, spikeProb, spikeLo, spikeHi, effectCover,
-                           alpha, seed, [&](const PairedResult& p) { return intervalCovers(p, iv, effectCover); },
-                           &r.ciWidth, iv);
+                           alpha, seed, [&](const PairedResult& p) { return intervalCovers(p, effectCover); },
+                           &r.ciWidth);
       r.powerTol = runRate(trials, pairs, base, sigmaRel, spikeProb, spikeLo, spikeHi, -1.01 * tolerance,
-                           alpha, seed + 11, [&](const PairedResult& p) { return !notWorseThan(p, tolerance, iv); },
-                           nullptr, iv);
+                           alpha, seed + 11, [&](const PairedResult& p) { return !notWorseThan(p, tolerance); },
+                           nullptr);
       r.powerNoise = runRate(trials, pairs, base, sigmaRel, spikeProb, spikeLo, spikeHi, -sigmaRel,
-                             alpha, seed + 23, [&](const PairedResult& p) { return !notWorseThan(p, tolerance, iv); },
-                             nullptr, iv);
+                             alpha, seed + 23, [&](const PairedResult& p) { return !notWorseThan(p, tolerance); },
+                             nullptr);
       r.spikesWith = runRate(trials, pairs, base, sigmaRel, spikeProb, spikeLo, spikeHi, -0.5 * tolerance,
-                             alpha, seed + 37, [&](const PairedResult& p) { return notWorseThan(p, tolerance, iv); },
-                             nullptr, iv);
+                             alpha, seed + 37, [&](const PairedResult& p) { return notWorseThan(p, tolerance); },
+                             nullptr);
       r.spikesWithout = runRate(trials, pairs, base, sigmaRel, 0.0, spikeLo, spikeHi, -0.5 * tolerance,
-                                alpha, seed + 37, [&](const PairedResult& p) { return notWorseThan(p, tolerance, iv); },
-                                nullptr, iv);
+                                alpha, seed + 37, [&](const PairedResult& p) { return notWorseThan(p, tolerance); },
+                                nullptr);
       // THE SENTINEL HAS TWO JOBS, and only the first one was measured before:
       //   false-failure rate on an honest A/A (must be low) and POWER against a real bias (must be
       //   high).  Without the second, "the sentinel stayed quiet" cannot be told apart from "the
@@ -388,17 +393,20 @@ namespace TuneStats {
       // than the tolerance is deliberately NOT flagged, because the equivalence check is a claim
       // about the tolerance, not about zero -- that is why the half-tolerance case is reported too.
       r.sentinelFalse = runRate(trials, pairs, base, sigmaRel, spikeProb, spikeLo, spikeHi, 0.0,
-                                alpha, seed + 53, [&](const PairedResult& p) { return !equivalentWithin(p, tolerance, iv); },
-                                nullptr, iv);
+                                alpha, seed + 53, [&](const PairedResult& p) { return !equivalentWithin(p, tolerance); },
+                                nullptr);
       r.sentinelPower = runRate(trials, pairs, base, sigmaRel, spikeProb, spikeLo, spikeHi, 1.01 * tolerance,
-                                alpha, seed + 61, [&](const PairedResult& p) { return !equivalentWithin(p, tolerance, iv); },
-                                nullptr, iv);
+                                alpha, seed + 61, [&](const PairedResult& p) { return !equivalentWithin(p, tolerance); },
+                                nullptr);
       r.sentinelPowerHalf = runRate(trials, pairs, base, sigmaRel, spikeProb, spikeLo, spikeHi, 0.5 * tolerance,
-                                    alpha, seed + 67, [&](const PairedResult& p) { return !equivalentWithin(p, tolerance, iv); },
-                                    nullptr, iv);
+                                    alpha, seed + 67, [&](const PairedResult& p) { return !equivalentWithin(p, tolerance); },
+                                    nullptr);
       return r;
     }
 
+    // The SIX criteria.  They are deliberately shape-agnostic thresholds on measured rates -- no
+    // threshold here is a fitted scale, which is what lets the same function judge shapes that were
+    // never used to pick the pair count.
     bool passes(const Rates& r) {
       return r.coverage >= 0.90 && r.coverage <= 0.99 && r.powerTol >= 0.80 &&
              r.powerNoise <= 0.20 && fabs(r.spikesWith - r.spikesWithout) <= 0.05 &&
@@ -406,76 +414,111 @@ namespace TuneStats {
     }
 
     // The applicability ENVELOPE: the conclusion only holds inside the noise shapes that were
-    // synthesised, so the same six criteria are re-run on shapes around the measured one, and the
-    // set that passes is what the runtime gate is allowed to trust (see the audit page, gap P12).
-    struct EnvCase { const char* name; double p; double lo; double hi; unsigned long long seedOff; };
-    const EnvCase ENV_CASES[5] = {
-      { "measured",  0.106, 0.4, 1.0, 0ull },        // the measured regime (spike_p 10.6%, +40..100%)
-      { "alt-seed",  0.106, 0.4, 1.0, 0x1234ull },   // the same shape, an independent seed (out of sample)
-      { "mild",      0.050, 0.2, 0.5, 0x2345ull },   // fewer, smaller spikes
-      { "big",       0.106, 1.0, 3.0, 0x3456ull },   // the same rate, much larger spikes
-      { "harsh",     0.200, 0.4, 1.0, 0x4567ull },   // double the measured rate
+    // synthesised, so the same six criteria are re-run on shapes around the measured one.  Each row
+    // declares its EXPECTED verdict, and the gate constant must agree with the rows -- a gate that
+    // says "up to 15%" while a 15% row is declared FAIL (or a passing 18% row sits above it) is a
+    // dead judgement, and the self-test reddens instead of printing it politely.
+    struct EnvCase { const char* name; double p; double lo; double hi; unsigned long long seedOff; bool expectPass; };
+    const EnvCase ENV_CASES[8] = {
+      { "measured",  0.106, 0.4, 1.0, 0ull,      true  },   // the measured regime (spike_p 10.6%, +40..100%)
+      { "alt-seed",  0.106, 0.4, 1.0, 0x1234ull, true  },   // the same shape, an independent seed (out of sample)
+      { "mild",      0.050, 0.2, 0.5, 0x2345ull, true  },   // fewer, smaller spikes
+      { "big",       0.106, 1.0, 3.0, 0x3456ull, true  },   // the same rate, much larger spikes
+      { "rate12",    0.120, 0.4, 1.0, 0x5555ull, true  },   // the gap between the measured rate and the gate
+      { "rate15",    0.150, 0.4, 1.0, 0x6666ull, true  },   // the gate itself
+      { "rate18",    0.180, 0.4, 1.0, 0x7777ull, false },   // above the gate: must FAIL
+      { "harsh20",   0.200, 0.4, 1.0, 0x4567ull, false },   // double the measured rate: must FAIL
     };
   }
 
   string selfTestSummary() {
-    const double alpha = 0.05;          // DECLARED (the reference makes alpha an explicit parameter too)
-    const double tolerance = 0.01;      // 1% : the product tolerance
+    const double alpha = ALPHA;
+    const double tolerance = TOLERANCE;
     const double sigmaRel = 0.001;      // 0.1% : the BLOCK-relative paired scale measured on the 5080
     const double base = 1.0;
-    const size_t trials = 1000;   // enough that the bands are not Monte-Carlo luck
-    const size_t pairs = 25;            // the MEASURED floor: at 16 the out-of-sample coverage fell to 0.896
+    const size_t trials = (size_t)devTrials();
+    const size_t pairs = (size_t)PAIRS_FLOOR;
     const unsigned long long seed = 0x5EEDC0DEULL;
 
-    // (1) the pair-count evidence, at the measured shape: 9 must FAIL, 16 must PASS (a fixed
-    //     multiplier that only works when the count was fitted would show up right here)
-    const Rates n9 = measure(CI_MAD, trials, 9, alpha, tolerance, sigmaRel, 0.106, 0.4, 1.0, base, seed);
-    const Rates r16 = measure(CI_MAD, trials, pairs, alpha, tolerance, sigmaRel, 0.106, 0.4, 1.0, base, seed);
-    const Rates n25 = measure(CI_MAD, trials, 25, alpha, tolerance, sigmaRel, 0.106, 0.4, 1.0, base, seed);
+    // (0) the multiplier against PUBLISHED table values: the t quantile is a textbook part, and this
+    //     is what stops it from being a claim.  The tolerance separates it from a wrong multiplier
+    //     (z at df=24 differs by 0.10) by three orders of magnitude.
+    struct TCase { double p; double df; double want; };
+    const TCase TCASES[4] = { {0.975, 1.0,   12.706204736},
+                              {0.975, 8.0,    2.306004135},
+                              {0.975, 24.0,   2.063898562},
+                              {0.975, 100.0,  1.983971519} };
+    double tErr = 0.0;
+    ostringstream tt;
+    for (int i = 0; i < 4; i++) {
+      const double got = tQuantile(TCASES[i].p, TCASES[i].df);
+      tErr = max(tErr, fabs(got - TCASES[i].want));
+      tt << (i ? " " : "") << "df=" << (int)TCASES[i].df << ":" << setprecision(9) << got;
+    }
 
-    // (2) OUT OF SAMPLE: the same criteria on shapes around the measured one, no re-selection
-    bool envPass[5];
+    // (1) the pair-count evidence at the measured shape.  n=9 must FAIL (the negative control that
+    //     keeps the criteria from being vacuous), n=25 must pass, and n=16 is quoted on an
+    //     INDEPENDENT seed -- the out-of-sample reading that keeps the floor at 25: it lands ON the
+    //     0.93 line (0.927 at 1000 trials, 0.933 at 4000) while 25 sits at 0.943-0.945.
+    const Rates n9  = measure(trials, 9,    alpha, tolerance, sigmaRel, 0.106, 0.4, 1.0, base, seed);
+    const Rates n16 = measure(trials, 16,   alpha, tolerance, sigmaRel, 0.106, 0.4, 1.0, base, seed + 0x9E37ull);
+    const Rates n25 = measure(trials, pairs, alpha, tolerance, sigmaRel, 0.106, 0.4, 1.0, base, seed);
+
+    // (2) OUT OF SAMPLE: the same six criteria on shapes and seeds around the measured one, with no
+    //     re-selection, plus the gate row check.
+    bool envPass[8];
+    bool envExpect[8];
     ostringstream env;
     int envOkCount = 0;
-    for (int i = 0; i < 5; i++) {
-      const Rates r = measure(CI_MAD, trials, pairs, alpha, tolerance, sigmaRel, ENV_CASES[i].p,
+    int envMismatch = 0;
+    for (int i = 0; i < 8; i++) {
+      const Rates r = measure(trials, pairs, alpha, tolerance, sigmaRel, ENV_CASES[i].p,
                               ENV_CASES[i].lo, ENV_CASES[i].hi, base, seed + ENV_CASES[i].seedOff);
       envPass[i] = passes(r);
       if (envPass[i]) envOkCount++;
+      envExpect[i] = (ENV_CASES[i].p <= SPIKE_RATE_GATE);
+      if (envExpect[i] != envPass[i]) envMismatch++;
       env << (i ? "," : "") << ENV_CASES[i].name << (envPass[i] ? ":OK" : ":FAIL")
           << "(cov=" << setprecision(3) << r.coverage << " pn=" << r.powerNoise
           << " snF=" << r.sentinelFalse << " snP=" << r.sentinelPower
           << " sp=" << fabs(r.spikesWith - r.spikesWithout) << ")" << setprecision(4);
     }
 
-    // (3) the two textbook intervals, for the record: they must stay visibly unusable
-    const Rates wil = measure(CI_WILCOXON, trials, 16, alpha, tolerance, sigmaRel, 0.106, 0.4, 1.0, base, seed);
-    const Rates boot = measure(CI_BOOTSTRAP, trials, 9, alpha, tolerance, sigmaRel, 0.106, 0.4, 1.0, base, seed);
-
-    vector<double> sig(1, sigmaRel);
-    const Budget bud = allocateReps(sig, tolerance, alpha, 16, 512);
+    // (3) the budget: two block-relative scales, so "the measured floor is what sets the count" is
+    //     visible instead of implied.  The formula is the Gaussian face and is REPORTED; the count
+    //     that is run is the max with the measured floor.
+    vector<double> sig;
+    sig.push_back(sigmaRel);   // 0.1% : the measured block-relative scale
+    sig.push_back(0.01);       // 1%   : a scale an order of magnitude worse, i.e. formula-bound
+    const Budget bud = allocateReps(sig, tolerance, alpha, PAIRS_FLOOR, REPS_MAX);
 
     const bool n9FailsAsExpected = !passes(n9);
-    const bool selfOk = passes(r16) && n9FailsAsExpected && envPass[0] && envPass[1] && envOkCount >= 3;
+    const bool selfOk = passes(n25) && n9FailsAsExpected && envMismatch == 0 && tErr < 1e-4 &&
+                        envPass[0] && envPass[1] && envPass[2] && envPass[3];
 
     ostringstream os;
     os << fixed << setprecision(4)
        << "seed=" << seed << " trials=" << trials
        << " alpha=" << setprecision(3) << alpha << setprecision(4)
        << " tol=" << tolerance << " sigma_rel=" << sigmaRel
-       << " | mad/n=9[cov=" << n9.coverage << " snF=" << n9.sentinelFalse << " sp=" << fabs(n9.spikesWith - n9.spikesWithout) << "]"
-       << " mad/n=" << pairs << "[cov=" << r16.coverage << " pw=" << r16.powerTol << " pn=" << r16.powerNoise
-       << " sp=" << fabs(r16.spikesWith - r16.spikesWithout) << " snF=" << r16.sentinelFalse
-       << " snP=" << r16.sentinelPower << " snP_half=" << r16.sentinelPowerHalf << " w=" << r16.ciWidth << "]"
-       << " mad/n=25[cov=" << n25.coverage << " snF=" << n25.sentinelFalse << " snP=" << n25.sentinelPower << "]"
-       << " | envelope[" << env.str() << "]"
-       << " | records: wilcoxon/n=16[snF=" << wil.sentinelFalse << " pn=" << wil.powerNoise << "]"
-       << " bootstrap/n=9[snF=" << boot.sentinelFalse << " pn=" << boot.powerNoise << "]"
-       << " | reps_for_tol=" << (bud.repsPerShape.empty() ? 0 : bud.repsPerShape[0])
+       << " block_ms=" << setprecision(2) << MIN_BLOCK_TIME_MS << setprecision(4)
+       << " pairs_floor=" << pairs << " gate=" << setprecision(3) << SPIKE_RATE_GATE << setprecision(4)
+       << " | t_inv[" << tt.str() << " max_err=" << scientific << setprecision(2) << tErr << fixed << setprecision(4) << "]"
+       << " | n9[cov=" << n9.coverage << " snF=" << n9.sentinelFalse
+       << " sp=" << fabs(n9.spikesWith - n9.spikesWithout) << "] must-fail=" << (n9FailsAsExpected ? 1 : 0)
+       << " | n16_altseed[cov=" << n16.coverage << " pw=" << n16.powerTol << "]"
+       << " | n25[cov=" << n25.coverage << " pw=" << n25.powerTol << " pn=" << n25.powerNoise
+       << " sp=" << fabs(n25.spikesWith - n25.spikesWithout) << " snF=" << n25.sentinelFalse
+       << " snP=" << n25.sentinelPower << " snP_half=" << n25.sentinelPowerHalf << " w=" << n25.ciWidth << "]"
+       << " pass=" << (passes(n25) ? 1 : 0)
+       << " | coverage[nominal=" << (1.0 - alpha) << " effective=" << n25.coverage << "]"
+       << " | reps[formula_0.1pct=" << bud.repsFormula[0] << " formula_1pct=" << bud.repsFormula[1]
+       << " floor=" << bud.floorReps << " required=" << bud.repsRequired[0] << "/" << bud.repsRequired[1] << "]"
+       << " | env[" << env.str() << "] ok_env=" << envOkCount << "/8 expect_mismatch=" << envMismatch
        << " | " << (selfOk ? "ok" : "FAILED");
     if (!selfOk) {
-      os << " (r16=" << (passes(r16) ? 1 : 0) << " n9_fails=" << (n9FailsAsExpected ? 1 : 0)
-         << " env_ok=" << envOkCount << ")";
+      os << " (n25_pass=" << (passes(n25) ? 1 : 0) << " n9_fails=" << (n9FailsAsExpected ? 1 : 0)
+         << " t_err=" << tErr << " env_mismatch=" << envMismatch << ")";
     }
     return os.str();
   }

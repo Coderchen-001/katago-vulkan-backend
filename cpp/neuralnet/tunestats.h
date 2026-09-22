@@ -20,25 +20,39 @@
 // comparison with a declared alpha and a repetition floor, and a stability discipline.  What that
 // reference cannot give us is enumerated in tune-algorithm-audit.md section 11.
 //
-// WHAT IS DELIBERATELY **NOT** HERE: half-split self-checks, spike replacement, k/k2 thresholds and
-// CV gates.  All four were ours, all four were unpinned or biased, and all four are on the delete
-// list in tune-algorithm-audit.md section 7.
+// 2026-09-21, delete-dead-criteria batch: the two ORDER-STATISTIC intervals are GONE from the
+// shipped path.  Both were MEASURED unusable under our spike shape -- a one-sided spike shifts
+// every Walsh average that contains that d_i, so intervals built on Walsh order statistics are
+// wrong there, and the percentile bootstrap was 40% wide and fired the A/A sentinel in 86% of
+// sessions.  One interval ships: median +- t * 1.2533 * MAD / sqrt(n), whose multiplier is
+// Student's t with n-1 degrees of freedom because the scale is ESTIMATED from the same n pairs (a
+// Gaussian z would claim more confidence than the data supports).  Deleting them also removed about
+// 95% of this self-test's cost (the bootstrap sorted 400 Walsh medians per trial; a probe leg that
+// took 225 s now takes seconds).  The generator and the six criteria stay, so either interval can be
+// put back as a candidate and re-measured.  The pair-count floor was re-measured on the NEW interval
+// and did NOT move down: at n=16 the out-of-sample reading is 0.927 / 0.933 (1000 / 4000 trials,
+// logs-t3/stats-v3-sweep-*.txt), i.e. ON the 0.93 line, while n=25 sits at 0.943-0.945 -- so 25 stays
+// as a deliberately conservative floor whose cost is counted (about 3.5-5 s per tune).
+// See tune-algorithm-audit.md section 7 for the delete list this file implements.
 namespace TuneStats {
+
+  // ---- the DECLARED protocol constants: ONE source, so the probe batch cannot re-copy them ----
+  constexpr double MIN_BLOCK_TIME_MS = 2.0;  // declared block; the us clock's 0.19% quantisation stays under the 0.1% sigma budget
+  constexpr long   PAIRS_FLOOR = 25;         // MEASURED floor: n=16 is on the 0.93 line, n=25 is 0.943-0.945 (logs-t3/stats-v3-sweep-*.txt)
+  constexpr double ALPHA = 0.05;             // declared, not hidden inside a formula
+  constexpr double TOLERANCE = 0.01;         // 1% : the product tolerance
+  constexpr double SPIKE_RATE_GATE = 0.15;   // MEASURED bound: 15% passes, 18% fails on THREE criteria at once (the rate12/15/18 sweep)
+  constexpr long   REPS_MAX = 512;
+  constexpr long   DEV_TRIALS_DEFAULT = 200; // the self-test's size when KATAGO_VK_TUNE_STATS_TRIALS is unset
 
   // ---- descriptive: REPORTING only.  No threshold hangs on these. ----
   double median(std::vector<double> v);
   double madScale(const std::vector<double>& v);   // 1.4826 * MAD (textbook robust scale)
 
-  // Which interval the decision reads.  All three are computed and carried, because the self-test's
-  // whole job is to MEASURE them against injected ground truth and retire the ones that fail:
-  //   CI_MAD       : median +- z * 1.2533 * MAD / sqrt(n)
-  //   CI_WILCOXON  : the distribution-free signed-rank interval (order statistics of the Walsh
-  //                  averages, trimmed by the alpha/2 quantile of W+ with the ties correction)
-  //   CI_BOOTSTRAP : percentile bootstrap over pairs -- MEASURED UNUSABLE (interval 40% wide, the
-  //                  A/A sentinel firing in 86% of sessions).  Kept only so the self-test keeps
-  //                  measuring its failure and nobody re-introduces it blind.
-  enum Interval { CI_MAD = 0, CI_WILCOXON = 1, CI_BOOTSTRAP = 2 };
-  const char* intervalName(Interval iv);
+  // Student's t quantile -- the small-sample multiplier for an interval whose scale is ESTIMATED.
+  // Textbook part with no fitted constant: inverted from the regularised incomplete beta (Lentz
+  // continued fraction) by bisection, and pinned against published table values by the self-test.
+  double tQuantile(double p, double df);
 
   // ---- the paired decision machinery ----
   // Input: d_i = t_stock,i - t_cand,i for ONE rep each (the pairing cancels the common-mode drift a
@@ -47,30 +61,28 @@ namespace TuneStats {
     std::size_t pairs;        // usable pairs (exact zeros dropped, the signed-rank convention)
     std::size_t zerosDropped;
     double hl;                // Hodges-Lehmann estimate of the median difference (Walsh averages)
-    double ciLowMad, ciHighMad;
-    bool madOk;
-    double ciLowWil, ciHighWil;
-    bool wilOk;
-    double ciLowBoot, ciHighBoot;
-    bool bootOk;
+    double ciLow;             // hl - t_{n-1,1-alpha/2} * 1.2533 * MAD / sqrt(n)
+    double ciHigh;
+    bool ciOk;                // false when n cannot support an interval at all (fail closed)
     double pValue;            // two-sided Wilcoxon signed-rank
     bool pExact;              // true when the exact null distribution was used
     double wPlus;             // the statistic, recorded for the evidence
   };
-  PairedResult pairedSignedRank(const std::vector<double>& d, double alpha, unsigned long long seed);
+  PairedResult pairedSignedRank(const std::vector<double>& d, double alpha);
 
-  // The two decisions, both reading ONE chosen interval:
+  // The two decisions, both reading the ONE interval:
   //   non-inferiority -- the persisted row-set claim: the whole interval above -tolerance
   //   equivalence     -- the A/A sentinel: the whole interval inside +-tolerance (failing to reject
   //                      equality is not evidence of equality, which is how a broken comparison
   //                      would slip past the older "the sentinel did not win" phrasing)
-  bool notWorseThan(const PairedResult& r, double tolerance, Interval iv);
-  bool equivalentWithin(const PairedResult& r, double tolerance, Interval iv);
-  bool intervalCovers(const PairedResult& r, Interval iv, double value);
+  bool notWorseThan(const PairedResult& r, double tolerance);
+  bool equivalentWithin(const PairedResult& r, double tolerance);
+  bool intervalCovers(const PairedResult& r, double value);
 
   // ---- the budget: solved ONCE, up front (no optional stopping) ----
   struct Budget {
-    std::vector<long> repsPerShape;
+    std::vector<long> repsFormula;   // the Gaussian formula's answer: REPORTED, and systematically low under spikes
+    std::vector<long> repsRequired;  // max(floorReps, formula) -- what is actually run
     long totalReps;
     long floorReps;
     bool anyClampedAtMax;
@@ -80,6 +92,11 @@ namespace TuneStats {
   // per-dispatch-relative figure benchgemm prints is NOT the right normalisation.
   Budget allocateReps(const std::vector<double>& sigmaRel, double tolerance, double alpha,
                       long floorReps, long maxReps);
+
+  // The DEV knob: the self-test's trial count (default DEV_TRIALS_DEFAULT, clamped to [10, 20000]).
+  // Logging/flow only -- it cannot change what the tuner may select, so it is NOT a policy knob and
+  // deliberately does not enter policyFingerprint.
+  long devTrials();
 
   // ---- the self-test: known ground truth, pure CPU, deterministic ----
   // Returns ONE line; the shell logs it (the shell owns the logging conventions).
