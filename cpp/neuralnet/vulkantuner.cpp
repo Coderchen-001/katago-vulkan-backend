@@ -327,6 +327,26 @@ namespace VulkanTuner {
     const NegativeReasonSpec NEGATIVE_REASONS[] = {
       { "no-injection-slot", "full-key-set" },
       { "no-entry",          "full-key-set" },
+      // A1 (probe batch): `no-gain` -- "the key was swept and nothing beat stock" -- is registered
+      // while NOTHING produces it, which is exactly the status `no-entry` above already has, and for
+      // the same reason: a name in the closed set is not a name something PRODUCES.  Both halves are
+      // needed.  (i) The PARSER must read it -- a hand-written or reflowed file may carry it, and a
+      // format that refuses a name it admits is a format that cannot be interpreted.  (ii) Its
+      // producer does not exist yet and that is written down rather than implied: the writer is
+      // branch (2) of the three-branch decision ("nothing better AND pairsComplete"), which lands
+      // with the measurement primitive's decision path.  R17 pins the writer COUNT per reason, so the
+      // day that branch assigns this literal the guardrail reddens until its author returns and says
+      // what it means -- "reserved" cannot decay into "accidentally live".
+      // (iii) REACHABILITY is a separate question from existence: even with the branch in place this
+      // write cannot fire today, because `swept-here` is false while the catalogue is a sampling
+      // surface.  The first REACHABLE write is therefore step 5 (the first real negative entry).
+      // 🔴 GRANULARITY (pinned here so that `full-key-set` is not read as answering it): the negative
+      // entry is ONE whole-key claim -- every per-shape pair was measured and no candidate was
+      // non-inferior -- and the per-shape readings stay in the report/log.  A reason whose
+      // invalidation differs from `full-key-set` would be a FORMAT-level act (a new header key + a
+      // loader comparison + an R12 update), not an edit to this row; a per-shape LIFETIME is not
+      // expressible at all, because the file name carries the whole key.
+      { "no-gain",           "full-key-set" },
     };
 
     // The closed set holds on BOTH sides: the parser (so an uninterpretable file is refused
@@ -617,6 +637,21 @@ namespace VulkanTuner {
       { "io-error",              "measurement", false, ""            },
       { "device-lost",           "measurement", false, ""            },
       { "no-winner",             "measurement", false, ""            },
+      // A1 (probe batch): `unstable` means "we do NOT know" -- the re-measurement did not re-confirm
+      // the decision inside the stability boundary (STABILITY_BOUNDARY_SE, tunestats.h) -- which is a
+      // THIRD thing next to "no answer was produced" (timeout / io-error / device-lost / no-winner)
+      // and "there is no answer to produce" (structural-all-reject).  It is NOT writable, and the
+      // reason is the rule this table exists for: writing "unresolved" into the file would state,
+      // permanently, a fact about the DEVICE that the measurement never established.  Declaring it as
+      // a row (rather than leaving it in a comment where it is decided) is what makes the state gate
+      // refuse it BY NAME -- and the self-test iterates this declared table, so a `measurement` row
+      // is exercised in both directions at birth without a new fixture.
+      // Its PRODUCER is the stability step of the decision path, which lands with the measurement
+      // primitive in this same batch.  An OUTCOME name may not precede its producer (unlike a
+      // NEGATIVE reason, whose reserved class above exists precisely because the parser must accept
+      // names no writer has produced yet); the batch's own entry list carries that as an obligation,
+      // not as prose.
+      { "unstable",              "measurement", false, ""            },
     };
 
     // The extra conditions named by a table row (G-D20 + W3-P1).  Fail-closed: EVERY name in the list
