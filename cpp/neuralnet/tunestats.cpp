@@ -433,6 +433,21 @@ namespace TuneStats {
              r.sentinelFalse <= 0.05 && r.sentinelPower >= 0.80;
     }
 
+    // WHICH criterion refused this row, BY NAME.  The pair-floor conclusion has to be able to say what
+    // n=25 buys, and "n=16 fails" alone is a generalisation: with a wider interval the EQUIVALENCE
+    // check is the first to go, so the interesting question is whether it is the sentinel (snF) or the
+    // others.  Measured (logs-t3/stats-correction-spread-postcommit.txt), it is snF -- i.e. what 25
+    // buys is sentinel trustworthiness at spike rates near the gate, not "accuracy" in general.
+    const char* firstFailingCriterion(const Rates& r) {
+      if (r.coverage < 0.90 || r.coverage > 0.99) return "cov";
+      if (r.powerTol < 0.80) return "pw";
+      if (r.powerNoise > 0.20) return "pn";
+      if (fabs(r.spikesWith - r.spikesWithout) > 0.05) return "sp";
+      if (r.sentinelFalse > 0.05) return "snF";
+      if (r.sentinelPower < 0.80) return "snP";
+      return "none";
+    }
+
     // The applicability ENVELOPE: the conclusion only holds inside the noise shapes that were
     // synthesised, so the same six criteria are re-run on shapes around the measured one.  Each row
     // declares its EXPECTED verdict, and the gate constant must agree with the rows -- a gate that
@@ -526,6 +541,15 @@ namespace TuneStats {
       }
       pf << (i ? "," : "") << ENV_CASES[i].name << ":n16=" << (envPass16[i] ? "OK" : "FAIL")
          << "/n25=" << (envPass[i] ? "OK" : "FAIL");
+      if (!envPass16[i]) {
+        // The MEASUREMENTS, not just the verdict: an OK/FAIL alone cannot support a sentence about what
+        // the floor buys.  Appended AFTER the n16/n25 pair so the parsers keyed on that shape keep working.
+        pf << " n16_fail=" << firstFailingCriterion(r16e)
+           << " n16_cov=" << setprecision(3) << r16e.coverage
+           << " n16_pn=" << r16e.powerNoise
+           << " n16_snF=" << r16e.sentinelFalse
+           << " n16_sp=" << fabs(r16e.spikesWith - r16e.spikesWithout) << setprecision(4);
+      }
       env << (i ? "," : "") << ENV_CASES[i].name << (envPass[i] ? ":OK" : ":FAIL")
           << "(cov=" << setprecision(3) << r.coverage << " pn=" << r.powerNoise
           << " snF=" << r.sentinelFalse << " snP=" << r.sentinelPower
@@ -552,6 +576,9 @@ namespace TuneStats {
     // hand; the print is the only trustworthy source).
     const double se25 = sqrt(n25.coverage * (1.0 - n25.coverage) / (double)trials);
     const double covMinOk = COVERAGE_TARGET - 3.0 * se25;
+    // SCOPE: this is the MEASURED row's coverage only (see COVERAGE_TARGET's note (iv)).  The envelope
+    // rows are judged by passes(), not by this line -- at 4000 trials the line is 0.9191 and the gate
+    // row's own coverage is 0.921-0.928, so extending it there would be 0.4-2.1 sigma of headroom.
     const bool n25CoverageOk = n25.coverage >= covMinOk;
     const bool loose = trials < (size_t)COVERAGE_STRICT_MIN_TRIALS;
     const double se16 = sqrt(n16.coverage * (1.0 - n16.coverage) / (double)trials);

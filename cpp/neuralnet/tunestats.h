@@ -85,6 +85,10 @@ namespace TuneStats {
   //         catches a floor quietly lowered to 16 is the DECLARATION (smoke A44 pins pairs_floor=25),
   //         not a statistic.  n=16 is accordingly REPORTED with its distance to the target and never
   //         asserted: a "must be below" clause would be red about 22% of the time.
+  //   (iv)  SCOPE: this assertion covers the MEASURED row only.  It must NOT be generalised to the
+  //         envelope rows: at 4000 trials the scaled line is 0.9191 while the gate row's own coverage
+  //         is 0.921-0.928, i.e. 0.4-2.1 sigma of headroom -- making it a coin flip there.  Those
+  //         rows are judged by passes()'s six criteria, which is what the envelope was MEASURED with.
   constexpr double COVERAGE_TARGET = 0.93;
 
   // ---- descriptive: REPORTING only.  No threshold hangs on these. ----
