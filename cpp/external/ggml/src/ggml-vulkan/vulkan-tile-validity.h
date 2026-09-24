@@ -505,7 +505,9 @@ static inline constexpr int vk_tile_axis_class(int path, int axis) {
             //     :440-443).  Here the value must be RIGHT; INERT would turn "fill the device's
             //     shape" into "fill anything".
             //   * The scalar path keeps both: its spec really carries constant_id 7/8 and no device
-            //     constrains them (pinned by the third static_assert below).
+            //     constrains them (pinned by the `F14: TM/TN ...` assert below -- named by its MESSAGE
+            //     rather than by an ordinal, because the ordinals moved when the E1 self-assert, which
+            //     used to sit between them, was deleted).
             return path == VK_TILE_PATH_CM1 ? VK_TILE_AXIS_PINNED : VK_TILE_AXIS_ENUMERABLE;
         case VK_TILE_AXIS_WMITER:
             // Scalar: ENUMERABLE.  cm1: INERT (cm1-c).  WMITER reaches mul_mm.comp's COOPMAT
@@ -595,15 +597,20 @@ static inline constexpr int vk_tile_axis_class(int path, int axis) {
 // INERT on cm2 and ENUMERABLE on scalar and cm1 -- i.e. exactly the surface where those two numbers are
 // things a ROW can choose.  Deriving it that way means the day an axis is reclassified, this rule
 // follows instead of going stale.  (BS is deliberately NOT part of the scope test: it is DERIVED, see
-// the note inside the function -- requiring it to be ENUMERABLE skipped cm1 entirely, which the
-// static_assert below caught.)
+// the note inside the function.  Requiring it to be ENUMERABLE skipped cm1 entirely -- a bug that was
+// caught, and the assert that caught it has since been deleted as self-verifying; see the deletion note
+// further down.)
 #define VK_TILE_E1_WM        16
 #define VK_TILE_E1_WN        16
 #define VK_TILE_E1_BS_FLOOR  256
-// 🔴 `constexpr`, not merely `inline`: this function is CALLED from vk_tile_e1_boundary_pinned(), which
-// is itself constexpr and therefore may only make constant-expression calls.  `inline` alone makes the
-// static_assert fail with "constexpr function cannot produce a constant expression" -- an error that
-// names the CALLER while the cause is the callee's missing specifier.
+// `constexpr` is KEPT, and the honest reason is NOT "something still needs it at compile time" -- the
+// assert that did is gone, and a check of both callers shows neither is a constant-expression context:
+// the shell stores this as a plain function pointer in a `const` table (vulkantuner.cpp, the
+// "E1-blacklist" row of CANDIDATE_RULES), and the firewall calls it at runtime.  It is kept because it
+// costs nothing and keeps the predicate usable in a constant expression if a future guard needs one --
+// stated this way so the next reader is not told a requirement that does not exist.  What IS structural
+// is that both readers call THIS function rather than restating the boundary, so an edit here reaches
+// both doors at once.
 static inline constexpr bool vk_tile_e1_blacklist_hit(int path, const vk_tile_geometry & g) {
     switch (path) {
     case VK_TILE_PATH_SCALAR:
@@ -642,46 +649,26 @@ static inline const char * vk_tile_e1_blacklist_reason(int path, const vk_tile_g
            "needs the device's wave so the device-free predicate cannot state it";
 }
 
-// The boundary is pinned by the compiler, in the direction that matters.  R44 can only check that the
-// shell's rule DELEGATES to this function; whether the delegation is worth anything depends on this
-// function really refusing the measured combination and really letting the neighbours through.  A
-// floor that drifted to `> 256`, or an equality that crept in where a floor belongs, would leave the
-// measured hang reachable while every text-level check stayed green -- so the numbers are asserted,
-// not described.
+// ── E1 HAS NO static_assert HERE, AND THAT IS THE CORRECT SHAPE (2026-09-24, deletion review) ──────
+// A `vk_tile_e1_boundary_pinned()` helper stood here, folding eight geometries through the predicate.
+// It was REMOVED, and the reason is worth keeping so it is not rebuilt: **it verified its own input.**
+// `vk_tile_e1_blacklist_hit` is `constexpr` and the boundary is a `#define`, so the assertion compared
+// a function against constants that are its own definition -- it could only fail if the predicate were
+// edited into contradicting itself on the same line it defines itself.  What it COULD NOT check is the
+// thing actually in question: **whether the clause is WIRED into the install path** (a deleted call
+// site leaves it green, which was measured).  A safety assertion that guards nothing while looking
+// like it guards the boundary is worse than no assertion, because it is what a later reader cites.
 //
-// Written as a C++17 constexpr FUNCTION rather than as one fold of `&&` over temporary geometries:
-// taking the function's ADDRESS in a macro argument is an ODR-use, which makes the expression
-// non-constant ("address of ... is not a constant expression"), so the temporary-and-address shape does
-// not compile.  A constexpr function body may do the calls itself and return a bool, which the
-// static_assert consumes.
-static constexpr bool vk_tile_e1_boundary_pinned() {
-    // The measured combination, and the far side of the floor.
-    if (!vk_tile_e1_blacklist_hit(VK_TILE_PATH_SCALAR,
-            vk_tile_geometry { 128, 128, 32, VK_TILE_E1_WM, VK_TILE_E1_WN, 2, 8, 8, VK_TILE_E1_BS_FLOOR, -1, -1, -1 })) return false;
-    if (!vk_tile_e1_blacklist_hit(VK_TILE_PATH_SCALAR,
-            vk_tile_geometry { 128, 128, 32, 16, 16, 2, 8, 8, 512, -1, -1, -1 })) return false;
-    // BS is a FLOOR, so one below it is NOT refused -- if this ever flips, the rule has become an
-    // equality and a whole half-line of measured-hang territory has quietly opened.
-    if (vk_tile_e1_blacklist_hit(VK_TILE_PATH_SCALAR,
-            vk_tile_geometry { 128, 128, 32, 16, 16, 2, 8, 8, 255, -1, -1, -1 })) return false;
-    // Both numbers are load-bearing: matching only one is not the measured combination.
-    if (vk_tile_e1_blacklist_hit(VK_TILE_PATH_SCALAR,
-            vk_tile_geometry { 128, 128, 32, 32, 16, 2, 8, 8, 512, -1, -1, -1 })) return false;
-    if (vk_tile_e1_blacklist_hit(VK_TILE_PATH_SCALAR,
-            vk_tile_geometry { 128, 128, 32, 16, 32, 2, 8, 8, 512, -1, -1, -1 })) return false;
-    // cm1 enumerates WM/WN too, so the boundary is enforced there as well...
-    if (!vk_tile_e1_blacklist_hit(VK_TILE_PATH_CM1,
-            vk_tile_geometry { 128, 128, 32, 16, 16, 2, 16, 16, 512, -1, -1, -1 })) return false;
-    // ...while cm2 does not have these axes at all: the same numbers are not this rule's business.
-    // This case is what shows the scoping is the AXIS TABLE's answer rather than a hardcoded path
-    // list -- a future edit that drops the axis-class question flips it and reddens here.
-    if (vk_tile_e1_blacklist_hit(VK_TILE_PATH_CM2,
-            vk_tile_geometry { 128, 128, 32, 16, 16, 2, 8, 8, 512, -1, -1, -1 })) return false;
-    return true;
-}
-static_assert(vk_tile_e1_boundary_pinned(),
-              "E1 boundary: WM==16 && WN==16 && BS>=256 must be refused on the paths whose axis table "
-              "makes WM/WN/BS row-settable (scalar, cm1) and must not fire on cm2, where they are not axes");
+// Where the boundary IS pinned instead, and why each of those is a different kind of check:
+//   * the two literals `16` / `256` exist exactly ONCE, in the `#define`s below -- one spelling;
+//   * the SHARED PREDICATE is what both the shell's rule table and the firewall call, so there is no
+//     second boundary to drift (see the two-reader note above);
+//   * the FIREWALL'S call site is held by the text-level guardrail that required it there, which is
+//     the only mechanism that can see a deleted call at all;
+//   * "no row reaches this clause through the install path" is a measured property of the derived-BS
+//     clause, recorded in handoff-algo.md section 8a -- not a compile-time claim.
+// The measured number's own history (why a FLOOR and not an equality, why the scope is the axis
+// table's answer) stays in the comments above, which is where a reader needs it.  
 
 // Convenience for the enumerator: may this axis be swept on this path?
 static inline int vk_tile_axis_is_live(int path, int axis) {
