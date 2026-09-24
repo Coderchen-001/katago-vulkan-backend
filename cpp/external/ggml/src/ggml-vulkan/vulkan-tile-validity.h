@@ -681,7 +681,7 @@ static inline int vk_tile_axis_is_live(int path, int axis) {
 // cm1-c: the classification above is DATA with no device in it, so the compiler can check the whole
 // claim instead of a reader having to trust the comment -- and "this axis does nothing" is exactly
 // the kind of claim that rots silently.  Making vk_tile_axis_class() constexpr (it is a pure switch
-// over two ints) is what buys these three lines; nothing else about it changed.
+// over two ints) is what buys the asserts below; nothing else about it changed.
 //
 // 1) cm1's DECORATIVE axes must not be swept -- and the two kinds are named separately, because
 //    collapsing them into one word is exactly how this comment went stale: WMITER and BK never
@@ -689,12 +689,9 @@ static inline int vk_tile_axis_is_live(int path, int axis) {
 //    (their row values DO reach spec 12/13, which is why they are ENUMERABLE).  The assert pins
 //    BOTH halves, so neither word can drift over the other again.
 static_assert(vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_WMITER) == VK_TILE_AXIS_INERT &&
-              vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_SPEC_PAD) == VK_TILE_AXIS_ENUMERABLE &&
-              vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_SPEC_RESHAPE) == VK_TILE_AXIS_ENUMERABLE &&
               vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_BK) == VK_TILE_AXIS_INERT,
               "cm1: WMITER / BK must not be swept on cm1 -- sweeping them would emit N identical "
-              "rows (the shader does not read the row's value on either path); PAD / RESHAPE ARE "
-              "swept, and since cm1-d the row's value really does reach spec 12/13");
+              "rows (the shader does not read the row's value on either path).");
 // 2) The other direction, so that INERT cannot spread over the real geometry by accident: what cm1
 //    may sweep is the four FREE geometry axes (BM/BN/WM/WN) PLUS pad/reshape since cm1-d -- six --
 //    and BS is DERIVED from the geometry plus the wave.  TM/TN left this set in F14: they are this
@@ -720,12 +717,14 @@ static_assert(vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_BM) == VK_TILE_A
 //    refactor can collapse without noticing: scalar runs the `#else` side that reads WSUBM/WNITER.
 static_assert(vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_WMITER) == VK_TILE_AXIS_ENUMERABLE &&
               vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_SPEC_PAD) == VK_TILE_AXIS_INERT,
-              "cm1-c: WMITER is a live scalar axis (the scalar inner loop reads WSUBM/WNITER) and a "
-              "dead cm1 one");
-// 4) F14 added the SECOND axis whose answer differs per path: TM/TN are PINNED on cm1 (the device
-//    dictates them) but stay real, sweepable axes on scalar, whose spec carries constant_id 7/8 with
-//    no device constraint.  Without this line the `path ==` test in the case body could be dropped
-//    and would silently delete a scalar tuning axis -- the assert is what makes that a compile error.
+              "cm1-c: WMITER is a live scalar axis (the scalar inner loop reads WSUBM/WNITER); its "
+              "cm1-INERT half is asserted above, not here");
+// 4) The scalar half of the per-path split, RESTORED after a wrong deletion (2026-09-24).  The deletion
+//    review filed this as a restatement of assert 2 and removed it; that was wrong, and the check that
+//    caught it is worth naming: EVERY axis in assert 2 is guarded under VK_TILE_PATH_CM1, so removing
+//    this line left scalar TM/TN with NO assert at all -- and the scalar case body is
+//    `path == CM1 ? PINNED : ENUMERABLE`, so a dropped `path ==` test would silently turn a real scalar
+//    tuning axis INERT.  The claim is about SCALAR; assert 2's is about CM1.  Two paths, two asserts.
 static_assert(vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_TM) == VK_TILE_AXIS_ENUMERABLE &&
               vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_TN) == VK_TILE_AXIS_ENUMERABLE,
               "F14: TM/TN are pinned on cm1 but must stay sweepable on the scalar path");
