@@ -20909,17 +20909,34 @@ static const char * ggml_vk_tuned_row_capability_reason(const vk_device & device
                    "index formula is compiled in, and a wrong driver fold there is a driver fault "
                    "(not a wrong value) that the sizing and precision gates cannot see";
         }
-        // 🔴 2026-09-24 (item 4, the OTHER half of §E -- see runtime-tuner-spec.md:75): the E1
-        // driver boundary, refused BY NAME on the INSTALL path.  The shell's candidate table already
-        // keeps this combination out of the ENUMERATED set (vulkantuner.cpp, rule "E1-blacklist"),
-        // but enumeration is not the only door: a row that arrives from the tuner CACHE or from
-        // KATAGO_VK_TUNE_IMPORT is never enumerated, and it lands right here.  Measured shape of the
-        // failure: `WM=WN=16 && BS>=256` hung the driver (t1-predicate.md:136); the custom: parser
-        // admits it, so nothing upstream of this line refuses it.
+        // 🔴 2026-09-24 (item 4, the OTHER half of §E -- see runtime-tuner-spec.md:75): the E1 driver
+        // boundary, refused BY NAME on the INSTALL path.
+        //
+        // ⚠️ WHAT THIS CLAUSE IS *NOT* (item 4 deletion review): it is NOT what protects a user today,
+        // and reading it as the defence is the mistake it most invites.  The predicate three steps up
+        // already refuses every row that could carry the boundary -- BS is DERIVED, so a row declaring
+        // BS>=256 fails `BS != num_warps * wave` and is dropped as ILLEGAL before this function is ever
+        // asked.  Measured: deleting this clause leaves every smoke leg green.  So today's protection is
+        // the PREDICATE plus the shell's candidate table; this clause is INSURANCE.
+        //
+        // 🔴 WHEN IT STOPS BEING INSURANCE AND BECOMES THE ONLY LINE, i.e. the condition to watch:
+        // `vk_tile_candidate_reason`'s derived-BS clause being RELAXED, or the install loop's ORDER
+        // changing so the capability call runs first.  Either one makes this clause reachable AND
+        // load-bearing -- on a path no test has ever exercised.  That is not a hypothetical shape: the
+        // boundary is a measured driver hang, and the clause exists so that the day the predicate stops
+        // covering it, the refusal is still there and still named.
+        //
+        // Why an unreachable clause is kept rather than deleted, per this repo's own precedent
+        // (w1-preview.md:66-69, the same decision for the family/targets asymmetry): the unreachability
+        // is BY CONSTRUCTION, and deleting the guard would leave only prose saying so.  Cost is ~zero
+        // (it is called, so no unused-function warning); benefit is that a measured hang cannot come
+        // back silently.
+        //
         // The SENTENCE is not written here: vk_tile_e1_blacklist_reason() (vulkan-tile-validity.h) is
         // the ONE spelling, called by BOTH the shell's rule table and this firewall, so the two
         // readers cannot drift (G-D26 -- same discipline as the "path is neither scalar, cm1 nor cm2"
-        // string three rows up in VK_TUNE_CAPABILITY_CLASSES).
+        // string three rows up in VK_TUNE_CAPABILITY_CLASSES).  R47 pins that boundary's numbers, its
+        // direction (a floor, never an equality) and its scope; R23 pins THIS call site's existence.
         // Classified OUR GAP in that table: opening an upstream constant into a row-settable axis is
         // OUR decision, not a capability of the device (G-D20 / the note at :20790-20792).
         if (const char * e1 = vk_tile_e1_blacklist_reason(r.path, r.geom)) {
