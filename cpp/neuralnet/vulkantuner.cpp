@@ -646,11 +646,14 @@ namespace VulkanTuner {
       // a row (rather than leaving it in a comment where it is decided) is what makes the state gate
       // refuse it BY NAME -- and the self-test iterates this declared table, so a `measurement` row
       // is exercised in both directions at birth without a new fixture.
-      // Its PRODUCER is the stability step of the decision path, which lands with the measurement
-      // primitive in this same batch.  An OUTCOME name may not precede its producer (unlike a
-      // NEGATIVE reason, whose reserved class above exists precisely because the parser must accept
-      // names no writer has produced yet); the batch's own entry list carries that as an obligation,
-      // not as prose.
+      // 🔴 NOTHING PRODUCES IT TODAY, and that is stated rather than left to the reader: the producer is
+      // the stability step of the decision path, which lands with the measurement primitive in this
+      // batch, and until it does this row is a WINDOW ITEM -- tracked as a ledger row in tune-gaps.md
+      // section A1-A (the list of names the spec declares before their carrier exists).  An OUTCOME name
+      // may not precede its producer, unlike a NEGATIVE reason whose reserved class above exists
+      // precisely because the parser must accept names no writer has produced yet; registering these
+      // two in the SAME batch as their producers is what keeps the row from being reverse drift, and the
+      // ledger is what makes that an obligation someone can check instead of prose.
       { "unstable",              "measurement", false, ""            },
     };
 

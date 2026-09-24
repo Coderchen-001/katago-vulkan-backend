@@ -20786,6 +20786,13 @@ static const vk_tuned_row_capability_class VK_TUNE_CAPABILITY_CLASSES[] = {
       "values this build hardcodes (0/true) and whose layout has never been measured here", true },
     { "two rows share (src0, src1, key_m, key_k) but differ in PAD/RESHAPE: the dispatch face cannot "
       "tell them apart, so neither is installed", true },
+    // 2026-09-24: closing the RESHAPE row override.  OUR GAP on purpose -- it is a decision about
+    // what we expose, not a capability of the device; classifying it as a device verdict would let a
+    // machine that simply met this row write down "this device cannot do cm1", which is exactly the
+    // durable false negative the our_gap flag exists to prevent (G-D20).
+    { "row sets RESHAPE, which is not row-overridable: it selects which shared-memory "
+      "index formula is compiled in, and a wrong driver fold there is a driver fault "
+      "(not a wrong value) that the sizing and precision gates cannot see", true },
     // --- W1: the install path's WHOLE refusal vocabulary, so that no reason is left to the
     // fail-closed default by accident.  Classifying the DEVICE ones below as our gap would silently
     // switch the negative verdict off (allRejectReasonsAreDevice would never become true), so each
@@ -20871,6 +20878,26 @@ static const char * ggml_vk_tuned_row_capability_reason(const vk_device & device
             return "path=cm1 with a PAD/RESHAPE override on the Intel-proprietary coopmat class, "
                    "whose effective values this build hardcodes (0/true) and whose layout has never "
                    "been measured here";
+        }
+        // 🔴 2026-09-24 (runtime-tuner-spec 5.3.1/5.3.2, the "open_safety" property): RESHAPE is
+        // NOT row-overridable.  It is the one enumerable axis that sits in the H tier -- it decides
+        // WHICH code is compiled in (`if (APPLY_SLM_A_RESHAPE)` picks one of two shared-memory index
+        // formulas, mul_mm_funcs.glsl:3/12), so the driver's constant folding is load-bearing for
+        // correctness rather than for quality.  A wrong fold there is a DRIVER FAULT, not a wrong
+        // number: measured 2026-09-24, a row carrying RESHAPE=1 (PAD resolved to the PAIR default 1)
+        // killed the driver (`0xC0000005` in the process + nvlddmkm 153 / display reset), and the
+        // upstream comment at mul_mm.comp:126-128 records the same class ("multi-level spec array ...
+        // miscompiled by the Blackwell driver", lesson #41).  The whole point of the H tier is that
+        // the ordinary guards CANNOT see this: a wrong fold changes neither the declared shared size
+        // (measured: 10752 for both reshape values) nor the output (bit-equal, cm1-e), so the sizing
+        // pre-check and the precision gates are blind to it, while the crash lands on a USER machine.
+        // Axis benefit is ~0 as well: bit-equal, bank-conflict only.  -1 ("unspecified") stays legal,
+        // and the two upstream layouts stay reachable through their own paths (default 4/false,
+        // Intel-proprietary 0/true) and through PAD, which is a pure-arithmetic (M tier) axis.
+        if (r.geom.reshape >= 0) {
+            return "row sets RESHAPE, which is not row-overridable: it selects which shared-memory "
+                   "index formula is compiled in, and a wrong driver fold there is a driver fault "
+                   "(not a wrong value) that the sizing and precision gates cannot see";
         }
     } else {
         return "path is neither scalar, cm1 nor cm2";

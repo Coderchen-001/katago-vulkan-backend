@@ -338,19 +338,24 @@ static inline const char * vk_tile_candidate_reason(int path, const vk_tile_geom
             return "cm1: BK outside {16, 32} (wire syntax only: the f16 coopmat shader compiles "
                    "#define BK 32 and does not read the row's BK)";
         }
-        // PAD / RESHAPE are refused LOUDLY unless they name the value the shader will really run
-        // with, because a row carrying a DIFFERENT value would be a silent no-op: spec 12/13 are
-        // filled from the global mm_spec_pad / mm_spec_reshape (ggml-vulkan.cpp:2406-2407,
-        // :4890-4894) and the row's own fields have no reader anywhere -- which is why the axis
-        // table classifies both as INERT.  -1 ("unspecified") is legal, and 4 (PAD's shader
-        // default, mul_mm.comp:122) / 0 (APPLY_SLM_A_RESHAPE's, :123) are the effective values.
-        // 0 is NOT a synonym for "default" on PAD: it is the Intel-proprietary stride, 16+0
+        // PAD / RESHAPE, the two cm1-only spec constants (12/13).  ⚠️ This note is stated ONCE, in
+        // the present tense, because the version that stood here mixed a cm1-c-era sentence with the
+        // cm1-d update and ended up contradicting the code two lines below it (2026-09-24).
+        //
+        // TODAY: `-1` ("unspecified") is legal for both; the row's values DO reach the spec
+        // (ggml-vulkan.cpp:21035 passes them into the spec builder, 20868 is the Intel refusal), so
+        // any value the range checks admit is a value the pipeline really runs with -- which is why
+        // the generic checks above (`PAD ∈ [0,4]`, `RESHAPE ∈ {0,1}`) are the whole rule here.
+        // `0` is NOT a synonym for "default" on PAD: it is the Intel-proprietary stride, 16+0
         // instead of 16+4, i.e. a real (and different) layout.
-        // cm1-d DELETED the PAD/RESHAPE normalization that stood here (it accepted only -1 and the
-        // then-effective 4/0 and refused everything else by name).  It was right while the row's
-        // values reached no spec -- any other value really was a silent no-op -- and it became wrong
-        // the moment they were wired: 0..4 for PAD and 0/1 for RESHAPE are now things the pipeline
-        // really runs with, so the generic range checks above are the whole rule again.
+        //
+        // 🔴 RESHAPE is additionally not row-overridable any more (2026-09-24, runtime-tuner-spec
+        // 5.3.1/5.3.2): it selects WHICH shared-memory index formula is compiled in
+        // (`mul_mm_funcs.glsl:3`), so the driver's constant folding is load-bearing for correctness
+        // rather than for quality, and the ordinary guards are blind to a wrong fold (it changes
+        // neither the declared shared size nor the output).  That clause lives in the ROW check
+        // (ggml-vulkan.cpp), not here: this table is shared with the init path, which legitimately
+        // fills spec 12/13 with its own values.
         if (g.WM / g.TM < 1 || g.WN / g.TN < 1) {
             return "cm1: WM / TM or WN / TN is 0 (the shader's cms_per_row / cms_per_col)";
         }
@@ -515,22 +520,25 @@ static inline constexpr int vk_tile_axis_class(int path, int axis) {
             return VK_TILE_AXIS_PINNED;
         case VK_TILE_AXIS_SPEC_PAD:
         case VK_TILE_AXIS_SPEC_RESHAPE:
-            // INERT on BOTH paths, but for two DIFFERENT reasons, stated separately because the
-            // cm1 case is the one that looks wrong at first glance:
-            //   scalar: not specs there at all (mul_mm.comp:124-133 -- they stay compile-time
-            //           consts, with the explicit "DO NOT spec-ize" note, lesson #41);
-            //   cm1:    they ARE specs (mul_mm.comp:121-123), but they are filled from the GLOBAL
-            //           mm_spec_pad/mm_spec_reshape (ggml-vulkan.cpp:2406-2407, consumed at
-            //           :4890-4894), never from the row -- and the row's own two fields have NO
-            //           reader anywhere (grep `geom.pad` / `geom.reshape` in ggml-vulkan.cpp: 0
-            //           hits; cm1-d gave them a reader, added them to the dedup key and made them
-//           ENUMERABLE on cm1 -- the sentence that used to sit here said the opposite, which is
-//           exactly what a stale comment does).  So sweeping
-            //           them would emit N identical rows: a silently empty axis, which is exactly
-            //           what INERT is for.  cm1-c made this explicit and made the predicate refuse
-            //           any row value that is not the effective one, instead of accepting it
-            //           quietly.  Wiring them per row is cm1-d's job (it needs the spec builder's
-            //           input surface to become per-row, plus a numerical bit-equality leg).
+            // 🔴 ONE statement, present tense (2026-09-24).  What stood here was cm1-c's text
+            // ("INERT on BOTH paths ... the row's own two fields have NO reader anywhere") with the
+            // cm1-d correction APPENDED to it, so the block said both things and contradicted the
+            // `return` two lines below -- a reader had no way to tell which half was current.  The
+            // historical text is recoverable from git; it is not kept here.
+            //
+            // TODAY: cm1 = ENUMERABLE, scalar = INERT, and the two INERT/ENUMERABLE reasons differ:
+            //   scalar: not specs there at all -- SHMEM_STRIDE_PAD / APPLY_SLM_A_RESHAPE stay
+            //           compile-time consts (mul_mm.comp:124-133, the "DO NOT spec-ize" note,
+            //           lesson #41: spec-ing them miscompiles on the Blackwell driver).  So a scalar
+            //           row carrying them is a silent no-op, which is what INERT is for.
+            //   cm1:    they ARE specs (:121-123) and the row's values DO reach them -- cm1-d wired
+            //           them (spec builder call at ggml-vulkan.cpp:21035), added them to the dedup
+            //           key and flipped this entry, which is why sweeping them is a real axis here.
+            // ⚠️ RESHAPE is no longer ROW-overridable as of 2026-09-24 (see the clause in the row
+            //    check and runtime-tuner-spec 5.3.1): ENUMERABLE describes what the AXIS is, while
+            //    the row-override closure is a separate decision, made in the row check.  The two
+            //    must not be conflated -- an axis can be enumerable and still not be exposed to the
+            //    wire.
             // cm1-d: cm1 = ENUMERABLE, scalar = INERT.  This is the flip the cm1-c note below
             // predicted ("Wiring them per row is cm1-d's job"), and it is safe only because the
             // wiring landed in the same batch: before it, sweeping these produced N identical rows.
