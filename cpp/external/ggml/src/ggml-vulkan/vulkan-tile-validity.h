@@ -663,8 +663,11 @@ static inline const char * vk_tile_e1_blacklist_reason(int path, const vk_tile_g
 //   * the two literals `16` / `256` exist exactly ONCE, in the `#define`s below -- one spelling;
 //   * the SHARED PREDICATE is what both the shell's rule table and the firewall call, so there is no
 //     second boundary to drift (see the two-reader note above);
-//   * the FIREWALL'S call site is held by the text-level guardrail that required it there, which is
-//     the only mechanism that can see a deleted call at all;
+//   * the FIREWALL'S call site is NOT held by anything yet, and this line used to claim otherwise.
+//     The text-level guardrail that would require the call is PLANNED, not written (handoff-algo.md
+//     section 8a/8b): today a deleted call site leaves every check green, which is the measured gap.
+//     Stated as MISSING rather than as present, because a check holds this is exactly the kind of
+//     sentence a later reader stops verifying;
 //   * "no row reaches this clause through the install path" is a measured property of the derived-BS
 //     clause, recorded in handoff-algo.md section 8a -- not a compile-time claim.
 // The measured number's own history (why a FLOOR and not an equality, why the scope is the axis
