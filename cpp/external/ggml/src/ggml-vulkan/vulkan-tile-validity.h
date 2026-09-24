@@ -555,6 +555,134 @@ static inline constexpr int vk_tile_axis_class(int path, int axis) {
     }
 }
 
+// ── E1: the one OBSERVED driver boundary, and the one spelling of it ────────────────────────────────
+// 🔴 THIS BLOCK IS DOWN HERE, AFTER vk_tile_axis_class(), AND THE PLACEMENT IS LOAD-BEARING.  The file's
+// order is otherwise "rules first, classification later", and moving this up with the other tile rules
+// is the obvious-looking refactor that BREAKS THE BUILD: `vk_tile_axis_class` names BOTH the enum type
+// (declared near the top) and the function below, so a call written above the function's declaration
+// resolves to the TYPE and is parsed as a function-style cast ("cannot convert from 'initializer list'
+// to 'vk_tile_axis_class'").  Measured with MSVC 14.51; neither `const T x = f(...)` nor `&f` fixes it,
+// because both meet the same incomplete name.  One order, one reason.
+//
+// `WM == 16 && WN == 16 && BS >= 256` HUNG THE DRIVER (t1-predicate.md:136, rule "E1").  The custom:
+// parser lets it through, so the boundary is real, reachable, and not a preference.
+//
+// WHY THIS LIVES IN THE SHARED HEADER RATHER THAN IN EITHER READER.  It has two readers and they must
+// not be able to disagree:
+//   * the SHELL's candidate table (vulkantuner.cpp, CANDIDATE_RULES -> rule "E1-blacklist"), which
+//     keeps the configuration out of the enumerated set -- a MUST rule, so it is not even a ledger
+//     entry;
+//   * the BACKEND's install firewall (ggml_vk_tuned_row_capability_reason), which must refuse it as a
+//     NAMED reason, because the enumerator is not the only door: a row arriving from the cache or from
+//     KATAGO_VK_TUNE_IMPORT never passes through enumeration at all.
+// One fact, two independent gates -- and the gates guard DIFFERENT doors, which is why both are
+// needed.  Two hand-written copies of the sentence would be the next drift, so the sentence is
+// returned from ONE function here (G-D26: one spelling for one condition; precedent is the "path is
+// neither scalar, cm1 nor cm2" string, shared the same way with a row in VK_TUNE_CAPABILITY_CLASSES).
+//
+// WHY IT IS NOT A CLAUSE IN vk_tile_candidate_reason().  That function is DEVICE-FREE by contract --
+// the shell calls it while parsing rows, with no device handle (see the I6 note in the cm1 branch
+// below).  The boundary is stated in terms of BLOCK_SIZE, whose meaning in it is `num_warps * wave`
+// (the `BS != num_warps * wave` clause), so judging it needs the DEVICE's wave.  `BS >= 256` is
+// therefore a boundary ON A DEVICE CLASS, not a self-consistency rule about a geometry, and the table
+// that may not consult a device cannot hold it.
+//
+// 🔴 `BS >= 256` IS A FLOOR, NOT AN EQUALITY.  E1 was measured at 256 and never swept upward; the
+// refusal is the whole half-line because a configuration BELOW a measured hang is not thereby shown
+// to be safe.  Reading this as `== 256` is the way this rule silently loses its teeth.
+//
+// 🔴 SCOPE IS THE AXIS TABLE'S ANSWER, not a hardcoded path test: vk_tile_axis_class() reports WM/WN as
+// INERT on cm2 and ENUMERABLE on scalar and cm1 -- i.e. exactly the surface where those two numbers are
+// things a ROW can choose.  Deriving it that way means the day an axis is reclassified, this rule
+// follows instead of going stale.  (BS is deliberately NOT part of the scope test: it is DERIVED, see
+// the note inside the function -- requiring it to be ENUMERABLE skipped cm1 entirely, which the
+// static_assert below caught.)
+#define VK_TILE_E1_WM        16
+#define VK_TILE_E1_WN        16
+#define VK_TILE_E1_BS_FLOOR  256
+// 🔴 `constexpr`, not merely `inline`: this function is CALLED from vk_tile_e1_boundary_pinned(), which
+// is itself constexpr and therefore may only make constant-expression calls.  `inline` alone makes the
+// static_assert fail with "constexpr function cannot produce a constant expression" -- an error that
+// names the CALLER while the cause is the callee's missing specifier.
+static inline constexpr bool vk_tile_e1_blacklist_hit(int path, const vk_tile_geometry & g) {
+    switch (path) {
+    case VK_TILE_PATH_SCALAR:
+    case VK_TILE_PATH_CM1:
+        break;
+    default:
+        return false;   // cm2 and anything unknown: these are not row-settable axes there
+    }
+    // 🔴 SCOPE = "the path lets a ROW choose WM and WN", and it is the AXIS TABLE's answer rather than a
+    // hardcoded path test: both are ENUMERABLE on scalar and cm1 and INERT on cm2, so the day an axis is
+    // reclassified this rule follows instead of going stale.
+    //
+    // 🔴 AND THE CHECK IS WM/WN ONLY -- BS IS NOT TESTED FOR ENUMERABILITY, because it is not a free axis
+    // anywhere: on cm1 the table classes it DERIVED (`BS == num_warps * wave`, recomputed from the four
+    // free axes plus the device's wave) and on scalar it is a free-but-derived field.  Requiring BS to be
+    // ENUMERABLE made this predicate return FALSE on cm1 and the static_assert below caught it -- which
+    // is the whole reason the scope is asserted at compile time instead of described in a comment.  The
+    // boundary still READS BS; it just must not demand that BS be sweepable, or the one path whose
+    // geometry most easily reaches the measured hang would be the path this rule skipped.
+    if (vk_tile_axis_class(path, VK_TILE_AXIS_WM) != VK_TILE_AXIS_ENUMERABLE
+     || vk_tile_axis_class(path, VK_TILE_AXIS_WN) != VK_TILE_AXIS_ENUMERABLE) {
+        return false;
+    }
+    return g.WM == VK_TILE_E1_WM && g.WN == VK_TILE_E1_WN && g.BS >= VK_TILE_E1_BS_FLOOR;
+}
+
+// The refusal sentence, returned by the ONE function both readers call.  It names the measured fact,
+// the three numbers, and why the predicate could not have decided it -- the reader of a dropped row
+// has to be able to tell "the driver hung on this" from "we chose not to expose this".
+static inline const char * vk_tile_e1_blacklist_reason(int path, const vk_tile_geometry & g) {
+    if (!vk_tile_e1_blacklist_hit(path, g)) {
+        return nullptr;
+    }
+    return "WM == 16 && WN == 16 && BS >= 256, which hung the driver (E1: t1-predicate.md:136); "
+           "the custom: parser admits it, this geometry is not row-overridable, and the boundary "
+           "needs the device's wave so the device-free predicate cannot state it";
+}
+
+// The boundary is pinned by the compiler, in the direction that matters.  R44 can only check that the
+// shell's rule DELEGATES to this function; whether the delegation is worth anything depends on this
+// function really refusing the measured combination and really letting the neighbours through.  A
+// floor that drifted to `> 256`, or an equality that crept in where a floor belongs, would leave the
+// measured hang reachable while every text-level check stayed green -- so the numbers are asserted,
+// not described.
+//
+// Written as a C++17 constexpr FUNCTION rather than as one fold of `&&` over temporary geometries:
+// taking the function's ADDRESS in a macro argument is an ODR-use, which makes the expression
+// non-constant ("address of ... is not a constant expression"), so the temporary-and-address shape does
+// not compile.  A constexpr function body may do the calls itself and return a bool, which the
+// static_assert consumes.
+static constexpr bool vk_tile_e1_boundary_pinned() {
+    // The measured combination, and the far side of the floor.
+    if (!vk_tile_e1_blacklist_hit(VK_TILE_PATH_SCALAR,
+            vk_tile_geometry { 128, 128, 32, VK_TILE_E1_WM, VK_TILE_E1_WN, 2, 8, 8, VK_TILE_E1_BS_FLOOR, -1, -1, -1 })) return false;
+    if (!vk_tile_e1_blacklist_hit(VK_TILE_PATH_SCALAR,
+            vk_tile_geometry { 128, 128, 32, 16, 16, 2, 8, 8, 512, -1, -1, -1 })) return false;
+    // BS is a FLOOR, so one below it is NOT refused -- if this ever flips, the rule has become an
+    // equality and a whole half-line of measured-hang territory has quietly opened.
+    if (vk_tile_e1_blacklist_hit(VK_TILE_PATH_SCALAR,
+            vk_tile_geometry { 128, 128, 32, 16, 16, 2, 8, 8, 255, -1, -1, -1 })) return false;
+    // Both numbers are load-bearing: matching only one is not the measured combination.
+    if (vk_tile_e1_blacklist_hit(VK_TILE_PATH_SCALAR,
+            vk_tile_geometry { 128, 128, 32, 32, 16, 2, 8, 8, 512, -1, -1, -1 })) return false;
+    if (vk_tile_e1_blacklist_hit(VK_TILE_PATH_SCALAR,
+            vk_tile_geometry { 128, 128, 32, 16, 32, 2, 8, 8, 512, -1, -1, -1 })) return false;
+    // cm1 enumerates WM/WN too, so the boundary is enforced there as well...
+    if (!vk_tile_e1_blacklist_hit(VK_TILE_PATH_CM1,
+            vk_tile_geometry { 128, 128, 32, 16, 16, 2, 16, 16, 512, -1, -1, -1 })) return false;
+    // ...while cm2 does not have these axes at all: the same numbers are not this rule's business.
+    // This case is what shows the scoping is the AXIS TABLE's answer rather than a hardcoded path
+    // list -- a future edit that drops the axis-class question flips it and reddens here.
+    if (vk_tile_e1_blacklist_hit(VK_TILE_PATH_CM2,
+            vk_tile_geometry { 128, 128, 32, 16, 16, 2, 8, 8, 512, -1, -1, -1 })) return false;
+    return true;
+}
+static_assert(vk_tile_e1_boundary_pinned(),
+              "E1 boundary: WM==16 && WN==16 && BS>=256 must be refused on the paths whose axis table "
+              "makes WM/WN/BS row-settable (scalar, cm1) and must not fire on cm2, where they are not axes");
+
 // Convenience for the enumerator: may this axis be swept on this path?
 static inline int vk_tile_axis_is_live(int path, int axis) {
     return vk_tile_axis_class(path, axis) == VK_TILE_AXIS_ENUMERABLE;

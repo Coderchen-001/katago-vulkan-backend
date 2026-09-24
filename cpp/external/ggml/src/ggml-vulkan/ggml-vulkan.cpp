@@ -20793,6 +20793,16 @@ static const vk_tuned_row_capability_class VK_TUNE_CAPABILITY_CLASSES[] = {
     { "row sets RESHAPE, which is not row-overridable: it selects which shared-memory "
       "index formula is compiled in, and a wrong driver fold there is a driver fault "
       "(not a wrong value) that the sizing and precision gates cannot see", true },
+    // 2026-09-24 (item 4).  The E1 driver boundary, as the install firewall's own class.  OUR GAP,
+    // deliberately: the hang is a measured fact about a configuration WE made reachable by opening an
+    // upstream constant into a row-settable axis, so it is a decision about what we expose, not a
+    // capability of the device.  Classifying it as a device verdict would let a machine that merely
+    // met one bad row write down a durable "this device cannot do cm1".  The STRING is not
+    // duplicated here: it is vk_tile_e1_blacklist_reason() (vulkan-tile-validity.h), shared with the
+    // shell's rule table.
+    { "WM == 16 && WN == 16 && BS >= 256, which hung the driver (E1: t1-predicate.md:136); "
+      "the custom: parser admits it, this geometry is not row-overridable, and the boundary "
+      "needs the device's wave so the device-free predicate cannot state it", true },
     // --- W1: the install path's WHOLE refusal vocabulary, so that no reason is left to the
     // fail-closed default by accident.  Classifying the DEVICE ones below as our gap would silently
     // switch the negative verdict off (allRejectReasonsAreDevice would never become true), so each
@@ -20898,6 +20908,22 @@ static const char * ggml_vk_tuned_row_capability_reason(const vk_device & device
             return "row sets RESHAPE, which is not row-overridable: it selects which shared-memory "
                    "index formula is compiled in, and a wrong driver fold there is a driver fault "
                    "(not a wrong value) that the sizing and precision gates cannot see";
+        }
+        // 🔴 2026-09-24 (item 4, the OTHER half of §E -- see runtime-tuner-spec.md:75): the E1
+        // driver boundary, refused BY NAME on the INSTALL path.  The shell's candidate table already
+        // keeps this combination out of the ENUMERATED set (vulkantuner.cpp, rule "E1-blacklist"),
+        // but enumeration is not the only door: a row that arrives from the tuner CACHE or from
+        // KATAGO_VK_TUNE_IMPORT is never enumerated, and it lands right here.  Measured shape of the
+        // failure: `WM=WN=16 && BS>=256` hung the driver (t1-predicate.md:136); the custom: parser
+        // admits it, so nothing upstream of this line refuses it.
+        // The SENTENCE is not written here: vk_tile_e1_blacklist_reason() (vulkan-tile-validity.h) is
+        // the ONE spelling, called by BOTH the shell's rule table and this firewall, so the two
+        // readers cannot drift (G-D26 -- same discipline as the "path is neither scalar, cm1 nor cm2"
+        // string three rows up in VK_TUNE_CAPABILITY_CLASSES).
+        // Classified OUR GAP in that table: opening an upstream constant into a row-settable axis is
+        // OUR decision, not a capability of the device (G-D20 / the note at :20790-20792).
+        if (const char * e1 = vk_tile_e1_blacklist_reason(r.path, r.geom)) {
+            return e1;
         }
     } else {
         return "path is neither scalar, cm1 nor cm2";

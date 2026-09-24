@@ -987,8 +987,23 @@ namespace VulkanTuner {
       const int* allowed;
       size_t count;
     };
+    // The ForbiddenCombo rules no longer carry their own numbers, and that is the point: the ONE
+    // observed driver boundary (E1) is stated in `vulkan-tile-validity.h`
+    // (vk_tile_e1_blacklist_hit / vk_tile_e1_blacklist_reason), because it has TWO readers -- this
+    // table, which keeps the combination out of the ENUMERATED set, and the backend's install
+    // firewall, which must refuse a row that came from the cache or from KATAGO_VK_TUNE_IMPORT and
+    // therefore never passed through enumeration.
+    // Why a FUNCTION POINTER and not the three ints it used to hold: two hand-written copies of the
+    // same boundary drift, and the drift is invisible -- a rule whose numbers say `== 256` while the
+    // firewall's says `>= 256` leaves a whole half-line reachable through whichever gate is weaker.
+    // Delegating makes "the enumerator and the firewall agree" structural instead of a review habit
+    // (G-D26, the same reason the "path is neither scalar, cm1 nor cm2" sentence has one spelling).
+    // The path scoping comes along with it: the shared predicate asks vk_tile_axis_class() whether
+    // WM/WN/BS are row-settable ENUMERABLE axes on the row's path, so a cm2 row is out of scope by
+    // the axis table's own answer rather than by a second, hardcoded path test here.
+    using ComboHitFn = bool (*)(int path, const vk_tile_geometry&);
     struct ForbiddenCombo {
-      const int* values;   // three ints: fieldA, fieldB, and the floor on fieldC
+      ComboHitFn hit;      // the shared predicate; never nullptr for an enabled rule
     };
     struct CandidateRule {
       const char* name;
@@ -1002,17 +1017,16 @@ namespace VulkanTuner {
       const char* unlock;    // what experiment would lift it (PRUNE entries must name one)
     };
     const int C4_BK_ALLOWED[] = { 64 };
-    // The E1 blacklist, as data: {WM, WN, BS floor} -- the combination that hung the driver.
-    const int E1_FORBIDDEN[] = { 16, 16, 256 };
     const CandidateRule CANDIDATE_RULES[] = {
       { "C4-BK", "mm", RuleShape::AxisValue, "BK", { C4_BK_ALLOWED, 1 }, { nullptr }, true,
         "census-t05-shapes.md section 4.4: mm total 64=1579.8us vs 128=2792.2us with 33 ms pathological "
         "samples (BK=128 legal, just not worth trying)",
         "re-run the BK sweep of census-t05-shapes.md section 4.4 on this device" },
       { "E1-blacklist", "mm", RuleShape::ForbiddenCombo, nullptr, { nullptr, 0 },
-        { E1_FORBIDDEN }, false,
+        { vk_tile_e1_blacklist_hit }, false,
         "t1-predicate.md:136 (E1): WM==16 && WN==16 && BS>=256 hung the driver, and the custom: "
-        "validation lets it through; the predicate does not cover the WM/WN axes at all",
+        "validation lets it through; the boundary lives in vulkan-tile-validity.h so that this table "
+        "and the backend's install firewall (ggml_vk_tuned_row_capability_reason) cannot drift",
         nullptr },
     };
     const size_t CANDIDATE_RULE_COUNT = sizeof(CANDIDATE_RULES) / sizeof(CANDIDATE_RULES[0]);
@@ -1068,8 +1082,8 @@ namespace VulkanTuner {
     //   NOT an exclusion: it is unusable, so it belongs in neither the ledger nor the candidate set.
     enum class RuleResolution { Admissible, ExcludedByPrune, RejectedByMust };
 
-    RuleResolution candidateRuleVerdict(const vk_tile_geometry& g, string& pruneName, string& pruneDetail,
-                                        string& mustName) {
+    RuleResolution candidateRuleVerdict(int rulePath, const vk_tile_geometry& g, string& pruneName,
+                                        string& pruneDetail, string& mustName) {
       pruneName.clear();
       pruneDetail.clear();
       mustName.clear();
@@ -1092,10 +1106,19 @@ namespace VulkanTuner {
           }
         }
         else if (r.shape == RuleShape::ForbiddenCombo) {
+          // The verdict comes from the SHARED predicate, and so does the sentence (the firewall
+          // returns the same one).  What stays local is only the VOCABULARY the ledger and the log
+          // speak: rule names and axis values, which are this table's business.  `ruleAxisValue` is
+          // still used for that -- an axis this build does not know returns 0, which is why the
+          // readout is spelled as the raw numbers rather than as a claim about why they are wrong.
           const int a = ruleAxisValue(g, "WM");
           const int b = ruleAxisValue(g, "WN");
           const int c = ruleAxisValue(g, "BS");
-          if (a != r.combo.values[0] || b != r.combo.values[1] || c < r.combo.values[2]) {
+          // The path is not in the geometry: the catalogue is a per-family walk, and the family's
+          // own path is what the shared predicate needs to ask the axis table whether these are
+          // row-settable axes at all.  Passed in rather than assumed, so a cm2 catalogue walk cannot
+          // inherit a scalar-only boundary.
+          if (r.combo.hit == nullptr || !r.combo.hit(rulePath, g)) {
             continue;
           }
           if (r.prune) {
@@ -1170,7 +1193,7 @@ namespace VulkanTuner {
           c.geom = g;
           c.legal = false;
           string pruneName, pruneDetail, mustName;
-          const RuleResolution verdict = candidateRuleVerdict(g, pruneName, pruneDetail, mustName);
+          const RuleResolution verdict = candidateRuleVerdict(path, g, pruneName, pruneDetail, mustName);
           if (verdict == RuleResolution::RejectedByMust) {
             continue;   // unusable: it belongs in neither the ledger nor the set this run searched
           }
@@ -1258,7 +1281,12 @@ namespace VulkanTuner {
                   g.smaller = (int) fam.axes[4].values[v4];
                   string pruneName, pruneDetail, mustName;
                   calls++;
-                  const RuleResolution v = candidateRuleVerdict(g, pruneName, pruneDetail, mustName);
+                  // The path is the one this catalogue walks, spelled ONCE above it (both call sites
+                  // pass it now): the shared ForbiddenCombo predicate needs it to ask the axis table
+                  // whether WM/WN/BS are row-settable here, and a defaulted path would be a second
+                  // answer to a question the caller already knows.
+                  const RuleResolution v = candidateRuleVerdict(VK_TILE_PATH_CM2, g, pruneName,
+                                                               pruneDetail, mustName);
                   // 🔴 A PERMANENT cross-check, and it stays: this line's whole subject is "how much did
                   // the rules take away", and the failure this batch hit was exactly a disagreement between
                   // "a rule named a candidate" and "the candidate was skipped" (the first version's
