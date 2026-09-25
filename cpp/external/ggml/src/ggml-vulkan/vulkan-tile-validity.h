@@ -178,6 +178,82 @@ struct vk_tune_install_result {
 };
 
 // ---------------------------------------------------------------------------
+// W4e (t3-shell-plan.md section 9.1's `probe_candidate`): the MEASUREMENT primitive.
+//
+// It measures BLOCKS -- one shape x one object x `shots` dispatches, timed as one graph_compute plus
+// one synchronize -- and returns the paired differences that the judgement layer consumes
+// (cpp/neuralnet/tunestats.h).  It is the PRODUCER of the differences and it decides NOTHING: the
+// non-inferiority interval, the A/A equivalence test, the stability boundary and the budget all live
+// in tunestats.h, which is pure and device-free.
+//
+// 🔴 THE ONE HARD PRECONDITION (tune-measurement.md section 2.4): it must run BEFORE `pr_recording` is
+// first set.  From then on graph_compute takes the replay branch and returns early -- so the
+// measurement would be silently skipped -- and any block it did submit would be recorded into the
+// USER's graph.  A violated precondition REFUSES; it never "measures as well as it can" (fail-closed,
+// like every other gate in this file).
+//
+// 🔴 OWNERSHIP: every field of vk_tune_probe_result is written by the BACKEND, and the caller's sample
+// buffer is an ARGUMENT rather than a member -- the entry resets the result as a whole, so a member the
+// backend does not own would be silently cleared.  Same boundary as vk_tune_install_result.
+struct vk_tune_probe_shape {
+    uint32_t m;
+    uint32_t n;
+    uint32_t k;
+};
+
+// One measured pipeline.  `stock` means the backend's OWN choice for that shape -- the anchor every
+// candidate is compared against inside the same rep; otherwise `rowIndex` indexes the caller's
+// candidate array.  Two objects may point at the SAME pipeline on purpose: that is what the A/A
+// sentinel is (tune-measurement.md section 2.6's `n_sentinel = 2`).
+struct vk_tune_probe_object {
+    bool stock;
+    uint32_t rowIndex;
+    bool aligned;   // which of the row's two variants.  The caller passes the SAME align rule the
+                    // dispatcher uses, or the number measured is not the number that takes effect
+                    // (tune-measurement.md section 2.6's K1 same-source requirement).
+};
+
+struct vk_tune_probe_params {
+    const vk_tune_probe_shape* shapes;
+    uint32_t nShapes;
+    const vk_tune_probe_object* objects;
+    uint32_t nObjects;
+    // The SAME `shots` for every object in one comparison: per_dispatch = block/shots carries a
+    // 1/shots submission term, so a differing `shots` biases the comparison instead of lengthening it.
+    uint32_t shots;
+    uint32_t warmupBlocks;   // per object (ruled): warming only the shape would be an inference about
+                             // every other object
+    uint32_t reps;           // R, the DECLARED budget -- it is never adjusted by looking at the data
+    uint32_t stallBlocks;    // stall detection: consecutive blocks with no measurable progress
+};
+
+// The runtime spike rate is the fraction of blocks the amplitude-band detector marks.  The band is the
+// envelope generator's OWN definition (tunestats.cpp's ENV_CASES: a spike is +40..100% against that
+// object's median), REUSED rather than invented, because the 15% gate was measured with that
+// definition -- a different detector would make 0.15 a different quantity.
+enum vk_tune_probe_status {
+    VK_TUNE_PROBE_OK = 0,
+    VK_TUNE_PROBE_REFUSED_PRECONDITION,   // section 2.4 interference check, fail-closed
+    VK_TUNE_PROBE_STALLED,                // stallBlocks consecutive blocks with no progress
+    VK_TUNE_PROBE_NOT_MEASURED,           // ran, but produced no usable comparison
+};
+
+struct vk_tune_probe_result {
+    enum vk_tune_probe_status st;
+    uint32_t shapes;
+    uint32_t objects;
+    uint32_t blocks;         // blocks actually timed (warmup excluded)
+    uint32_t samples;        // paired samples written into the caller's buffer
+    uint32_t spikes;         // blocks the amplitude-band detector marked
+    uint32_t dropped_too_slow;
+    uint32_t dropped_build_failed;
+    bool pairs_complete;     // every legal pair of every covered shape has a full budget
+    bool coverage_complete;  // the covered set IS the slot's whole shape set
+    double t_block_hot_us;   // the estimate's input: median of the hot blocks of the heaviest shape
+    uint64_t elapsed_us;
+};
+
+// ---------------------------------------------------------------------------
 // Which (family, path) combinations have an implementation at all.
 //
 // Same sharing rule as vk_tile_candidate_reason: the enumerator and the loader MUST

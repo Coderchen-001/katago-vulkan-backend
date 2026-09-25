@@ -39,7 +39,9 @@
 // The backend interface (defined in the vendored ggml-vulkan.cpp).  Declared HERE, at
 // global scope with the C++ linkage the definition has, and NOT in ggml-vulkan.h: that
 // header is vendored public API and the ggml CMake surface stays untouched
-// (t3-shell-plan.md section 7.1-7).  Four functions total (R1).
+// (t3-shell-plan.md section 7.1-7).  Four ITEMS, FIVE names (R1): fingerprint / install_rows /
+// probe_candidate / export_state / import_state -- and R1's expected set already carries all five,
+// so this section's count and the guardrail agree.
 //
 // Returns the written length (excluding the terminator) or 0 when the backend is not a
 // Vulkan one / the buffer is too small.
@@ -62,6 +64,18 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
                                        char* err, size_t errSize,
                                        unsigned char* rowInstalled, unsigned rowInstalledCap,
                                        vk_tune_install_result* out);
+// W4e: the MEASUREMENT primitive.  Runs the interleaved paired blocks and returns the differences the
+// judgement layer consumes; it decides nothing (see the vk_tune_probe_* block in
+// vulkan-tile-validity.h).  Returns false and fills `err` on refusal; the backend logs it loudly.
+//
+// 🔴 `dOut` is the CALLER'S buffer, laid out [shape][candidate][rep], and `out->samples` says how many
+// entries were written.  It is an argument and not a member for the same reason install_rows' per-row
+// truth buffer is: the entry resets the result struct as a whole.
+bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_row_spec* cands, size_t nCands,
+                                          const vk_tune_probe_params* params,
+                                          double* dOut, size_t dCap,
+                                          vk_tune_probe_result* out,
+                                          char* err, size_t errSize);
 
 namespace VulkanTuner {
 
