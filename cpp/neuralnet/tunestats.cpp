@@ -257,6 +257,30 @@ namespace TuneStats {
     return r;
   }
 
+  // The spike rate's interval (declaration and rationale in the header).  Wilson score interval:
+  // the same alpha the decisions use, no fitted constant, and it stays inside [0,1] at the edges
+  // (k = 0 and k = n are exactly where a normal approximation would leave the interval).
+  RateInterval rateInterval(long hits, long trials, double alpha) {
+    RateInterval r { 0.0, 0.0, 0.0, false };
+    if (trials <= 0) return r;
+    if (hits < 0) hits = 0;
+    if (hits > trials) hits = trials;
+    const double n = (double) trials;
+    const double p = (double) hits / n;
+    const double z = normInv(1.0 - alpha / 2.0);
+    const double z2 = z * z;
+    const double denom = 1.0 + z2 / n;
+    const double center = (p + z2 / (2.0 * n)) / denom;
+    const double half = (z / denom) * sqrt(p * (1.0 - p) / n + z2 / (4.0 * n * n));
+    r.p = p;
+    r.low = center - half;
+    r.high = center + half;
+    if (r.low < 0.0) r.low = 0.0;
+    if (r.high > 1.0) r.high = 1.0;
+    r.ok = true;
+    return r;
+  }
+
   bool intervalCovers(const PairedResult& r, double value) {
     return r.ciOk && r.ciLow <= value && r.ciHigh >= value;
   }
@@ -311,7 +335,7 @@ namespace TuneStats {
   }
 
   unsigned long long devSeed() {
-    const unsigned long long kDefault = 0x5EEDC0DEULL;
+    const unsigned long long kDefault = PROBE_ROTATION_SEED;   // ONE source: the rotation's declared seed
     const char* v = getenv("KATAGO_VK_TUNE_STATS_SEED");
     if (v == nullptr || v[0] == '\0') return kDefault;
     const unsigned long long parsed = strtoull(v, nullptr, 0);   // base 0: accepts 0x... and decimal
@@ -472,16 +496,26 @@ namespace TuneStats {
     // says "up to 15%" while a 15% row is declared FAIL (or a passing 18% row sits above it) is a
     // dead judgement, and the self-test reddens instead of printing it politely.
     struct EnvCase { const char* name; double p; double lo; double hi; unsigned long long seedOff; bool expectPass; };
-    const EnvCase ENV_CASES[8] = {
-      { "measured",  0.106, 0.4, 1.0, 0ull,      true  },   // the measured regime (spike_p 10.6%, +40..100%)
-      { "alt-seed",  0.106, 0.4, 1.0, 0x1234ull, true  },   // the same shape, an independent seed (out of sample)
+    // The rows whose band IS the measured one reference SPIKE_BAND_LO/HI instead of repeating 0.4/1.0:
+    // the runtime detector is fed those same two constants by the probe's caller, so "the gate was
+    // measured with the detector's band" is a single value rather than two literals that happen to
+    // agree today.  `mild` and `big` deliberately carry OTHER bands (fewer/smaller and larger spikes):
+    // they are envelope cases, not the regime the gate was measured in, and they must not be folded
+    // into the measured band.
+    constexpr EnvCase ENV_CASES[8] = {
+      { "measured",  0.106, SPIKE_BAND_LO, SPIKE_BAND_HI, 0ull,      true  },   // the measured regime (spike_p 10.6%, +40..100%)
+      { "alt-seed",  0.106, SPIKE_BAND_LO, SPIKE_BAND_HI, 0x1234ull, true  },   // the same shape, an independent seed (out of sample)
       { "mild",      0.050, 0.2, 0.5, 0x2345ull, true  },   // fewer, smaller spikes
       { "big",       0.106, 1.0, 3.0, 0x3456ull, true  },   // the same rate, much larger spikes
-      { "rate12",    0.120, 0.4, 1.0, 0x5555ull, true  },   // the gap between the measured rate and the gate
-      { "rate15",    0.150, 0.4, 1.0, 0x6666ull, true  },   // the gate itself
-      { "rate18",    0.180, 0.4, 1.0, 0x7777ull, false },   // above the gate: must FAIL
-      { "harsh20",   0.200, 0.4, 1.0, 0x4567ull, false },   // double the measured rate: must FAIL
+      { "rate12",    0.120, SPIKE_BAND_LO, SPIKE_BAND_HI, 0x5555ull, true  },   // the gap between the measured rate and the gate
+      { "rate15",    0.150, SPIKE_BAND_LO, SPIKE_BAND_HI, 0x6666ull, true  },   // the gate itself
+      { "rate18",    0.180, SPIKE_BAND_LO, SPIKE_BAND_HI, 0x7777ull, false },   // above the gate: must FAIL
+      { "harsh20",   0.200, SPIKE_BAND_LO, SPIKE_BAND_HI, 0x4567ull, false },   // double the measured rate: must FAIL
     };
+    static_assert(ENV_CASES[0].lo == SPIKE_BAND_LO && ENV_CASES[0].hi == SPIKE_BAND_HI,
+                  "the measured envelope row must carry the runtime spike band: the 0.15 gate was "
+                  "measured with THIS band (w4e-preview.md R-3(a)), so a row that drifts off it makes "
+                  "the gate a statement about a detector nobody runs");
   }
 
   string selfTestSummary() {

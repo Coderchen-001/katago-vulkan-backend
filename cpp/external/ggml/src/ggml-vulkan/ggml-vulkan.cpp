@@ -21255,10 +21255,15 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
         *result = vk_tune_probe_result {};
         result->st = VK_TUNE_PROBE_NOT_MEASURED;
     }
-    // Zero the caller's samples BEFORE anything can refuse: "not measured" must never be readable as a
-    // difference of zero, which is the value that would look like a tie.
+    // Fill the caller's samples with NaN BEFORE anything can refuse.  "Not measured" must never be
+    // readable as a difference of zero -- zero is the value that looks like a tie -- and since 2c-c the
+    // buffer is DENSE (shape x object x rep), so the slots that were never written stay NaN rather than
+    // being left at whatever the caller's array happened to hold.  A consumer that ignores this gets
+    // NaN, and NaN poisons any median or interval built from it instead of quietly entering as a tie.
     if (d_out != nullptr && d_cap > 0) {
-        memset(d_out, 0, d_cap * sizeof(double));
+        for (size_t i = 0; i < d_cap; i++) {
+            d_out[i] = std::numeric_limits<double>::quiet_NaN();
+        }
     }
 
     // ---- the arguments -------------------------------------------------------------------------
@@ -21277,9 +21282,34 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
     if (params->shots == 0) {
         return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION, "shots == 0");
     }
-    if (params->reps == 0 || params->warmupBlocks == 0) {
-        // reps is the DECLARED budget (never adjusted by looking at the data); warmup is per object.
-        return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION, "reps or warmupBlocks is 0");
+    if (params->spikeBandLo <= 0.0 || params->spikeBandHi <= params->spikeBandLo) {
+        // The band is handed in (the declared values live in cpp/neuralnet/tunestats.h), so this is the
+        // one place that can catch a caller passing something that is not an interval at all.  A band of
+        // (0,0] would mark nothing and report a spike rate of 0 -- a clean-looking number produced by a
+        // broken detector -- and the 0.15 gate compares against the number that band produces.
+        return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
+                      "spikeBandLo/Hi (" + std::to_string(params->spikeBandLo) + ", "
+                      + std::to_string(params->spikeBandHi) + ") is not a usable amplitude band: the "
+                      "detector's definition comes from the envelope generator (+40..100% of that "
+                      "object's median), and a band that marks nothing would report a rate of zero");
+    }
+    if (params->reps < 2) {
+        // The plan's hard calibration floor, not a convenience: one block per object has no scale
+        // (section 2.3's MAD and the A/A sentinel both need >= 2 points) and t_block_hot is a median of
+        // K >= 2 hot blocks (section 2.6).  A budget of 1 would produce "samples" that cannot support
+        // the interval the judgement layer is about to compute from them.
+        return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
+                      "reps < 2: R >= 2 is the declared hard floor (a single block per object has no "
+                      "scale, and t_block_hot is a median over K >= 2 hot blocks)");
+    }
+    if (params->warmupBlocks < 2) {
+        // Measured, not assumed: with the pre-record path off, `eval 1` is 22.4x the plateau and
+        // `eval 2` is still 23% above it (logs-t3/calib-b-warmup-robust.txt), so warmup >= 2 is what
+        // "hot" means here.  Taking the measurement with fewer warmup blocks would compare a cold first
+        // block against a hot one and call the difference a pipeline effect.
+        return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
+                      "warmupBlocks < 2: the measured warmup plateau needs >= 2 (eval 2 is still 23% "
+                      "above the plateau), so a shorter warmup would time a cold block as if it were hot");
     }
     if (params->stallBlocks == 0) {
         // W4e leg (R-12): `stallBlocks` is the no-progress window, and 0 would mean "a stall may
@@ -21471,29 +21501,60 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
                       "nothing to measure and \"complete\" would be vacuous");
     }
 
-    // ---- 2c-b: the candidate pipelines, then ONE timed block per legal pair ---------------------
+    // ---- 2c-c: the candidate pipelines, then the WARMUP + R passes over every legal slot --------
     //
-    // What this cut DOES establish, stated rather than implied -- the two mechanisms the whole
-    // measurement rests on are built and exercised end to end:
+    // What this cut establishes, stated rather than implied:
     //
     //   * a candidate's pipeline is created by the SAME builder the install path uses
     //     (ggml_vk_tuned_row_build), so a measured number and an installed row cannot come to describe
     //     two different pipelines;
     //   * a block is ONE ggml_backend_graph_compute plus ONE synchronize, timed by WALL CLOCK around
     //     both (tune-measurement.md section 2.2).  Timing the submit alone would measure the queue
-    //     hand-off instead of the work, because the async entry returns while the GPU is still busy.
+    //     hand-off instead of the work, because the async entry returns while the GPU is still busy;
+    //   * every object is WARMED UP separately (warmupBlocks passes over the whole slot grid), because
+    //     warming only the shape would be an inference about every other object (section 2.2: the
+    //     measured `warmup >= 2`, eval 2 still 23% above the plateau);
+    //   * the passes rotate at (object x shape) granularity with a randomized Latin square
+    //     (vk_tune_rotation_permutation), so a position effect is balanced over a cycle instead of
+    //     being read as a difference -- and the seed is a DECLARED constant handed in by the caller,
+    //     not a value this file invents;
+    //   * a paired difference is taken INSIDE one pass (d = t_stock - t_candidate for the same pass
+    //     index), which is what makes the slow drift common mode;
+    //   * a block whose wall-clock time does not even reach one microsecond is a block that made no
+    //     measurable progress; `stallBlocks` of those in a row ABORT the probe (section 2.6's stall
+    //     detector).  ⚠️ A fence that never returns cannot be detected from here at all -- the
+    //     synchronous call simply blocks -- so the hard deadline stays the caller's business
+    //     (section 4.5: it is checked between dispatches and its constant belongs to the gate batch);
+    //   * the spike count comes from the SHARED detector (vk_tune_spike_band_marked) against each
+    //     object's own median, with the band handed in by the caller from tunestats.h.
     //
-    // What it does NOT establish: any READING.  One block per pair is COLD, and the plan's t_block_hot
-    // is a median over the hot blocks and never the first one -- so the numbers below are printed as
-    // mechanism evidence and are NOT handed to the judgement layer.  The rep loop that turns blocks
-    // into paired samples is the next cut; until it exists this function keeps refusing with
-    // NOT_MEASURED rather than return a difference taken from a single cold block.
+    // What it does NOT do: JUDGE.  No interval, no gate, no sentinel decision, no budget -- those are
+    // cpp/neuralnet/tunestats.h, which is pure and device-free.  This function hands over samples
+    // (d_out), the spike COUNT and the hot block time; the caller computes the rate interval and
+    // compares it with 0.15 (w4e-preview.md R-10: the gate is the shell's, and the two names must not
+    // be merged -- which is why this returns OK once a comparison exists instead of encoding a
+    // verdict).
 
     // The accumulator variant, read from the ONE predicate the family selector uses, and paired with
     // the prec written into every dst below: those two must be the same fact, which is why the prec is
     // written explicitly instead of being left at whatever ggml_mul_mat defaults to.
     const ggml_prec probe_prec = GGML_PREC_DEFAULT;
     const bool f16acc = ggml_vk_prefers_f16acc(ctx->device, probe_prec);
+
+    // The sample buffer is DENSE from 2c-c on: one slot per (shape, object, rep), in that order, so the
+    // caller can compute an index from its own shape and object lists without a side channel -- which
+    // samples exist is answered by the NaN fill above and by nothing else.  A buffer too small to hold
+    // the grid is REFUSED rather than filled partially: a truncated set is the "the compared set
+    // silently shrank" shape, and the judgement layer cannot see that it happened.
+    const size_t probe_slots = (size_t) params->nShapes * (size_t) params->nObjects;
+    const size_t samples_needed = probe_slots * (size_t) params->reps;
+    if (d_out == nullptr || d_cap < samples_needed) {
+        return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
+                      "the sample buffer holds " + std::to_string(d_cap) + " double(s) but this probe "
+                      "writes " + std::to_string(samples_needed) + " (shapes="
+                      + std::to_string(params->nShapes) + " x objects=" + std::to_string(params->nObjects)
+                      + " x reps=" + std::to_string(params->reps) + ")");
+    }
 
     // ONE pipeline per (candidate, variant) that some object asks for, MEMOISED: the A/A sentinel is
     // two objects pointing at the same pipeline on purpose, so building it twice would give the
@@ -21544,7 +21605,9 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
     // The override guard.  Same-in-same-out lives in a DESTRUCTOR on purpose:
     // ggml_backend_graph_compute is a vk:: call underneath and can throw, and a residue here would
     // silently re-route every later graph of the USER onto a probe pipeline -- a performance change
-    // with no line anywhere to explain it.
+    // with no line anywhere to explain it.  What the field held on ENTRY is saved so the restore can be
+    // CHECKED after the passes instead of assumed.
+    const vk_pipeline override_at_entry = ctx->probe_override_pipeline;
     struct override_guard {
         ggml_backend_vk_context * ctx;
         vk_pipeline prev;
@@ -21559,24 +21622,51 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
         }
     };
 
-    // The block graph, and whether it can be allocated at all.  One graph per shape, holding `shots`
-    // INDEPENDENT matmul nodes, each writing its own dst tensor: reusing one dst would make the backend
-    // place a barrier between them, which is the per-op-sync + cold-L2 regime this design exists to
-    // avoid (tune-measurement.md section 2.2), so the dsts are the block's VRAM cost and that cost is
-    // the only resource question in the primitive.
+    // ---- the block graphs: every covered shape stays resident for the whole call ---------------
+    //
+    // One graph per shape, holding `shots` INDEPENDENT matmul nodes, each writing its own dst tensor:
+    // reusing one dst would make the backend place a barrier between them, which is the per-op-sync +
+    // cold-L2 regime this design exists to avoid (tune-measurement.md section 2.2), so the dsts are the
+    // block's VRAM cost and that cost is the only resource question in the primitive.
+    //
+    // EVERY covered shape's graph is alive while the measured passes run, and that is a CONSEQUENCE of
+    // the ruling that the block order rotates at (object x shape) granularity (section 2.2): one pass
+    // visits every shape, so a graph cannot be built when its shape comes up and released when it goes
+    // away without paying a fresh allocation and a cold first touch once per pass.  The resource
+    // question is therefore the SUM over the covered set rather than the heaviest shape alone, and the
+    // failure path is unchanged -- a failed allocation aborts (class (c)) naming the shape and the
+    // (m,n,k, shots) that did not fit, so the caller can come back with a smaller `shots`.
     //
     // It is answered by TRYING, never by reading a reported VRAM size: a numeric budget would be a
-    // per-device table in disguise, which section 2.6 forbids outright.  A failure aborts the probe
-    // (class (c)) and says what did not fit, so the caller can retry with a smaller `shots` -- the
-    // min() of section 2.2 is the caller's half of exactly that.
+    // per-device table in disguise, which section 2.6 forbids outright.
     ggml_init_params probe_iparams = {
         /*.mem_size   =*/ (size_t) 16 * 1024 * 1024,   // metadata only: the tensors are device-allocated
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
 
-    uint32_t blocks_timed = 0;
-    uint64_t elapsed_us_total = 0;
+    std::vector<ggml_context *> shape_gctx(params->nShapes, nullptr);
+    std::vector<ggml_backend_buffer_t> shape_buf(params->nShapes, nullptr);
+    std::vector<ggml_cgraph *> shape_graph(params->nShapes, nullptr);
+
+    // Per-CALL RAII, and it has to be: the graphs outlive every early return below (a refusal half way
+    // through the passes must not leave VRAM held for the rest of the process), and a `shots`-sized
+    // block is not small on the widest shapes.
+    struct probe_graph_guard {
+        std::vector<ggml_context *> & gctxs;
+        std::vector<ggml_backend_buffer_t> & bufs;
+        ~probe_graph_guard() {
+            for (size_t i = 0; i < bufs.size(); i++) {
+                if (bufs[i] != nullptr) {
+                    ggml_backend_buffer_free(bufs[i]);
+                }
+            }
+            for (size_t i = 0; i < gctxs.size(); i++) {
+                ggml_free(gctxs[i]);
+            }
+        }
+    };
+    probe_graph_guard pgg { shape_gctx, shape_buf };
 
     for (uint32_t s = 0; s < params->nShapes; s++) {
         const uint32_t m = params->shapes[s].m;
@@ -21604,6 +21694,7 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
         if (gctx == nullptr) {
             return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION, "ggml_init failed for the probe graph");
         }
+        shape_gctx[s] = gctx;
         ggml_tensor * p_src0 = ggml_new_tensor_3d(gctx, (ggml_type) params->shapes[s].src0_type, k, m, 1);
         ggml_tensor * p_src1 = ggml_new_tensor_3d(gctx, (ggml_type) params->shapes[s].src1_type, k, n, 1);
         ggml_cgraph * p_graph = ggml_new_graph(gctx);
@@ -21617,37 +21708,74 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
             ggml_mul_mat_set_prec(out, probe_prec);
             ggml_build_forward_expand(p_graph, out);
         }
+        shape_graph[s] = p_graph;
 
         ggml_backend_buffer_t p_buf = ggml_backend_alloc_ctx_tensors(gctx, backend);
         if (p_buf == nullptr) {
-            ggml_free(gctx);
             return refuse(VK_TUNE_PROBE_NOT_MEASURED,
                           "the block graph for shape " + std::to_string(s) + " (" + std::to_string(m)
                           + "x" + std::to_string(n) + "x" + std::to_string(k) + ", shots="
                           + std::to_string(params->shots) + ") could not be allocated: the destination "
-                          "tensors a block needs do not fit, so this shape cannot be measured");
+                          "tensors a block needs do not fit, so this shape cannot be measured (the "
+                          "caller may come back with a smaller `shots`, and must then report that this "
+                          "run's blocks were shortened)");
         }
-        {
-            // RAII, and it also BOUNDS the probe's footprint: only ONE shape's graphs are alive at a
-            // time, so the per-block VRAM question (shots x m*n x 4) is asked of the heaviest SHAPE
-            // rather than of the sum over the covered set -- which is what the accumulated
-            // try-allocate callers are told to respect.  Declared inside the loop so every early
-            // return below frees the block it was holding.
-            struct shape_guard {
-                ggml_context * gctx = nullptr;
-                ggml_backend_buffer_t buf = nullptr;
-                ~shape_guard() {
-                    if (buf != nullptr) {
-                        ggml_backend_buffer_free(buf);
-                    }
-                    ggml_free(gctx);
-                }
-            };
-            shape_guard sg;
-            sg.gctx = gctx;
-            sg.buf = p_buf;
+        shape_buf[s] = p_buf;
+    }
 
-            for (uint32_t o = 0; o < params->nObjects; o++) {
+    // ---- the passes: warmupBlocks over every slot, then reps of them, rotating --------------------
+    //
+    // The unit is ONE (shape, object, shots) block, so a pass visits every legal slot once and the
+    // pairs are formed INSIDE a pass: d = t_stock - t_candidate for the same pass index, which is what
+    // makes the slow drift common mode (section 2.2's 5th step).  Two properties are deliberate:
+    //
+    //   * WARMUP IS PER OBJECT (ruled, section 2.2): the first `warmupBlocks` passes are not recorded
+    //     for any object, so no object is measured against another object's hot state.  "eval 2 is
+    //     still 23% above the plateau" is why the count is not 1.
+    //   * THE ORDER ROTATES per pass with a randomized Latin square (vk_tune_rotation_permutation), at
+    //     (object x shape) granularity: a fixed order leaks a position effect -- what the previous
+    //     object left in cache and in the clock -- into the paired difference, and that term is not
+    //     common mode.  The seed is handed in (tunestats.h's declared PROBE_ROTATION_SEED), so the
+    //     sequence is reproducible from the log's own numbers.
+    std::vector<uint64_t> block_us(samples_needed, 0);
+    std::vector<unsigned char> block_measured(samples_needed, 0);
+    std::vector<uint32_t> obj_perm(params->nObjects, 0);
+    std::vector<uint32_t> shape_perm(params->nShapes, 0);
+
+    // The anchor: the FIRST stock object.  Every difference is taken against it, and the A/A sentinel
+    // (a second entry pointing at the same pipeline) gets its own slot like any other object.
+    uint32_t anchor_index = params->nObjects;
+    for (uint32_t o = 0; o < params->nObjects; o++) {
+        if (params->objects[o].stock) {
+            anchor_index = o;
+            break;
+        }
+    }
+
+    uint32_t blocks_timed = 0;
+    uint64_t elapsed_us_total = 0;
+    uint64_t warmup_us_total = 0;
+    uint32_t no_progress_streak = 0;
+    uint32_t no_progress_max = 0;
+    const uint32_t total_passes = params->warmupBlocks + params->reps;
+    const bool block_evidence = vk_t2_on(16u);   // the raw per-block lines are the calibration's evidence
+
+    for (uint32_t pass = 0; pass < total_passes; pass++) {
+        const bool is_measured = pass >= params->warmupBlocks;
+        const uint32_t rep = is_measured ? (pass - params->warmupBlocks) : 0u;
+        // Two independent squares: the shape order and the object order must not be the same
+        // permutation by accident (they would be, for nShapes == nObjects, if they shared a stream).
+        vk_tune_rotation_permutation(params->seed ^ 0x9E3779B97F4A7C15ULL, params->nShapes,
+                                     pass / params->nShapes, shape_perm.data());
+        vk_tune_rotation_permutation(params->seed, params->nObjects,
+                                     pass / params->nObjects, obj_perm.data());
+
+        for (uint32_t si = 0; si < params->nShapes; si++) {
+            const uint32_t s = vk_tune_rotation_at(shape_perm.data(), params->nShapes,
+                                                   pass % params->nShapes, si);
+            for (uint32_t oi = 0; oi < params->nObjects; oi++) {
+                const uint32_t o = vk_tune_rotation_at(obj_perm.data(), params->nObjects,
+                                                       pass % params->nObjects, oi);
                 const vk_tune_probe_object & obj = params->objects[o];
                 if (pair_legal[(size_t) s * params->nObjects + o] == 0) {
                     continue;   // the row would never be picked for this shape (already counted)
@@ -21661,16 +21789,16 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
                 // standard libraries, and a wall-clock jump in the middle of a block would enter the
                 // sample set as a spike that no envelope generator could attribute.
                 const auto t0 = std::chrono::steady_clock::now();
-                const ggml_status gst = ggml_backend_graph_compute(backend, p_graph);
+                const ggml_status gst = ggml_backend_graph_compute(backend, shape_graph[s]);
                 ggml_backend_synchronize(backend);
                 const auto t1 = std::chrono::steady_clock::now();
 
                 if (gst != GGML_STATUS_SUCCESS) {
                     return refuse(VK_TUNE_PROBE_NOT_MEASURED,
                                   "the block for shape " + std::to_string(s) + " object "
-                                  + std::to_string(o) + " did not compute (status "
-                                  + std::to_string((int) gst) + "): a failed submission must not be "
-                                  "timed as a block");
+                                  + std::to_string(o) + " pass " + std::to_string(pass)
+                                  + " did not compute (status " + std::to_string((int) gst)
+                                  + "): a failed submission must not be timed as a block");
                 }
                 const uint64_t dt_us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
                                            t1 - t0).count();
@@ -21692,37 +21820,218 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
                                   "against it would mean anything");
                 }
 
-                blocks_timed++;
-                elapsed_us_total += dt_us;
-                ggml_vk_t3_line("probe block: shape=" + std::to_string(s) + " (" + std::to_string(m)
-                                + "x" + std::to_string(n) + "x" + std::to_string(k) + ") object="
-                                + std::to_string(o)
-                                + (obj.stock ? std::string(" stock")
-                                             : (" cand#" + std::to_string(obj.rowIndex)
-                                                + (obj.aligned ? " aligned" : " unaligned")))
-                                + " shots=" + std::to_string(params->shots) + " us="
-                                + std::to_string(dt_us) + " override_hits=" + std::to_string(hits));
+                // The stall detector: one microsecond of wall clock is the smallest amount of work the
+                // clock can show, so a block that does not reach it made no measurable progress.  It is
+                // a COUNT and not a timeout on purpose -- a fence that never returns cannot be seen from
+                // here at all (the synchronous call blocks), and the hard deadline is checked between
+                // dispatches by the caller (section 4.5).
+                if (dt_us == 0) {
+                    no_progress_streak++;
+                    if (no_progress_streak > no_progress_max) {
+                        no_progress_max = no_progress_streak;
+                    }
+                    if (no_progress_streak >= params->stallBlocks) {
+                        return refuse(VK_TUNE_PROBE_STALLED,
+                                      std::to_string(no_progress_streak) + " consecutive block(s) made "
+                                      "no measurable progress (wall clock 0 us with shots="
+                                      + std::to_string(params->shots) + "): the device is accepting the "
+                                      "submission without doing the work, so nothing measured after this "
+                                      "point could be attributed");
+                    }
+                } else {
+                    no_progress_streak = 0;
+                }
+
+                if (is_measured) {
+                    const size_t idx = ((size_t) s * params->nObjects + o) * (size_t) params->reps + rep;
+                    block_us[idx] = dt_us;
+                    block_measured[idx] = 1;
+                    blocks_timed++;
+                    elapsed_us_total += dt_us;
+                } else {
+                    warmup_us_total += dt_us;
+                }
+
+                if (block_evidence) {
+                    ggml_vk_t3_line("probe block: shape=" + std::to_string(s) + " ("
+                                    + std::to_string(params->shapes[s].m) + "x"
+                                    + std::to_string(params->shapes[s].n) + "x"
+                                    + std::to_string(params->shapes[s].k) + ") object="
+                                    + std::to_string(o)
+                                    + (obj.stock ? std::string(" stock")
+                                                 : (" cand#" + std::to_string(obj.rowIndex)
+                                                    + (obj.aligned ? " aligned" : " unaligned")))
+                                    + " pass=" + std::to_string(pass)
+                                    + (is_measured ? (" rep=" + std::to_string(rep)) : std::string(" warmup"))
+                                    + " shots=" + std::to_string(params->shots) + " us="
+                                    + std::to_string(dt_us) + " override_hits=" + std::to_string(hits));
+                }
             }
         }
     }
 
-    if (result != nullptr) {
-        result->blocks = blocks_timed;
-        result->elapsed_us = elapsed_us_total;
-        result->dropped_build_failed = build_failed;
+    // The guard restores in a DESTRUCTOR, so reaching this point with a residue means that path did not
+    // run -- and the failure would be invisible from then on: every later graph of the USER would be
+    // dispatched onto a probe pipeline, with no line anywhere to explain the change.  Checked here
+    // rather than trusted, because "nobody assigns that field outside the guard" is a claim about every
+    // future edit.
+    if (ctx->probe_override_pipeline != override_at_entry) {
+        return refuse(VK_TUNE_PROBE_NOT_MEASURED,
+                      "the pipeline override was left installed after the pass loop (the RAII guard did "
+                      "not restore it): the user's later graphs would run a probe pipeline");
+    }
+    const char * restore_token = "restore=ok";
+
+    // ---- the readings this function IS allowed to produce: counts, not a verdict ----------------
+    //
+    // The spike detector is the SHARED one (vk_tune_spike_band_marked) against EACH OBJECT's own
+    // median, with the band handed in by the caller: the same definition the envelope generator
+    // injects a spike with, which is what makes 0.15 refer to the same quantity at runtime (R-3(a)).
+    // The plain median below is re-derived because the backend cannot see the judgement layer
+    // (cpp/neuralnet/tunestats.h is pure and includes nothing from here); it is the same textbook
+    // operation the leg's own detector check pins, and the RATE INTERVAL is deliberately NOT computed
+    // here -- the interval family and the gate both belong to the caller (R-10).
+    std::vector<double> series;
+    uint32_t spikes = 0;
+    uint32_t pairs_measured = 0;
+    // The DENOMINATOR of `pairs_complete` is `pairs_legal`, not "legal pairs whose pipeline
+    // happens to have built": a build failure is bucket 4 (in the denominator, gates) in
+    // section 2.6, so a slot whose candidate could not be built has to make the flag FALSE
+    // rather than leave the denominator unmeasured-and-silent.
+    std::vector<double> anchor_median(params->nShapes, 0.0);
+
+    uint32_t samples_written = 0;
+    for (uint32_t s = 0; s < params->nShapes; s++) {
+        for (uint32_t o = 0; o < params->nObjects; o++) {
+            const size_t slot = (size_t) s * params->nObjects + o;
+            if (pair_legal[slot] == 0) {
+                continue;   // illegal: not in the denominator (it was counted when the rule was applied)
+            }
+            if (block_measured[slot * (size_t) params->reps] == 0) {
+                continue;   // legal and in the denominator, but never measured (a build failure)
+            }
+            pairs_measured++;
+            series.clear();
+            for (uint32_t r = 0; r < params->reps; r++) {
+                series.push_back((double) block_us[slot * (size_t) params->reps + r]);
+            }
+            std::vector<double> sorted = series;
+            std::sort(sorted.begin(), sorted.end());
+            const double med = sorted.empty() ? 0.0 : sorted[sorted.size() / 2];
+            for (uint32_t r = 0; r < params->reps; r++) {
+                if (vk_tune_spike_band_marked(series[r], med, params->spikeBandLo, params->spikeBandHi)) {
+                    spikes++;
+                }
+            }
+            if (o == anchor_index) {
+                anchor_median[s] = med;
+            }
+            if (block_evidence) {
+                // The reading section 2 asks for by name: how far the FIRST measured block sits from the
+                // rest of them, per (shape, object).  Without it, "warmup is per object" would rest on a
+                // single shape's numbers -- an inference rather than a measurement -- and it is also what
+                // answers whether the one-time creation cost tracks the target pipeline.
+                double rest_sum = 0.0;
+                uint32_t rest_n = 0;
+                for (uint32_t r = 1; r < params->reps; r++) {
+                    rest_sum += series[r];
+                    rest_n++;
+                }
+                const double rest_med = rest_n == 0 ? series[0] : (rest_sum / (double) rest_n);
+                ggml_vk_t3_line("probe first-vs-rest: shape=" + std::to_string(s) + " object="
+                                + std::to_string(o) + " first_us=" + std::to_string((uint64_t) series[0])
+                                + " rest_median_us=" + std::to_string((uint64_t) rest_med)
+                                + " median_us=" + std::to_string((uint64_t) med) + " reps="
+                                + std::to_string(params->reps));
+            }
+        }
     }
 
-    // NOT_MEASURED, and the message says exactly what DID happen.  "The mechanism ran" and "there is a
-    // reading" are two different claims, and this is the line that keeps them apart: the block count
-    // and the elapsed time are facts about this process, while the sample count is 0 because the rep
-    // loop does not exist yet.  Handing the judgement layer cold single-block times would make it
-    // report a decision built on samples nobody took.
-    return refuse(VK_TUNE_PROBE_NOT_MEASURED,
-                  "the block submit-and-time mechanism ran (" + std::to_string(blocks_timed)
-                  + " block(s) timed, " + std::to_string(build_failed) + " candidate pipeline(s) not "
-                  "built, " + std::to_string(elapsed_us_total) + " us total), but the rep loop that "
-                  "turns blocks into paired samples is not implemented in this build: 0 samples were "
-                  "written, so there is no comparison to read");
+    // The paired differences, in the DENSE slot layout the caller already knows: index
+    // (shape * nObjects + object) * reps + rep.  A slot whose object IS the anchor stays NaN (there is
+    // no difference to take), and so does a slot that was never measured -- deliberately, so that a
+    // consumer which ignores the NaN gets a poisoned interval rather than a tie of zero.
+    for (uint32_t s = 0; s < params->nShapes; s++) {
+        const size_t anchor_slot = (size_t) s * params->nObjects + anchor_index;
+        if (block_measured[anchor_slot * (size_t) params->reps] == 0) {
+            continue;   // cannot happen (the anchor is legal and needs no pipeline), and skipping is
+                        // safer than reading uninitialised block times if it ever does
+        }
+        for (uint32_t o = 0; o < params->nObjects; o++) {
+            if (o == anchor_index) {
+                continue;
+            }
+            const size_t slot = (size_t) s * params->nObjects + o;
+            if (block_measured[slot * (size_t) params->reps] == 0) {
+                continue;
+            }
+            for (uint32_t r = 0; r < params->reps; r++) {
+                const double t_stock = (double) block_us[anchor_slot * (size_t) params->reps + r];
+                const double t_obj   = (double) block_us[slot * (size_t) params->reps + r];
+                d_out[slot * (size_t) params->reps + r] = t_stock - t_obj;
+                samples_written++;
+            }
+        }
+    }
+
+    // `t_block_hot`: median of the ANCHOR's hot blocks on the HEAVIEST shape (by measured block time,
+    // not by bytes -- section 2.6), which is the number the caller's budget estimate takes as t_ref.
+    // Never the first block: the first block of a slot is the one that carries the one-time creation
+    // cost, and this is a median over the whole measured budget.
+    double t_block_hot_us = 0.0;
+    for (uint32_t s = 0; s < params->nShapes; s++) {
+        if (anchor_median[s] > t_block_hot_us) {
+            t_block_hot_us = anchor_median[s];
+        }
+    }
+
+    // `pairs_complete`: every legal pair of every covered shape produced a FULL budget.  It is an
+    // equality between two counts rather than a flag somebody sets, and its denominator cannot be
+    // empty without the call having refused above ("no legal pair").
+    const bool pairs_complete = (pairs_measured == pairs_legal);
+
+    if (result != nullptr) {
+        result->st = VK_TUNE_PROBE_OK;
+        result->shapes = params->nShapes;
+        result->objects = params->nObjects;
+        result->blocks = blocks_timed;
+        result->samples = samples_written;
+        result->spikes = spikes;
+        result->dropped_too_slow = 0;   // NO PRODUCER YET: the `too-slow` drop is a later cut of W4e
+        result->dropped_build_failed = build_failed;
+        result->pairs_complete = pairs_complete;
+        // COVERAGE IS NOT THIS FUNCTION'S TO ANSWER, and writing `true` "because the set looks
+        // complete" is exactly the false green the flag exists to prevent: `coverage_complete` means the
+        // covered set IS the slot's whole shape set, and the slot's shape set lives in the caller (the
+        // enumerator).  Recorded as a gap: the wiring batch must either hand that fact in or read the
+        // flag from its own ledger -- until then this field is `false` and no reader may treat it as an
+        // answer.
+        result->coverage_complete = false;
+        result->t_block_hot_us = t_block_hot_us;
+        result->elapsed_us = elapsed_us_total;
+    }
+
+    ggml_vk_t3_line("probe: shapes=" + std::to_string(params->nShapes) + " objects="
+                    + std::to_string(params->nObjects) + " shots=" + std::to_string(params->shots)
+                    + " warmup=" + std::to_string(params->warmupBlocks) + " reps="
+                    + std::to_string(params->reps) + " pairs_legal=" + std::to_string(pairs_legal)
+                    + " pairs_illegal=" + std::to_string(pairs_illegal) + " pairs_measured="
+                    + std::to_string(pairs_measured) + " pairs_complete="
+                    + std::string(pairs_complete ? "1" : "0") + " samples="
+                    + std::to_string(samples_written) + " blocks=" + std::to_string(blocks_timed)
+                    + " spikes=" + std::to_string(spikes) + " band=["
+                    + std::to_string(params->spikeBandLo) + "," + std::to_string(params->spikeBandHi)
+                    + "] seed=" + std::to_string(params->seed) + " no_progress_max="
+                    + std::to_string(no_progress_max) + " t_block_hot_us="
+                    + std::to_string(t_block_hot_us) + " elapsed_us=" + std::to_string(elapsed_us_total)
+                    + " warmup_us=" + std::to_string(warmup_us_total) + " dropped_build_failed="
+                    + std::to_string(build_failed) + " " + restore_token);
+
+    // OK, and that says exactly one thing: a usable comparison EXISTS.  Whether it supports the
+    // non-inferiority claim, whether the sentinel is inside tolerance and whether the spike rate is
+    // inside the gate are the judgement layer's questions, and its NOT_MEASURED is reserved for "the
+    // primitive could not produce a comparison" (R-10: the two names must not merge).
+    return true;
 }
 
 // Install a row set into ONE backend context.  Called by the shell once per context,

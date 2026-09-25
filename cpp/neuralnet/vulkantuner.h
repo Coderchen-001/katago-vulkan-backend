@@ -70,9 +70,14 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
 // judgement layer consumes; it decides nothing (see the vk_tune_probe_* block in
 // vulkan-tile-validity.h).  Returns false and fills `err` on refusal; the backend logs it loudly.
 //
-// 🔴 `dOut` is the CALLER'S buffer, laid out [shape][candidate][rep], and `out->samples` says how many
-// entries were written.  It is an argument and not a member for the same reason install_rows' per-row
-// truth buffer is: the entry resets the result struct as a whole.
+// 🔴 `dOut` is the CALLER'S buffer and its layout is DENSE (2c-c): index
+// `(shape * nObjects + object) * reps + rep`, one entry per slot of the grid, with the caller's own
+// shape and object order.  Slots that were not measured -- the object IS the anchor, or its pipeline
+// never got built -- are NaN, never 0: zero is what a tie looks like, and a consumer that ignores the
+// marker gets a poisoned interval instead of a quiet tie.  `dCap` must be at least
+// nShapes*nObjects*reps or the call is REFUSED (a truncated set would silently shrink the comparison);
+// `out->samples` counts the non-NaN entries actually written.  It is an argument and not a member for
+// the same reason install_rows' per-row truth buffer is: the entry resets the result struct as a whole.
 bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_row_spec* cands, size_t nCands,
                                           const vk_tune_probe_params* params,
                                           double* dOut, size_t dCap,

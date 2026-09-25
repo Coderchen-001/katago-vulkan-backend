@@ -64,6 +64,27 @@ namespace TuneStats {
   constexpr double TOLERANCE = 0.01;         // 1% : the product tolerance
   constexpr double SPIKE_RATE_GATE = 0.15;   // MEASURED bound: 15% passes, 18% fails on THREE criteria at once (the rate12/15/18 sweep)
   constexpr long   REPS_MAX = 512;
+  // ---- W4e: the two constants the MEASUREMENT primitive consumes, declared here so it has no copy ----
+  // THE SPIKE BAND.  A block is a spike when its time sits inside [1+lo, 1+hi] times THAT OBJECT's
+  // median -- the envelope generator's own definition (the "measured" row of ENV_CASES below, where a
+  // spike is a multiplicative delay 1 + U[lo,hi) on the block).  Two reasons the numbers are here and
+  // not in the backend:
+  //   (i)  the 0.15 gate was MEASURED with this band, so a different pair of numbers would make 0.15 a
+  //        different quantity (w4e-preview.md R-3(a): reuse the definition, do not invent one);
+  //   (ii) tune-measurement.md section 2.3.1: the declared constants have ONE source, and the probe
+  //        receives them as parameters -- the backend holds no second copy to drift.
+  // The self-test asserts ENV_CASES' measured rows carry exactly these values, so "same definition" is
+  // checked rather than promised.
+  constexpr double SPIKE_BAND_LO = 0.40;
+  constexpr double SPIKE_BAND_HI = 1.00;
+  // THE ROTATION SEED: the block sequence rotates with a randomized Latin square (tune-measurement.md
+  // section 2.2, one block per (shape, object) slot), and "fixed seed, reproducible" is only true if
+  // the seed is declared.  It is the same value the statistics self-test uses as its default base seed
+  // (devSeed() reads it instead of repeating the literal), so one number serves both and a rerun of
+  // either reproduces the other.  It is a CODE constant, not an env knob: it is covered by the build
+  // revision in the policy fingerprint, and making it settable would let two runs of the same machine
+  // differ in a way no header records.
+  constexpr unsigned long long PROBE_ROTATION_SEED = 0x5EEDC0DEULL;
   constexpr long   DEV_TRIALS_DEFAULT = 200; // the self-test's size when KATAGO_VK_TUNE_STATS_TRIALS is unset
   // The trial count below which the coverage assertion is LOOSE, and SAYS SO in the printed line.  With
   // the SE taken from the measured coverage (a plug-in estimate -- that is WHY the line floats with the
@@ -112,6 +133,26 @@ namespace TuneStats {
   // continued fraction) by bisection, and pinned against published table values by the self-test.
   // Its ROLE here is the heuristic described in the header comment, not a claim about the median.
   double tQuantile(double p, double df);
+
+  // ---- W4e: the SPIKE RATE's interval (a proportion is not a location) ----
+  // The judgement layer's one interval is a MEDIAN interval (hl +/- t * 1.2533 * MAD / sqrt(n)): it
+  // describes a continuous location parameter and has no meaning for "k spikes in n blocks".  A rate
+  // needs its own family, so it gets a declared one here rather than an anonymous formula at the call
+  // site.  Wilson score interval -- analytic, alpha declared, the same alpha the decisions use.  No
+  // bootstrap and no order statistics: those two were deleted for the median (they cannot survive our
+  // spike shape) and a proportion does not need them; spike-source-preview.md already fixed Wilson for
+  // a spike rate.
+  // ⚠️ IT ASSUMES INDEPENDENT BLOCKS.  Spikes are clustered, not drifting (logs-t3/calib-b-sigma-robust.txt:
+  // "散发、不是漂移"), so the effective n is smaller than the block count and this interval is if
+  // anything too NARROW.  Clustering-aware estimation is registered, not implemented (w4e-preview.md
+  // R-4(ii)): until then a caller that reports this interval must say that it is the i.i.d. one.
+  struct RateInterval {
+    double low;
+    double high;
+    double p;      // the point estimate hits/trials
+    bool ok;       // false when trials == 0 (an empty denominator is not a rate of zero)
+  };
+  RateInterval rateInterval(long hits, long trials, double alpha);
 
   // ---- the paired decision machinery ----
   // Input: d_i = t_stock,i - t_cand,i for ONE rep each (the pairing cancels the common-mode drift a

@@ -19,7 +19,10 @@
 //      vk_tile_axis_is_live() is a thin wrapper answering only "may it be swept?"
 //
 // No vk::, no ggml, no std::string: plain ints in, plain const char* out.  That is what
-// lets both sides share it without either one reaching into the other.
+// lets both sides share it without either one reaching into the other.  (W4e 2c-c adds two
+// pure arithmetic helpers at the end -- doubles and uint64_t, still no vk::, no ggml, no
+// allocation -- because the measurement primitive's self-test has to drive the same spike
+// detector and the same rotation the probe uses; see the section above them.)
 
 #pragma once
 
@@ -230,6 +233,23 @@ struct vk_tune_probe_params {
                              // every other object
     uint32_t reps;           // R, the DECLARED budget -- it is never adjusted by looking at the data
     uint32_t stallBlocks;    // stall detection: consecutive blocks with no measurable progress
+    // ---- W4e 2c-c: the two things the block sequence and the spike detector need, handed over ----
+    // Both are DECLARED constants of the judgement layer (cpp/neuralnet/tunestats.h) and arrive as
+    // arguments on purpose: the backend must not carry its own copy of a number the gate was measured
+    // with (tune-measurement.md section 2.3.1 -- one source), and a value that only the producer reads
+    // is exactly the kind of field that reaches production with nothing able to change it.
+    //
+    // `seed`: the randomized Latin square that orders the block sequence is reproducible only if its
+    // seed is declared, and "which order the blocks were submitted in" is part of what a measurement
+    // MEANS (a per-rep position effect is not common mode unless the order rotates).
+    uint64_t seed;
+    // `spikeBandLo`/`spikeBandHi`: the amplitude band of the spike detector, relative to THAT OBJECT's
+    // median -- the envelope generator's own definition, so a spike means the same thing at runtime as
+    // it did when the 0.15 gate was measured.  The probe refuses a band that is not a usable interval,
+    // because a silently-passed-through band would change the reported rate without changing anything
+    // a reader could see.
+    double spikeBandLo;
+    double spikeBandHi;
 };
 
 // The runtime spike rate is the fraction of blocks the amplitude-band detector marks.  The band is the
@@ -267,7 +287,72 @@ struct vk_tune_probe_result {
 };
 
 // ---------------------------------------------------------------------------
-// Which (family, path) combinations have an implementation at all.
+// W4e 2c-c: the two DEFINITIONS the measurement primitive shares with its self-test.
+//
+// Why they are functions in this header instead of five lines inside ggml-vulkan.cpp: the probe's
+// self-test leg runs in the SHELL (cpp/neuralnet/vulkantuner.cpp) and has to drive the very rule the
+// probe applies.  "Feed the detector a series with a known rate and check it comes back" is a claim
+// about the produced rate only if both sides call ONE function; a second copy would make the leg
+// verify the copy.  Neither function touches the device, allocates, or knows about vk:: -- they are
+// arithmetic on plain numbers, which is what this header is for.
+
+// One spike mark.  The band is relative to THAT OBJECT's median and both edges are inclusive: the
+// generator draws its delay as 1 + U[lo,hi), so the inclusive upper edge is a measure-zero difference
+// and stating the convention beats leaving it to whoever reads a `<` next.  The VALUES are arguments
+// because the declared band lives in the judgement layer (tunestats.h SPIKE_BAND_LO/HI) and the probe
+// receives it from its caller -- see vk_tune_probe_params.
+static inline bool vk_tune_spike_band_marked(double t, double median_t, double lo, double hi) {
+    return t >= median_t * (1.0 + lo) && t <= median_t * (1.0 + hi);
+}
+
+// The rotation.  The block sequence visits every (shape, object) slot once per rep, and the ORDER is a
+// randomized Latin square rather than a fixed walk (tune-measurement.md section 2.2: the granularity of
+// the rotation is (object x shape); the deterministic circular shift that used to do this was replaced
+// because a fixed order leaks a position effect -- what the previous object left in cache/clocks -- into
+// the paired difference, and that term is not common mode).
+//
+// Two properties are the whole point, and both are asserted by the shell-side leg:
+//   * BALANCE: inside one cycle of `n` passes, every index occupies every position exactly once (a
+//     rotation of one base permutation), so a position effect cancels over the cycle instead of
+//     accumulating -- which randomization alone does not achieve at the rep counts we can afford;
+//   * REPRODUCIBILITY: the base permutation is a Fisher-Yates shuffle driven by an integer-only stream
+//     derived from (seed, cycle).  Integer-only and allocation-free on purpose: the standard library's
+//     engines are allowed to differ between toolchains, and an order that differs between two builds of
+//     the same source is a measurement difference no header could explain.
+//
+// `perm` is caller-provided scratch (n entries): the call sites are a measurement loop and a self-test,
+// and neither should pay for a container to ask "which index is next".
+static inline uint64_t vk_tune_mix64(uint64_t x) {
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+
+static inline void vk_tune_rotation_permutation(uint64_t seed, uint32_t n, uint32_t cycle, uint32_t* perm) {
+    for (uint32_t i = 0; i < n; i++) {
+        perm[i] = i;
+    }
+    uint64_t s = vk_tune_mix64(seed ^ ((uint64_t) cycle * 0x9E3779B97F4A7C15ULL));
+    for (uint32_t i = n; i > 1; i--) {
+        s = vk_tune_mix64(s);
+        const uint32_t j = (uint32_t) (s % (uint64_t) i);
+        const uint32_t tmp = perm[i - 1];
+        perm[i - 1] = perm[j];
+        perm[j] = tmp;
+    }
+}
+
+// Which index sits at position `k` of pass `phase`.  The rotation IS the balance mechanism: the same
+// base permutation, shifted by the pass index, so index `i` is at position `(i + phase) % n`.
+static inline uint32_t vk_tune_rotation_at(const uint32_t* perm, uint32_t n, uint32_t phase, uint32_t k) {
+    if (n == 0) {
+        return 0;
+    }
+    return perm[(k + phase) % n];
+}
+
+
 //
 // Same sharing rule as vk_tile_candidate_reason: the enumerator and the loader MUST
 // answer this identically, because a candidate the loader would always drop is a
