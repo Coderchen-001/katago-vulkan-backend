@@ -3159,12 +3159,15 @@ namespace VulkanTuner {
     base.warmupBlocks = 2;
     base.reps = 3;
     base.stallBlocks = 8;
+    // The caller owns this fact (its enumerator built the set); the primitive only carries it.
+    base.coverageComplete = true;
     base.seed = TuneStats::PROBE_ROTATION_SEED;
     base.spikeBandLo = TuneStats::SPIKE_BAND_LO;
     base.spikeBandHi = TuneStats::SPIKE_BAND_HI;
 
     int refused = 0;
     int refusalCases = 0;
+    bool refusalFlag = false;   // did any REFUSED call report coverage_complete set?
     string refusalBad;
     {
       std::vector<double> dbuf(64, 0.0);
@@ -3181,6 +3184,9 @@ namespace VulkanTuner {
                                                                &r, rerr, sizeof(rerr));
         const bool good = !ok && r.st == VK_TUNE_PROBE_REFUSED_PRECONDITION && rerr[0] != '\0'
                           && string(rerr).find(sentence) != string::npos;
+        if (r.coverage_complete) {
+          refusalFlag = true;
+        }
         if (good) {
           refused++;
         } else if (refusalBad.empty()) {
@@ -3205,9 +3211,12 @@ namespace VulkanTuner {
       firstBad = firstBad.empty() ? ("refusal battery: " + refusalBad) : firstBad;
     }
     want(refused == refusalCases, "a refusal that 2c-c made reachable did not refuse with its own name");
+    want(!refusalFlag, "a refused probe call reported coverage_complete set: the input was minted into "
+                       "an answer where no measurement exists");
 
     // ---- 3 the device run, on a synthetic single-family fixture -----------------------------------
     bool deviceRan = false;
+    bool deviceCoverage = false;
     uint32_t deviceBlocks = 0;
     uint32_t deviceSamples = 0;
     uint32_t deviceSpikes = 0;
@@ -3260,6 +3269,7 @@ namespace VulkanTuner {
         if (ok && r.st == VK_TUNE_PROBE_OK) {
           deviceRan = true;
           workedRow = attempt;
+          deviceCoverage = r.coverage_complete;
           deviceBlocks = r.blocks;
           deviceSamples = r.samples;
           deviceSpikes = r.spikes;
@@ -3290,6 +3300,9 @@ namespace VulkanTuner {
         want(deviceSpikes <= deviceBlocks, "more spike marks than measured blocks");
         want(deviceAnchorNaN, "an anchor slot was written instead of staying NaN");
         want(deviceSamplesFinite, "a measured paired sample is not finite");
+        want(deviceCoverage == base.coverageComplete,
+             "the probe did not echo the caller's coverage_complete: the primitive is deriving a fact "
+             "that lives in the enumerator");
       }
 
       // ---- R-13: a candidate that does not target the SHAPE'S OBJECT must refuse the whole call ---
@@ -3366,7 +3379,8 @@ namespace VulkanTuner {
        << " spikes=" << deviceSpikes << " t_block_hot_us=" << setprecision(1) << deviceHot
        << setprecision(4) << " nan_anchor=" << (deviceAnchorNaN ? "ok" : "FAIL")
        << " samples_finite=" << (deviceSamplesFinite ? "ok" : "FAIL") << "]"
-       << " verifies[override_consumed anchor_hits=0 raii_restore samples+pairs detector_identity]"
+       << " verifies[override_consumed anchor_hits=0 raii_restore samples+pairs detector_identity "
+       << "coverage_complete_echo]"
        << " not_verified[gate_0.15 vs_tolerance too_slow coverage_complete number_quality "
        << "r13_without_coopmat2]"
        << " checks=" << checks << " [" << (ok ? "ok" : "FAIL") << "]"

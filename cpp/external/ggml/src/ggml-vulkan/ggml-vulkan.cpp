@@ -22242,13 +22242,15 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
         result->dropped_too_slow = 0;   // NO PRODUCER YET: the `too-slow` drop is a later cut of W4e
         result->dropped_build_failed = build_failed;
         result->pairs_complete = pairs_complete;
-        // COVERAGE IS NOT THIS FUNCTION'S TO ANSWER, and writing `true` "because the set looks
-        // complete" is exactly the false green the flag exists to prevent: `coverage_complete` means the
-        // covered set IS the slot's whole shape set, and the slot's shape set lives in the caller (the
-        // enumerator).  Recorded as a gap: the wiring batch must either hand that fact in or read the
-        // flag from its own ledger -- until then this field is `false` and no reader may treat it as an
-        // answer.
-        result->coverage_complete = false;
+        // COVERAGE IS NOT THIS FUNCTION'S TO ANSWER, and this line is an ECHO rather than a judgement: the
+        // caller states whether the set it handed in is the slot's whole shape set (its enumerator built
+        // that set), and the result carries the same value so the two cannot drift apart.  Deriving it
+        // here -- "the set looks complete" -- is exactly the false green the flag exists to prevent.
+        //
+        // A REFUSED CALL CANNOT MINT IT: this assignment sits on the success path only, and the entry
+        // reset leaves the flag false on every early return.  The leg asserts BOTH directions rather than
+        // trusting that sentence: the echo on a measured call, and no refusal reporting it set.
+        result->coverage_complete = params->coverageComplete;
         result->t_block_hot_us = t_block_hot_us;
         result->elapsed_us = elapsed_us_total;
     }

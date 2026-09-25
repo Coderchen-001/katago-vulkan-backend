@@ -233,6 +233,11 @@ struct vk_tune_probe_params {
                              // every other object
     uint32_t reps;           // R, the DECLARED budget -- it is never adjusted by looking at the data
     uint32_t stallBlocks;    // stall detection: consecutive blocks with no measurable progress
+    // `coverageComplete` is an INPUT, not an answer: only the caller knows whether the set it handed
+    // in is the slot's WHOLE shape set (its enumerator built that set).  The primitive echoes it into
+    // vk_tune_probe_result, so producer and result cannot disagree, and it must never derive it --
+    // "the set looks complete" is the false green this flag exists to prevent.
+    bool coverageComplete;
     // ---- W4e 2c-c: the two things the block sequence and the spike detector need, handed over ----
     // Both are DECLARED constants of the judgement layer (cpp/neuralnet/tunestats.h) and arrive as
     // arguments on purpose: the backend must not carry its own copy of a number the gate was measured
