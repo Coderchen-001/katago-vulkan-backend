@@ -2710,6 +2710,14 @@ struct ggml_backend_vk_context {
     // traversal and re-submit the cached single-cb submission.
     bool pr_enabled {};
     bool pr_recording {};   // eval >= 2: record mode
+    // W4e: while the measurement primitive runs, it forces WHICH pipeline a block dispatches.
+    // It cannot go through the row table, and the reason is not style: the primitive's own lookup
+    // would FREEZE that table (R3 refuses any later install), while the primitive runs BEFORE the
+    // user's first lookup precisely so that the rows the user gets are the ones the shell installed.
+    // Null means "not measuring", i.e. every production path.  The override is read in the SAME
+    // resolver the rows are read in, which is what keeps "the pipeline a block measured" and "the
+    // pipeline that takes effect" from becoming two decisions (tune-measurement.md section 2.6 K1).
+    vk_pipeline probe_override_pipeline {};
     bool pr_recorded {};    // cache ready: subsequent evals replay
     // Multi-segment replay cache: the graph may be recorded as several command
     // buffers (op-internal intermediate submissions), so we cache ALL segments'
@@ -10441,6 +10449,13 @@ static void ggml_vk_tuned_row_selftest(ggml_backend_vk_context * ctx) {
 
 static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, uint32_t m, uint32_t n, uint32_t k, bool aligned, ggml_type src0_type, ggml_type src1_type) {
     VK_LOG_DEBUG("ggml_vk_guess_matmul_pipeline(" << m << ", " << n << ", " << k << ", " << aligned << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
+
+    // W4e: the measurement primitive's override, read HERE -- before the row routing, inside the one
+    // resolver -- so that a block's pipeline and the dispatched pipeline cannot be two decisions.
+    // Every production path leaves this null.
+    if (ctx->probe_override_pipeline != nullptr) {
+        return ctx->probe_override_pipeline;
+    }
 
     // T4 row routing (t3-shell-plan.md K1): a tuned row replaces the l/m/s heuristic
     // for this (family, acc).  It is resolved HERE, before the cm2 / scalar split, so
