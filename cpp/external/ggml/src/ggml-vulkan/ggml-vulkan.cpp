@@ -21181,6 +21181,127 @@ static bool ggml_vk_tuned_row_build(vk_device & device, const vk_tune_row_spec &
     return true;
 }
 
+// The W4e measurement primitive.  It is a PRODUCER: it times blocks and hands the paired differences
+// to the judgement layer (cpp/neuralnet/tunestats.h).  It decides nothing -- the non-inferiority
+// interval, the A/A equivalence test, the stability boundary and the budget all live there.
+//
+// 🔴 THIS CUT IS THE INTERFERENCE GATE ONLY, and that is stated rather than implied: it establishes
+// that the process is in the one window where a measurement means anything (tune-measurement.md
+// section 2.4) and then REFUSES, because the block loop is not written yet.  A caller therefore always
+// gets `false` plus a reason it can print; there is no path that returns numbers this build never took.
+//
+// 🔴 THE WINDOW, and why `pr_evals` is the thing to read: `pr_recording` is set once `pr_evals >= 2`
+// (this file, below), and from then on graph_compute takes the replay branch and returns early -- a
+// measurement submitted afterwards would be silently skipped, and any block it did submit would be
+// recorded into the USER's graph.  `pr_evals` is a readable counter, so "no eval has started" is
+// CHECKED instead of assumed, and the ruling was to refuse on it rather than to measure alongside a
+// running eval (section 2.4's fallback: 任何 eval 已开始 => 不测 + loud).
+//
+// Every refusal names the one item that failed: an interference check that refuses without saying
+// which door it closed is the "it just did not work" shape this file keeps paying for.
+bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_row_spec * cands, size_t n_cands,
+                                          const vk_tune_probe_params * params,
+                                          double * d_out, size_t d_cap,
+                                          vk_tune_probe_result * result,
+                                          char * err, size_t err_size) {
+    const auto set_err = [&](const std::string & msg) {
+        if (err != nullptr && err_size > 0) {
+            snprintf(err, err_size, "%s", msg.c_str());
+        }
+    };
+    const auto ctx_tag = [&]() -> std::string {
+        return backend != nullptr && ggml_backend_is_vk(backend)
+                   ? ggml_vk_tune_ctx_tag((ggml_backend_vk_context *)backend->context)
+                   : std::string("no vulkan context");
+    };
+    const auto refuse = [&](vk_tune_probe_status st, const std::string & msg) {
+        ggml_vk_t3_line("probe refused (" + ctx_tag() + "): " + msg);
+        set_err(msg);
+        if (result != nullptr) {
+            result->st = st;
+        }
+        return false;
+    };
+
+    // W4e ownership: this resets the WHOLE struct, which stays correct only while every field is
+    // written by THIS function.  The caller's sample buffer is an ARGUMENT for exactly that reason --
+    // as a member it would be wiped right here.
+    if (result != nullptr) {
+        *result = vk_tune_probe_result {};
+        result->st = VK_TUNE_PROBE_NOT_MEASURED;
+    }
+    // Zero the caller's samples BEFORE anything can refuse: "not measured" must never be readable as a
+    // difference of zero, which is the value that would look like a tie.
+    if (d_out != nullptr && d_cap > 0) {
+        memset(d_out, 0, d_cap * sizeof(double));
+    }
+
+    // ---- the arguments -------------------------------------------------------------------------
+    if (params == nullptr) {
+        return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION, "no params");
+    }
+    if (params->nShapes == 0 || params->shapes == nullptr) {
+        return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION, "no shapes (the covered set is empty)");
+    }
+    if (params->objects == nullptr || params->nObjects < 2) {
+        // Two objects are the minimum: one comparison needs the stock anchor AND something to compare
+        // against it -- and the A/A sentinel is one of the two entries pointing at the same pipeline.
+        return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
+                      "fewer than two objects: a comparison needs an anchor and a second entry");
+    }
+    if (params->shots == 0) {
+        return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION, "shots == 0");
+    }
+    if (params->reps == 0 || params->warmupBlocks == 0) {
+        // reps is the DECLARED budget (never adjusted by looking at the data); warmup is per object.
+        return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION, "reps or warmupBlocks is 0");
+    }
+    if (n_cands > 0 && cands == nullptr) {
+        return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION, "candidate array is null but nCands > 0");
+    }
+
+    // ---- the interference window (tune-measurement.md section 2.4), fail-closed -----------------
+    if (!ggml_backend_is_vk(backend)) {
+        return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION, "not a Vulkan backend");
+    }
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+
+    if (ctx->pr_recording) {
+        return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
+                      "pr_recording is already set: the replay branch would skip the measurement and "
+                      "record the probe's blocks into the user's graph");
+    }
+    if (ctx->pr_evals != 0) {
+        return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
+                      "an eval has already run in this context (pr_evals=" + std::to_string(ctx->pr_evals)
+                      + "): device-exclusive measurement cannot be claimed");
+    }
+    if (vk_t2_on(4u) || vk_t2_on(8u)) {
+        return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
+                      "a probe bit that writes counters is on (bit 4 and/or bit 8): the probe's own "
+                      "shapes would be mixed into the user's tables");
+    }
+    if (getenv("KATAGO_VK_MM_TILE") != nullptr) {
+        return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
+                      "KATAGO_VK_MM_TILE is set: a tuned row short-circuits it, so the number measured "
+                      "would not be the number that takes effect");
+    }
+    if (getenv("GGML_VK_MAX_NODES_PER_SUBMIT") != nullptr) {
+        return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
+                      "GGML_VK_MAX_NODES_PER_SUBMIT is set: it moves the submit-split boundary, which "
+                      "changes what a block IS");
+    }
+
+    // ---- the measurement itself (W4e, next cut) -------------------------------------------------
+    // The window is open.  The block loop -- own warmup + R blocks, one graph_compute + synchronize
+    // each, objects rotated per block, the amplitude-band spike count -- is NOT implemented yet, and
+    // refusing here is the only honest answer: returning samples this process never took would be
+    // read by the judgement layer as evidence.
+    return refuse(VK_TUNE_PROBE_NOT_MEASURED,
+                  "the interference window is open, but the block loop is not implemented in this "
+                  "build: refusing rather than returning samples this process never took");
+}
+
 // Install a row set into ONE backend context.  Called by the shell once per context,
 // after ggml_backend_vk_init() and before the first graph build (section 6, step 1).
 //

@@ -8,7 +8,9 @@
 // cannot: a Vulkan pipeline is a runtime object (specialisation constants, an `align`
 // side effect on kpad/aligned, a pre-record replay bypass), so the tuner has to live
 // inside the process.  What we buy instead is a NARROW interface: the backend exposes
-// four functions and nothing else, and every piece of tuner policy -- which candidates
+// four ITEMS, five names -- fingerprint / install_rows / probe_candidate / export_state /
+// import_state (R1, whose expected set already carries all five) -- and nothing else, and
+// every piece of tuner policy -- which candidates
 // exist, which are legal, which gate applies, how they are ranked, where the cache lives
 // -- lives here (t3-shell-plan.md section 9.1 R1/R5).
 //
