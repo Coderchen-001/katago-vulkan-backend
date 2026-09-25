@@ -238,6 +238,13 @@ struct vk_tune_probe_params {
     // vk_tune_probe_result, so producer and result cannot disagree, and it must never derive it --
     // "the set looks complete" is the false green this flag exists to prevent.
     bool coverageComplete;
+    // Per-shape `shots` (section 2.2 allows the shapes to differ): one entry per shape, or null with
+    // nShotsPerShape == 0 to use the single `shots` above for every shape.  The reason it must exist
+    // is that a block shortened by VRAM does not carry the quantization argument of a full-length
+    // block (that section's consequence (1)), so a heavy shape has to be able to shorten ITSELF --
+    // with one global value the caller can only shorten every shape by proxy.
+    const uint32_t* shotsPerShape;
+    uint32_t nShotsPerShape;
     // ---- W4e 2c-c: the two things the block sequence and the spike detector need, handed over ----
     // Both are DECLARED constants of the judgement layer (cpp/neuralnet/tunestats.h) and arrive as
     // arguments on purpose: the backend must not carry its own copy of a number the gate was measured
@@ -286,7 +293,16 @@ struct vk_tune_probe_result {
     uint32_t dropped_too_slow;
     uint32_t dropped_build_failed;
     bool pairs_complete;     // every legal pair of every covered shape has a full budget
-    bool coverage_complete;  // the covered set IS the slot's whole shape set
+    // ⚠️ This is the CALLER's own statement, passed through UNCHANGED: the primitive never verifies
+    // it, and a reader must not read "true" as "somebody checked that the set is complete".  The
+    // completeness judgement lives in the enumerator that built the set (see the INPUT field in
+    // vk_tune_probe_params) -- the two are one fact, not two.
+    bool coverage_complete;
+    // What was ACTUALLY used per run: the range of the per-shape `shots` (equal when one value was
+    // passed).  The judgement layer divides each block by ITS OWN shape's shots, so a consumer that
+    // cannot see this cannot compute a per-dispatch time at all.
+    uint32_t shots_min;
+    uint32_t shots_max;
     double t_block_hot_us;   // the estimate's input: median of the hot blocks of the heaviest shape
     uint64_t elapsed_us;
 };

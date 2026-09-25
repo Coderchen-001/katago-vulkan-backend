@@ -21408,6 +21408,32 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
     if (params->shots == 0) {
         return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION, "shots == 0");
     }
+    if (params->nShotsPerShape != 0) {
+        if (params->shotsPerShape == nullptr) {
+            return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
+                          "nShotsPerShape is " + std::to_string(params->nShotsPerShape)
+                          + " but shotsPerShape is null: a length with no array cannot state a "
+                          "per-shape shots");
+        }
+        if (params->nShotsPerShape != params->nShapes) {
+            return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
+                          "per-shape shots has " + std::to_string(params->nShotsPerShape)
+                          + " entry/entries but there are " + std::to_string(params->nShapes)
+                          + " shape(s): one entry per shape, or none at all");
+        }
+        for (uint32_t s = 0; s < params->nShotsPerShape; s++) {
+            if (params->shotsPerShape[s] == 0) {
+                return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
+                              "per-shape shots entry " + std::to_string(s) + " is 0: a zero-length "
+                              "block measures nothing and the divisor would be zero");
+            }
+        }
+    }
+    // THE ONE READER of the two forms, so no call site can reach for `params->shots` for a shape
+    // without saying so.
+    const auto shots_of = [&](uint32_t s) -> uint32_t {
+        return params->nShotsPerShape != 0 ? params->shotsPerShape[s] : params->shots;
+    };
     if (params->spikeBandLo <= 0.0 || params->spikeBandHi <= params->spikeBandLo) {
         // The band is handed in (the declared values live in cpp/neuralnet/tunestats.h), so this is the
         // one place that can catch a caller passing something that is not an interval at all.  A band of
@@ -21867,7 +21893,7 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
                                                     (uint64_t) p_src1->ne[0], (uint64_t) p_src1->ne[1],
                                                     probe_prec).obj;
         ggml_cgraph * p_graph = ggml_new_graph(gctx);
-        for (uint32_t i = 0; i < params->shots; i++) {
+        for (uint32_t i = 0; i < shots_of(s); i++) {
             // A distinct node AND a distinct dst: that is what makes the `shots` dispatches overlap
             // instead of serialising on one accumulator.
             ggml_tensor * out = ggml_mul_mat(gctx, p_src0, p_src1);
@@ -21884,7 +21910,7 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
             return refuse(VK_TUNE_PROBE_NOT_MEASURED,
                           "the block graph for shape " + std::to_string(s) + " (" + std::to_string(m)
                           + "x" + std::to_string(n) + "x" + std::to_string(k) + ", shots="
-                          + std::to_string(params->shots) + ") could not be allocated: the destination "
+                          + std::to_string(shots_of(s)) + ") could not be allocated: the destination "
                           "tensors a block needs do not fit, so this shape cannot be measured (the "
                           "caller may come back with a smaller `shots`, and must then report that this "
                           "run's blocks were shortened)");
@@ -22073,7 +22099,7 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
                         return refuse(VK_TUNE_PROBE_STALLED,
                                       std::to_string(no_progress_streak) + " consecutive block(s) made "
                                       "no measurable progress (wall clock 0 us with shots="
-                                      + std::to_string(params->shots) + "): the device is accepting the "
+                                      + std::to_string(shots_of(s)) + "): the device is accepting the "
                                       "submission without doing the work, so nothing measured after this "
                                       "point could be attributed");
                     }
@@ -22102,7 +22128,7 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
                                                     + (obj.aligned ? " aligned" : " unaligned")))
                                     + " pass=" + std::to_string(pass)
                                     + (is_measured ? (" rep=" + std::to_string(rep)) : std::string(" warmup"))
-                                    + " shots=" + std::to_string(params->shots) + " us="
+                                    + " shots=" + std::to_string(shots_of(s)) + " us="
                                     + std::to_string(dt_us) + " override_hits=" + std::to_string(hits)
                                     + " pr_enabled=" + std::string(ctx->pr_enabled ? "1" : "0")
                                     + " pr_recording=" + std::string(ctx->pr_recording ? "1" : "0")
@@ -22251,6 +22277,18 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
         // reset leaves the flag false on every early return.  The leg asserts BOTH directions rather than
         // trusting that sentence: the echo on a measured call, and no refusal reporting it set.
         result->coverage_complete = params->coverageComplete;
+        // The range actually used.  Computed from the SAME two forms the loop reads via shots_of, so
+        // the result cannot describe a block length the measurement did not run.
+        {
+            uint32_t s_min = shots_of(0);
+            uint32_t s_max = s_min;
+            for (uint32_t s = 1; s < params->nShapes; s++) {
+                s_min = std::min(s_min, shots_of(s));
+                s_max = std::max(s_max, shots_of(s));
+            }
+            result->shots_min = s_min;
+            result->shots_max = s_max;
+        }
         result->t_block_hot_us = t_block_hot_us;
         result->elapsed_us = elapsed_us_total;
     }

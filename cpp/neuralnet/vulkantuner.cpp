@@ -3161,6 +3161,13 @@ namespace VulkanTuner {
     base.stallBlocks = 8;
     // The caller owns this fact (its enumerator built the set); the primitive only carries it.
     base.coverageComplete = true;
+    // Per-shape shots, exercised END TO END with ONE shape carrying the same value: the device
+    // fixture's grid (blocks / samples / pairs_legal) is pinned, and a second shape would move all
+    // three -- so the multi-shape DIFFERENT-value path is REGISTERED (see not_verified) rather than
+    // faked with a fixture whose numbers would then mean something else.
+    static const uint32_t baseShotsOne[1] = { 4 };
+    base.shotsPerShape = baseShotsOne;
+    base.nShotsPerShape = 1;
     base.seed = TuneStats::PROBE_ROTATION_SEED;
     base.spikeBandLo = TuneStats::SPIKE_BAND_LO;
     base.spikeBandHi = TuneStats::SPIKE_BAND_HI;
@@ -3197,6 +3204,11 @@ namespace VulkanTuner {
       vk_tune_probe_params q = base;
       q.shots = 0;         refusedBy(q, dbuf.size(), "shots == 0");
       q = base;
+      q.nShotsPerShape = 2;   refusedBy(q, dbuf.size(), "one entry per shape");
+      static const uint32_t zeroShot[1] = { 0 };
+      q = base;
+      q.shotsPerShape = zeroShot; refusedBy(q, dbuf.size(), "is 0: a zero-length");
+      q = base;
       q.reps = 1;          refusedBy(q, dbuf.size(), "reps < 2");
       q = base;
       q.warmupBlocks = 1;  refusedBy(q, dbuf.size(), "warmupBlocks < 2");
@@ -3216,7 +3228,9 @@ namespace VulkanTuner {
 
     // ---- 3 the device run, on a synthetic single-family fixture -----------------------------------
     bool deviceRan = false;
-    bool deviceCoverage = false;
+    bool deviceCoverageEcho = false;
+    uint32_t deviceShotsMin = 0;
+    uint32_t deviceShotsMax = 0;
     uint32_t deviceBlocks = 0;
     uint32_t deviceSamples = 0;
     uint32_t deviceSpikes = 0;
@@ -3269,7 +3283,9 @@ namespace VulkanTuner {
         if (ok && r.st == VK_TUNE_PROBE_OK) {
           deviceRan = true;
           workedRow = attempt;
-          deviceCoverage = r.coverage_complete;
+          deviceCoverageEcho = r.coverage_complete;
+          deviceShotsMin = r.shots_min;
+          deviceShotsMax = r.shots_max;
           deviceBlocks = r.blocks;
           deviceSamples = r.samples;
           deviceSpikes = r.spikes;
@@ -3300,7 +3316,9 @@ namespace VulkanTuner {
         want(deviceSpikes <= deviceBlocks, "more spike marks than measured blocks");
         want(deviceAnchorNaN, "an anchor slot was written instead of staying NaN");
         want(deviceSamplesFinite, "a measured paired sample is not finite");
-        want(deviceCoverage == base.coverageComplete,
+        want(deviceShotsMin == 4 && deviceShotsMax == 4,
+             "per-shape shots were not honoured: the result reports a range the run did not use");
+        want(deviceCoverageEcho == base.coverageComplete,
              "the probe did not echo the caller's coverage_complete: the primitive is deriving a fact "
              "that lives in the enumerator");
       }
@@ -3380,9 +3398,9 @@ namespace VulkanTuner {
        << setprecision(4) << " nan_anchor=" << (deviceAnchorNaN ? "ok" : "FAIL")
        << " samples_finite=" << (deviceSamplesFinite ? "ok" : "FAIL") << "]"
        << " verifies[override_consumed anchor_hits=0 raii_restore samples+pairs detector_identity "
-       << "coverage_complete_echo]"
+       << "coverage_complete_echo shots_shape_honoured]"
        << " not_verified[gate_0.15 vs_tolerance too_slow coverage_complete number_quality "
-       << "r13_without_coopmat2]"
+       << "r13_without_coopmat2 shots_shape_multi]"
        << " checks=" << checks << " [" << (ok ? "ok" : "FAIL") << "]"
        << (ok ? "" : " first problem: " + firstBad);
     logLine(os.str());
