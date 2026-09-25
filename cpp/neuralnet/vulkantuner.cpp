@@ -3247,6 +3247,9 @@ namespace VulkanTuner {
       q.nObjects = nObjects;
 
       string note;
+      // Which geometry built, so the R-13 case below reuses the SAME wave choice instead of becoming
+      // a second writer of the wave rule (the two-attempt loop exists to avoid exactly that).
+      int workedRow = -1;
       for (int attempt = 0; attempt < 2 && !deviceRan; attempt++) {
         std::vector<double> dsamp((size_t) 1 * nObjects * base.reps, 0.0);
         vk_tune_probe_result r {};
@@ -3256,6 +3259,7 @@ namespace VulkanTuner {
                                                                dsamp.size(), &r, derr, sizeof(derr));
         if (ok && r.st == VK_TUNE_PROBE_OK) {
           deviceRan = true;
+          workedRow = attempt;
           deviceBlocks = r.blocks;
           deviceSamples = r.samples;
           deviceSpikes = r.spikes;
@@ -3287,6 +3291,56 @@ namespace VulkanTuner {
         want(deviceAnchorNaN, "an anchor slot was written instead of staying NaN");
         want(deviceSamplesFinite, "a measured paired sample is not finite");
       }
+
+      // ---- R-13: a candidate that does not target the SHAPE'S OBJECT must refuse the whole call ---
+      //
+      // The pair is the plan's own example: the shape's tensor says F32 while the candidate declares the
+      // (F16,F32) family.  On a coopmat2 device the SHAPE is dispatched as f16 -- that is the
+      // `coopmat2 && src1->type == GGML_TYPE_F32` term inside the resolver -- so the shape lives in the
+      // (F16,F16) object while the candidate targets the (F16,F32) one.  Without coopmat2 the shape
+      // stays in (F16,F32) and the SAME pair is legal, so the outcome is DEVICE-CONDITIONAL: this leg
+      // asserts the half this machine can reach and REGISTERS the other (see not_verified) rather than
+      // fabricating a device to reach it.
+      //
+      // The refusal must carry its OWN status (NOT_MEASURED, not a precondition) and its own sentence:
+      // a wiring error is not a malformed argument, and "it was refused" alone would also be
+      // satisfied by the argument checks above -- the failure mode this battery was built to end.
+      if (deviceRan) {
+        // The device half comes from the fingerprint the backend already publishes (R1's own interface):
+        // a test must not invent an interface to ask a test question.
+        char fp[512];
+        fp[0] = '\0';
+        uint32_t fpsg = 0;
+        const bool fpOk = backendFingerprint(backend, fp, sizeof(fp), &fpsg) > 0;
+        const bool coopmat2 = fpOk && string(fp).find("cm2=1") != string::npos;
+
+        vk_tune_row_spec r13Cand = rows[workedRow];
+        r13Cand.src0_type = VK_TUNE_SRC_F16;
+        r13Cand.src1_type = VK_TUNE_SRC_F32;
+        vk_tune_probe_shape r13Shape = shape;
+        r13Shape.src1_type = VK_TUNE_SRC_F32;
+        vk_tune_probe_params q13 = q;
+        q13.shapes = &r13Shape;
+        vector<double> s13((size_t) 1 * nObjects * base.reps, 0.0);
+        vk_tune_probe_result r13res {};
+        char r13err[1024];
+        r13err[0] = '\0';
+        const bool r13ok = ::ggml_backend_vk_tune_probe_candidate(backend, &r13Cand, 1, &q13, s13.data(),
+                                                                  s13.size(), &r13res, r13err, sizeof(r13err));
+        if (coopmat2) {
+          bool allNaN = true;
+          for (size_t i = 0; i < s13.size(); i++) {
+            if (!std::isnan(s13[i])) {
+              allNaN = false;
+            }
+          }
+          want(!r13ok && r13res.st == VK_TUNE_PROBE_NOT_MEASURED
+                   && string(r13err).find("does not target the shape's object (R-13)") != string::npos
+                   && allNaN,
+               "R-13: a candidate whose object is not the shape's object did not refuse the whole call "
+               "by its own name (and leave the samples NaN)");
+        }
+      }
       if (!deviceRan && !note.empty()) {
         firstBad = firstBad.empty() ? ("device run: " + note) : firstBad;
       }
@@ -3313,7 +3367,8 @@ namespace VulkanTuner {
        << setprecision(4) << " nan_anchor=" << (deviceAnchorNaN ? "ok" : "FAIL")
        << " samples_finite=" << (deviceSamplesFinite ? "ok" : "FAIL") << "]"
        << " verifies[override_consumed anchor_hits=0 raii_restore samples+pairs detector_identity]"
-       << " not_verified[gate_0.15 vs_tolerance too_slow coverage_complete number_quality]"
+       << " not_verified[gate_0.15 vs_tolerance too_slow coverage_complete number_quality "
+       << "r13_without_coopmat2]"
        << " checks=" << checks << " [" << (ok ? "ok" : "FAIL") << "]"
        << (ok ? "" : " first problem: " + firstBad);
     logLine(os.str());

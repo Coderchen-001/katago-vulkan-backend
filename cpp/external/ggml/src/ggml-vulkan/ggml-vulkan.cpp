@@ -21936,6 +21936,13 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
                 if (pair_legal[(size_t) s * params->nObjects + o] == 0) {
                     continue;                                // already excluded by the routing predicate
                 }
+                if (obj_pipe_ok[o] == 0) {
+                    // The candidate was never built, so nothing about it would be measured and its own
+                    // line already says why.  Refusing the call here would misname a BUILD failure as a
+                    // wiring error -- and the wiring question this block asks is about a pair that could
+                    // actually be timed.
+                    continue;
+                }
                 const uint32_t ci = params->objects[o].rowIndex;
                 if (cand_obj[ci] == want) {
                     continue;
