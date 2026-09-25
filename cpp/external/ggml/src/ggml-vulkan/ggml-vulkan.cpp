@@ -21586,9 +21586,18 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
             return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
                           "shape " + std::to_string(s) + " has a zero dimension");
         }
+        // BOTH types, and the symmetry is the point: this protocol's type set is CLOSED
+        // (vk_tune_src_type), and an out-of-set value would reach ggml_new_tensor_3d below, where it is
+        // an assert that a release build compiles away (GGML_ASSERT is NDEBUG-dependent) -- i.e. silent
+        // undefined behaviour instead of a refusal.  Checking only src0 would leave the sibling field
+        // reading as validated to anyone skimming this block.
         if (params->shapes[s].src0_type != VK_TUNE_SRC_F16 && params->shapes[s].src0_type != VK_TUNE_SRC_F32) {
             return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
                           "shape " + std::to_string(s) + " names a src0 type this protocol does not carry");
+        }
+        if (params->shapes[s].src1_type != VK_TUNE_SRC_F16 && params->shapes[s].src1_type != VK_TUNE_SRC_F32) {
+            return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
+                          "shape " + std::to_string(s) + " names a src1 type this protocol does not carry");
         }
 
         ggml_context * gctx = ggml_init(probe_iparams);
