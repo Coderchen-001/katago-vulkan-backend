@@ -21326,6 +21326,27 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
         return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION, "candidate array is null but nCands > 0");
     }
 
+    // The sample buffer is DENSE from 2c-c on: one slot per (shape, object, rep), in that order, so the
+    // caller can compute an index from its own shape and object lists without a side channel -- which
+    // samples exist is answered by the NaN fill above and by nothing else.  A buffer too small to hold
+    // the grid is REFUSED rather than filled partially: a truncated set is the "the compared set
+    // silently shrank" shape, and the judgement layer cannot see that it happened.
+    //
+    // It sits HERE, with the other argument checks and BEFORE anything interprets the candidate table,
+    // because it is an argument error: measured on the first run of the shell-side leg, a capacity
+    // failure that had to wait for the geometry check could only be reached with a legal geometry, so
+    // the leg's buffer case came back as "illegal geometry" instead -- a test that passed by failing
+    // for another reason.
+    const size_t probe_slots = (size_t) params->nShapes * (size_t) params->nObjects;
+    const size_t samples_needed = probe_slots * (size_t) params->reps;
+    if (d_out == nullptr || d_cap < samples_needed) {
+        return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
+                      "the sample buffer holds " + std::to_string(d_cap) + " double(s) but this probe "
+                      "writes " + std::to_string(samples_needed) + " (shapes="
+                      + std::to_string(params->nShapes) + " x objects=" + std::to_string(params->nObjects)
+                      + " x reps=" + std::to_string(params->reps) + ")");
+    }
+
     // ---- the interference window (tune-measurement.md section 2.4), fail-closed -----------------
     if (!ggml_backend_is_vk(backend)) {
         return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION, "not a Vulkan backend");
@@ -21541,21 +21562,6 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
     const ggml_prec probe_prec = GGML_PREC_DEFAULT;
     const bool f16acc = ggml_vk_prefers_f16acc(ctx->device, probe_prec);
 
-    // The sample buffer is DENSE from 2c-c on: one slot per (shape, object, rep), in that order, so the
-    // caller can compute an index from its own shape and object lists without a side channel -- which
-    // samples exist is answered by the NaN fill above and by nothing else.  A buffer too small to hold
-    // the grid is REFUSED rather than filled partially: a truncated set is the "the compared set
-    // silently shrank" shape, and the judgement layer cannot see that it happened.
-    const size_t probe_slots = (size_t) params->nShapes * (size_t) params->nObjects;
-    const size_t samples_needed = probe_slots * (size_t) params->reps;
-    if (d_out == nullptr || d_cap < samples_needed) {
-        return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
-                      "the sample buffer holds " + std::to_string(d_cap) + " double(s) but this probe "
-                      "writes " + std::to_string(samples_needed) + " (shapes="
-                      + std::to_string(params->nShapes) + " x objects=" + std::to_string(params->nObjects)
-                      + " x reps=" + std::to_string(params->reps) + ")");
-    }
-
     // ONE pipeline per (candidate, variant) that some object asks for, MEMOISED: the A/A sentinel is
     // two objects pointing at the same pipeline on purpose, so building it twice would give the
     // sentinel two pipelines that are merely equal in intent (and compile the same shader twice).
@@ -21608,6 +21614,33 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
     // with no line anywhere to explain it.  What the field held on ENTRY is saved so the restore can be
     // CHECKED after the passes instead of assumed.
     const vk_pipeline override_at_entry = ctx->probe_override_pipeline;
+
+    // 🔴 THE PROBE'S OWN BLOCKS MUST NOT BE RECORDED OR REPLAYED, and this is not tidiness.
+    // MEASURED (the shell-side leg's first device run, 2026-09-25): the fork records the first
+    // graph_compute of a graph and REPLAYS from the second one (the replay branch is
+    // `pr_enabled && pr_recorded`, this file's graph_compute), so the pipelines a pass resolves are frozen
+    // by whichever object ran first: the anchor's block took 200 ms and the next took 79 us (a replay),
+    // and every CANDIDATE block after it came back with `override_hits = 0` -- the primitive would have
+    // timed the anchor's pipeline while reporting it as the candidate's, which is the worst failure this
+    // primitive can have.  The hit check is what refused, and it is the reason that check exists.
+    //
+    // `pr_enabled` is the switch both the record and the replay branch read, so turning it off for the
+    // probe's blocks makes every block BUILD (which is what "one graph_compute + one synchronize" means)
+    // and leaves the user's replay state machine untouched -- the probe runs before any user recording
+    // (checked at entry), and the runs are declared incomparable anyway (section 2.4's three level
+    // shifts).  Restored in a destructor for the same reason the override is: an early refusal must not
+    // leave the user's engine without its replay optimisation.
+    struct probe_pr_guard {
+        ggml_backend_vk_context * ctx;
+        bool pr_enabled_at_entry;
+        probe_pr_guard(ggml_backend_vk_context * c) : ctx(c), pr_enabled_at_entry(c->pr_enabled) {
+            ctx->pr_enabled = false;
+        }
+        ~probe_pr_guard() {
+            ctx->pr_enabled = pr_enabled_at_entry;
+        }
+    };
+    probe_pr_guard prg(ctx);
     struct override_guard {
         ggml_backend_vk_context * ctx;
         vk_pipeline prev;
@@ -21864,7 +21897,10 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
                                     + " pass=" + std::to_string(pass)
                                     + (is_measured ? (" rep=" + std::to_string(rep)) : std::string(" warmup"))
                                     + " shots=" + std::to_string(params->shots) + " us="
-                                    + std::to_string(dt_us) + " override_hits=" + std::to_string(hits));
+                                    + std::to_string(dt_us) + " override_hits=" + std::to_string(hits)
+                                    + " pr_enabled=" + std::string(ctx->pr_enabled ? "1" : "0")
+                                    + " pr_recording=" + std::string(ctx->pr_recording ? "1" : "0")
+                                    + " pr_recorded=" + std::string(ctx->pr_recorded ? "1" : "0"));
                 }
             }
         }
@@ -22025,7 +22061,8 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
                     + std::to_string(no_progress_max) + " t_block_hot_us="
                     + std::to_string(t_block_hot_us) + " elapsed_us=" + std::to_string(elapsed_us_total)
                     + " warmup_us=" + std::to_string(warmup_us_total) + " dropped_build_failed="
-                    + std::to_string(build_failed) + " " + restore_token);
+                    + std::to_string(build_failed) + " pr_enabled_at_entry="
+                    + std::string(prg.pr_enabled_at_entry ? "1" : "0") + " " + restore_token);
 
     // OK, and that says exactly one thing: a usable comparison EXISTS.  Whether it supports the
     // non-inferiority claim, whether the sentinel is inside tolerance and whether the spike rate is

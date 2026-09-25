@@ -1403,13 +1403,23 @@ namespace VulkanTuner {
     // grammar -- `all` or a base-10 bitmask, see vk_t2_probe's comment -- so one env asks both
     // sides for their self-checks.  Never reached under KATAGO_VK_TUNE=0: makeDecision returns
     // before this (and the backend suppresses its probes there for the same reason).
-    bool t2ProbeBit8() {
+    unsigned long t2ProbeBits() {
       const char* v = getenv("KATAGO_VK_T2_PROBE");
       if (v == nullptr || v[0] == '\0') {
-        return false;
+        return 0ul;
       }
-      const unsigned long bits = (strcmp(v, "all") == 0) ? 0xFul : strtoul(v, nullptr, 10);
-      return (bits & 8ul) != 0;
+      // `all` stays 0xF: bit 16 (the W4e probe leg) must NOT be part of it, because a full-probe run
+      // also turns bit 4 and bit 8 on and the measurement primitive refuses to measure under either --
+      // so "all" would ask for a measurement the primitive is right to refuse.
+      return (strcmp(v, "all") == 0) ? 0xFul : strtoul(v, nullptr, 10);
+    }
+
+    bool t2ProbeBit8() {
+      return (t2ProbeBits() & 8ul) != 0;
+    }
+
+    bool t2ProbeBit16() {
+      return (t2ProbeBits() & 16ul) != 0;
     }
 
     // The USER-FACING mode, as an identity string.  ONE producer: the file name's hash segment and
@@ -2996,6 +3006,319 @@ namespace VulkanTuner {
             + (ok ? "" : " first problem: " + firstBad));
   }
 
+  // -----------------------------------------------------------------------------------------------
+  // W4e 2c-c: the MEASUREMENT primitive's self-test leg (w4e-preview.md R-14 / R-15 / R-16).
+  //
+  // CARRIER (R-14): bit 16 of the EXISTING KATAGO_VK_T2_PROBE -- no new env, because R14's
+  // `MANAGED_WANT = 41` and the smoke's `$managed` (41 names) are a COUNT EQUALITY and a new name would
+  // have to move both.  It cannot ride bit 8 with the other self-tests, and that is a property of the
+  // object under test rather than a preference: the primitive REFUSES to measure while bit 4 or bit 8
+  // is on (its own shapes would be mixed into the user's tables), so a leg that asks it to measure must
+  // use a bit that is neither.  `all` therefore stays 0xF and does NOT include this one: a full-probe
+  // run would otherwise have every measurement refused by the primitive's own interference gate.
+  //
+  // WHAT THIS LEG VERIFIES -- written out because a leg that only says "ok" is read as "verified" for
+  // every neighbouring claim (R-15), and because 2c-c is the cut that made the second half reachable:
+  //
+  //   1. THE TWO SHARED DEFINITIONS, on the CPU, with no device.
+  //      (a) The rotation: balanced inside a cycle (each index occupies each position exactly once),
+  //          reproducible from its seed, and actually dependent on it.
+  //      (b) The spike detector, driven over a synthetic arm series with a KNOWN injected rate through
+  //          the very function the probe calls, returns an interval that CONTAINS that rate.  Without
+  //          this, "the rate gate was measured with the detector's band" would be a claim about two
+  //          definitions that merely look alike (R-3(a), R-4(i)).
+  //   2. THE REFUSALS 2c-c made reachable: shots == 0, reps < 2, warmupBlocks < 2, stallBlocks == 0, a
+  //      band that is not an interval, and a sample buffer too small for the grid.  Every one of them
+  //      must be refused BEFORE any device work, so the whole battery costs nothing.
+  //   3. THE DEVICE RUN, on a SYNTHETIC single-family fixture (R-16: a row this file builds, whose
+  //      family and accumulator match the shape's -- NOT an enumerated candidate, because a real one
+  //      would make R-13 a hard prerequisite of this batch): the pipeline override is CONSUMED (the
+  //      candidate blocks report hits > 0), the ANCHOR blocks report 0, the guard RESTORES the field,
+  //      blocks and samples are counted, the grid's paired samples are all finite while the anchor
+  //      slots stay NaN, and the summary reports pairs_complete.
+  //
+  //   4. WHAT IT DOES NOT VERIFY.  The gate comparison itself (interval upper bound vs 0.15), the
+  //      interval-vs-tolerance decisions, the `too-slow` drop, `coverage_complete`, and whether the
+  //      numbers are any GOOD -- that last one needs the calibration window, not a self-test.  The gate
+  //      is the shell's decision path and the numbers are the calibration batch's business (R-10).
+  //      The fixture is synthetic and the line says so: it exercises the (rowIndex, aligned) memo and
+  //      the A/A sentinel exactly as a real candidate would, and it is evidence about NO catalogue row.
+  void probeSelfTest(ggml_backend_t backend) {
+    int checks = 0;
+    int failed = 0;
+    string firstBad;
+    const auto want = [&](bool cond, const char * what) {
+      checks++;
+      if (!cond) {
+        failed++;
+        if (firstBad.empty()) {
+          firstBad = what;
+        }
+      }
+    };
+
+    // ---- 1(a) the rotation ----------------------------------------------------------------------
+    bool balanced = true;
+    bool reproducible = true;
+    bool seedMatters = false;
+    {
+      const uint32_t n = 5;
+      std::vector<uint32_t> perm(n, 0);
+      for (uint32_t cycle = 0; cycle < 3; cycle++) {
+        vk_tune_rotation_permutation(TuneStats::PROBE_ROTATION_SEED, n, cycle, perm.data());
+        std::vector<uint32_t> again(n, 0);
+        vk_tune_rotation_permutation(TuneStats::PROBE_ROTATION_SEED, n, cycle, again.data());
+        if (again != perm) {
+          reproducible = false;
+        }
+        for (uint32_t phase = 0; phase < n; phase++) {
+          std::vector<int> seen(n, 0);
+          for (uint32_t k = 0; k < n; k++) {
+            seen[vk_tune_rotation_at(perm.data(), n, phase, k)]++;
+          }
+          for (uint32_t i = 0; i < n; i++) {
+            if (seen[i] != 1) {
+              balanced = false;
+            }
+          }
+        }
+      }
+      std::vector<uint32_t> base0(n, 0);
+      std::vector<uint32_t> other(n, 0);
+      vk_tune_rotation_permutation(TuneStats::PROBE_ROTATION_SEED, n, 0, base0.data());
+      vk_tune_rotation_permutation(TuneStats::PROBE_ROTATION_SEED ^ 0x9E3779B97F4A7C15ULL, n, 0, other.data());
+      seedMatters = (base0 != other);
+    }
+    want(balanced, "the rotation is not balanced inside a cycle");
+    want(reproducible, "the rotation is not reproducible from its seed");
+    want(seedMatters, "two different seeds produced the same rotation");
+
+    // ---- 1(b) the detector, over a series whose rate we INJECTED ---------------------------------
+    const long detTrials = 4000;
+    const double detInjected = 0.106;   // the measured regime whose band the 0.15 gate came from
+    uint32_t detMarks = 0;
+    double detMeasured = 0.0;
+    double detLow = 0.0;
+    double detHigh = 0.0;
+    bool detContains = false;
+    {
+      // The generator's OWN arm (one object's block times), so the series this detector is asked about
+      // is the series the envelope is built from -- not a re-invention of it with the same constants.
+      const std::vector<double> arm = TuneStats::spikeSyntheticArm(detTrials, 1.0, 0.001, detInjected,
+                                                                   TuneStats::SPIKE_BAND_LO, TuneStats::SPIKE_BAND_HI,
+                                                                   TuneStats::PROBE_ROTATION_SEED);
+      std::vector<double> sorted = arm;
+      std::sort(sorted.begin(), sorted.end());
+      const double med = sorted.empty() ? 0.0 : sorted[sorted.size() / 2];
+      for (size_t i = 0; i < arm.size(); i++) {
+        if (vk_tune_spike_band_marked(arm[i], med, TuneStats::SPIKE_BAND_LO, TuneStats::SPIKE_BAND_HI)) {
+          detMarks++;
+        }
+      }
+      const TuneStats::RateInterval ri = TuneStats::rateInterval((long) detMarks, detTrials, TuneStats::ALPHA);
+      detMeasured = ri.p;
+      detLow = ri.low;
+      detHigh = ri.high;
+      detContains = ri.ok && ri.low <= detInjected && ri.high >= detInjected;
+    }
+    want(detContains, "the detector's interval does not contain the injected spike rate: the runtime "
+                      "detector and the envelope generator's band are not the same quantity");
+
+    // ---- 2 the refusals, none of which may touch the device ---------------------------------------
+    vk_tune_probe_shape shape {};
+    shape.m = 192;
+    // n must clear `mul_mat_vec_max_cols` (8): a mul_mat with n <= 8 is routed to the dmmv/mat-vec path
+    // (ggml-vulkan.cpp:564/2538), which never asks the matmul pipeline resolver at all -- so no tuned row
+    // and no probe override can reach it, and the primitive's own "override was not consumed" refusal is
+    // the fail-closed answer rather than a bug.  MEASURED (the first run of this leg, n = 8): the
+    // candidate's blocks reported override_hits = 0 and the probe refused exactly there.  That is a fact
+    // about which shapes a row can serve, not about this fixture: the covered set cannot contain a shape
+    // whose dispatch never consults the row table.
+    shape.n = 64;
+    shape.k = 512;
+    shape.src0_type = VK_TUNE_SRC_F16;
+    shape.src1_type = VK_TUNE_SRC_F16;
+    vk_tune_probe_object refObjects[2];
+    for (int i = 0; i < 2; i++) {
+      refObjects[i].stock = true;      // two entries pointing at the same pipeline: the A/A sentinel
+      refObjects[i].rowIndex = 0;
+      refObjects[i].aligned = false;
+    }
+    vk_tune_row_spec refCand {};
+    refCand.path = VK_TILE_PATH_SCALAR;
+    refCand.src0_type = 1;             // f16, the same family as the shape
+    refCand.src1_type = 1;
+    refCand.key_m = 192;
+    refCand.key_k = 512;
+    vk_tune_probe_params base {};
+    base.shapes = &shape;
+    base.nShapes = 1;
+    base.objects = refObjects;
+    base.nObjects = 2;
+    base.shots = 4;
+    base.warmupBlocks = 2;
+    base.reps = 3;
+    base.stallBlocks = 8;
+    base.seed = TuneStats::PROBE_ROTATION_SEED;
+    base.spikeBandLo = TuneStats::SPIKE_BAND_LO;
+    base.spikeBandHi = TuneStats::SPIKE_BAND_HI;
+
+    int refused = 0;
+    int refusalCases = 0;
+    string refusalBad;
+    {
+      std::vector<double> dbuf(64, 0.0);
+      char rerr[512];
+      // Each case names the SENTENCE it must produce, not just the status: every precondition failure in
+      // this function returns the same status, so "it was refused" alone would go green while a case
+      // tested a different door than it claims.  (Measured: the first version of this battery did exactly
+      // that -- the buffer case was answered by the candidate-geometry check.)
+      const auto refusedBy = [&](const vk_tune_probe_params & q, size_t cap, const char * sentence) {
+        refusalCases++;
+        vk_tune_probe_result r {};
+        rerr[0] = '\0';
+        const bool ok = ::ggml_backend_vk_tune_probe_candidate(backend, &refCand, 1, &q, dbuf.data(), cap,
+                                                               &r, rerr, sizeof(rerr));
+        const bool good = !ok && r.st == VK_TUNE_PROBE_REFUSED_PRECONDITION && rerr[0] != '\0'
+                          && string(rerr).find(sentence) != string::npos;
+        if (good) {
+          refused++;
+        } else if (refusalBad.empty()) {
+          refusalBad = string(sentence) + " -> " + (string(rerr).empty() ? string("(no sentence)") : string(rerr));
+        }
+        return good;
+      };
+      vk_tune_probe_params q = base;
+      q.shots = 0;         refusedBy(q, dbuf.size(), "shots == 0");
+      q = base;
+      q.reps = 1;          refusedBy(q, dbuf.size(), "reps < 2");
+      q = base;
+      q.warmupBlocks = 1;  refusedBy(q, dbuf.size(), "warmupBlocks < 2");
+      q = base;
+      q.stallBlocks = 0;   refusedBy(q, dbuf.size(), "stallBlocks is 0");
+      q = base;
+      q.spikeBandLo = 0.0; refusedBy(q, dbuf.size(), "not a usable amplitude band");
+      q = base;
+      refusedBy(q, 4, "the sample buffer holds");   // the grid needs 1*2*3 = 6 slots
+    }
+    if (refused != refusalCases) {
+      firstBad = firstBad.empty() ? ("refusal battery: " + refusalBad) : firstBad;
+    }
+    want(refused == refusalCases, "a refusal that 2c-c made reachable did not refuse with its own name");
+
+    // ---- 3 the device run, on a synthetic single-family fixture -----------------------------------
+    bool deviceRan = false;
+    uint32_t deviceBlocks = 0;
+    uint32_t deviceSamples = 0;
+    uint32_t deviceSpikes = 0;
+    uint32_t devicePairsLegal = 0;
+    double deviceHot = 0.0;
+    bool devicePairsComplete = false;
+    bool deviceAnchorNaN = false;
+    bool deviceSamplesFinite = true;
+    {
+      // Two wave variants of ONE synthetic geometry, both f16 x f16 (the shape's family) and both with
+      // the routing key the shape carries.  Which of them the device accepts is not this leg's business
+      // to re-derive: the rules live in the shared header and the PROBE is their authority here, so the
+      // leg tries the wave32 fixture and, if the probe refuses the geometry, the wave64 mirror.  Asking
+      // the predicate directly would make this leg a second writer of the wave rule (and a new wave
+      // source in the census) for no gain.
+      vk_tune_row_spec rows[2];
+      for (int i = 0; i < 2; i++) {
+        rows[i] = refCand;
+      }
+      rows[0].geom.BM = 128; rows[0].geom.BN = 128; rows[0].geom.BK = 32;
+      rows[0].geom.WM = 32;  rows[0].geom.WN = 64;  rows[0].geom.WMITER = 2;
+      rows[0].geom.TM = 2;   rows[0].geom.TN = 2;   rows[0].geom.BS = 256;
+      rows[0].geom.pad = 1;  rows[0].geom.reshape = 0; rows[0].geom.smaller = 0;
+      rows[1] = rows[0];
+      rows[1].geom.WM = 64;  rows[1].geom.WN = 64;  rows[1].geom.WMITER = 4;
+      rows[1].geom.TM = 4;   rows[1].geom.TN = 4;
+
+      const uint32_t nObjects = 4;
+      vk_tune_probe_object objects[nObjects];
+      objects[0].stock = true;  objects[0].rowIndex = 0; objects[0].aligned = false;   // the anchor
+      objects[1].stock = false; objects[1].rowIndex = 0; objects[1].aligned = false;   // the candidate
+      objects[2].stock = false; objects[2].rowIndex = 0; objects[2].aligned = false;   // its memo twin
+      objects[3].stock = true;  objects[3].rowIndex = 0; objects[3].aligned = false;   // A/A sentinel
+
+      vk_tune_probe_params q = base;
+      q.objects = objects;
+      q.nObjects = nObjects;
+
+      string note;
+      for (int attempt = 0; attempt < 2 && !deviceRan; attempt++) {
+        std::vector<double> dsamp((size_t) 1 * nObjects * base.reps, 0.0);
+        vk_tune_probe_result r {};
+        char derr[1024];
+        derr[0] = '\0';
+        const bool ok = ::ggml_backend_vk_tune_probe_candidate(backend, &rows[attempt], 1, &q, dsamp.data(),
+                                                               dsamp.size(), &r, derr, sizeof(derr));
+        if (ok && r.st == VK_TUNE_PROBE_OK) {
+          deviceRan = true;
+          deviceBlocks = r.blocks;
+          deviceSamples = r.samples;
+          deviceSpikes = r.spikes;
+          devicePairsLegal = r.pairs_legal;
+          deviceHot = r.t_block_hot_us;
+          devicePairsComplete = r.pairs_complete;
+          // The NaN discipline, checked rather than assumed: the anchor's three slots were never
+          // written (there is no difference to take against itself), and every other slot IS finite --
+          // a NaN among them would poison an interval the caller believes it measured.
+          deviceAnchorNaN = std::isnan(dsamp[0]) && std::isnan(dsamp[1]) && std::isnan(dsamp[2]);
+          for (size_t i = 3; i < dsamp.size(); i++) {
+            if (!std::isfinite(dsamp[i])) {
+              deviceSamplesFinite = false;
+            }
+          }
+        } else {
+          note = string(derr);
+        }
+      }
+
+      want(deviceRan, "the probe did not complete a synthetic run on this device (see the note in the line)");
+      if (deviceRan) {
+        // 1 shape x 4 objects x 3 measured passes, and 3 reps x 3 non-anchor objects.
+        want(deviceBlocks == 12, "the probe timed a different number of blocks than the measured grid");
+        want(deviceSamples == 9, "the probe wrote a different number of paired samples than 3 x 3");
+        want(devicePairsLegal == 4 && devicePairsComplete, "pairs_complete did not hold for a complete grid");
+        want(deviceHot > 0.0, "t_block_hot_us is not a positive median over hot blocks");
+        want(deviceSpikes <= deviceBlocks, "more spike marks than measured blocks");
+        want(deviceAnchorNaN, "an anchor slot was written instead of staying NaN");
+        want(deviceSamplesFinite, "a measured paired sample is not finite");
+      }
+      if (!deviceRan && !note.empty()) {
+        firstBad = firstBad.empty() ? ("device run: " + note) : firstBad;
+      }
+    }
+
+    // ---- the ONE line ----------------------------------------------------------------------------
+    // House style, and the boundary clause is part of the LINE rather than only of this comment: the
+    // smoke reads the line, so a reader of the evidence sees what was and was not verified without
+    // having to open this file.  The per-block evidence (the `probe block:` lines with their
+    // override_hits) is emitted by the primitive itself under this bit, and the smoke asserts it there.
+    const bool ok = (failed == 0);
+    ostringstream os;
+    // `fixed`: a default stream prints 71.0 as 7e+01, and the smoke matches on these numbers.
+    os << fixed << "probe self-test: rotation[balance=" << (balanced ? "ok" : "FAIL")
+       << " reproduce=" << (reproducible ? "ok" : "FAIL")
+       << " seed_dependent=" << (seedMatters ? "ok" : "FAIL") << "]"
+       << " detector[injected=" << setprecision(4) << detInjected << " marks=" << detMarks
+       << " trials=" << detTrials << " rate=" << detMeasured << " ci=[" << detLow << "," << detHigh
+       << "] contains_p=" << (detContains ? 1 : 0) << "]"
+       << " refusals=" << refused << "/" << refusalCases
+       << " device[synthetic=1 shapes=1 objects=4 blocks=" << deviceBlocks << " samples=" << deviceSamples
+       << " pairs_legal=" << devicePairsLegal << " pairs_complete=" << (devicePairsComplete ? 1 : 0)
+       << " spikes=" << deviceSpikes << " t_block_hot_us=" << setprecision(1) << deviceHot
+       << setprecision(4) << " nan_anchor=" << (deviceAnchorNaN ? "ok" : "FAIL")
+       << " samples_finite=" << (deviceSamplesFinite ? "ok" : "FAIL") << "]"
+       << " verifies[override_consumed anchor_hits=0 raii_restore samples+pairs detector_identity]"
+       << " not_verified[gate_0.15 vs_tolerance too_slow coverage_complete number_quality]"
+       << " checks=" << checks << " [" << (ok ? "ok" : "FAIL") << "]"
+       << (ok ? "" : " first problem: " + firstBad);
+    logLine(os.str());
+  }
+
   shared_ptr<Decision> makeDecision(
     ggml_backend_t backend,
     int deviceIdx,
@@ -3144,6 +3467,19 @@ namespace VulkanTuner {
           // purpose: one line, one question (the probe is the declaration's business, the catalogue is the
           // search's), and the smoke asserts the grammar of each independently.
           logLine(formatCandidateCatalog(*d, runCandidateCatalog(d.get())));
+        }
+      }
+
+      // W4e 2c-c: the measurement primitive's own leg, on its OWN bit (R-14).  It cannot share bit 8
+      // with the self-tests above: the primitive refuses to measure while bit 4 or bit 8 is on, because
+      // its shapes would be mixed into the user's tables -- so the carrier is bit 16 and `all` still
+      // means 0xF.  Same once-per-process shape as the block above, and it is placed AFTER it so the
+      // load/decision lines keep their order.
+      if (t2ProbeBit16()) {
+        static std::atomic<bool> probeSelfTested {false};
+        bool probeExpected = false;
+        if (probeSelfTested.compare_exchange_strong(probeExpected, true)) {
+          probeSelfTest(backend);
         }
       }
 

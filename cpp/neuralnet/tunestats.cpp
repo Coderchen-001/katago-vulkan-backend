@@ -368,19 +368,28 @@ namespace TuneStats {
     // One synthetic pair difference: two independent blocks, each base*(1 + N(0,sigma) + spike).
     // Both arms draw their spike uniforms even when spikeProb is 0, so the spike-free variant sees
     // the SAME normal draws -- the comparison is paired at the generator level too.
+    // ONE arm of one pair: base*(1 + N(0,sigma)) plus, with probability `spikeProb`, a multiplicative
+    // delay of 1 + U[lo,hi) -- the definition the runtime detector's band is the other half of.
+    // FACTORED OUT (2026-09-25, 2c-c) so that the series the probe's self-test hands to the RUNTIME
+    // detector is produced by the same code the envelope is built from, not by a second copy of the
+    // formula with the same constants.  The DRAW ORDER is part of the contract and is unchanged:
+    // one normal, then the "is there a spike" uniform, then the amplitude uniform -- and both arms
+    // draw all three even when spikeProb is 0, so the spike-free leg sees the SAME normal draws.
+    double armOnce(double base, double sigmaRel, double spikeProb, double spikeLo, double spikeHi, Rng& rng) {
+      double a = base * (1.0 + sigmaRel * rng.normal());
+      const double ua = rng.uniform();
+      const double ra = rng.uniform();
+      if (ua < spikeProb) a += base * (spikeLo + (spikeHi - spikeLo) * ra);
+      return a;
+    }
+
     void synthDifferences(vector<double>& d, size_t pairs, double base, double sigmaRel,
                           double spikeProb, double spikeLo, double spikeHi, double effect, Rng& rng) {
       d.clear();
       d.reserve(pairs);
       for (size_t k = 0; k < pairs; k++) {
-        double a = base * (1.0 + sigmaRel * rng.normal());
-        double b = base * (1.0 + sigmaRel * rng.normal());
-        const double ua = rng.uniform();
-        const double ub = rng.uniform();
-        const double ra = rng.uniform();
-        const double rb = rng.uniform();
-        if (ua < spikeProb) a += base * (spikeLo + (spikeHi - spikeLo) * ra);
-        if (ub < spikeProb) b += base * (spikeLo + (spikeHi - spikeLo) * rb);
+        const double a = armOnce(base, sigmaRel, spikeProb, spikeLo, spikeHi, rng);
+        const double b = armOnce(base, sigmaRel, spikeProb, spikeLo, spikeHi, rng);
         d.push_back((a - b) + effect * base);
       }
     }
@@ -719,5 +728,20 @@ namespace TuneStats {
          << " t_err=" << tErr << " env_mismatch=" << envMismatch << ")";
     }
     return os.str();
+  }
+  // The generator's ARM as a SERIES (W4e 2c-c; declaration and rationale in the header).  One object's
+  // block times, i.e. exactly what the runtime spike detector is pointed at when it runs against a
+  // device.  Defined here, outside the anonymous namespace, only so the probe's self-test leg can call
+  // it; the injection itself is `armOnce`, the same function the envelope's pairs are drawn with.
+  std::vector<double> spikeSyntheticArm(long n, double base, double sigmaRel, double spikeProb,
+                                        double spikeLo, double spikeHi, unsigned long long seed) {
+    std::vector<double> out;
+    if (n <= 0) return out;
+    out.reserve((size_t) n);
+    Rng rng(seed);
+    for (long i = 0; i < n; i++) {
+      out.push_back(armOnce(base, sigmaRel, spikeProb, spikeLo, spikeHi, rng));
+    }
+    return out;
   }
 }

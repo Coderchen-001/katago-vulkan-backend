@@ -153,6 +153,15 @@ namespace TuneStats {
     bool ok;       // false when trials == 0 (an empty denominator is not a rate of zero)
   };
   RateInterval rateInterval(long hits, long trials, double alpha);
+  // W4e 2c-c: the generator's ARM (one object's block times) as a series, injected with a rate the
+  // caller KNOWS.  It exists so the measurement primitive's self-test can point the RUNTIME spike
+  // detector at a series whose answer is known in advance: "the detector and the envelope share a
+  // band" is then a check rather than a resemblance (w4e-preview.md R-3(a), R-4(i)).  The
+  // injection has one definition -- this loop calls the same arm draw the envelope's pairs use --
+  // and the draw order is part of the contract (see the .cpp), so a refactor that reorders it
+  // changes the envelope's numbers and the self-test says so.
+  std::vector<double> spikeSyntheticArm(long n, double base, double sigmaRel, double spikeProb,
+                                        double spikeLo, double spikeHi, unsigned long long seed);
 
   // ---- the paired decision machinery ----
   // Input: d_i = t_stock,i - t_cand,i for ONE rep each (the pairing cancels the common-mode drift a
