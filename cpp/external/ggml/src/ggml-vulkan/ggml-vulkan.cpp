@@ -11050,6 +11050,84 @@ static vk_pipeline ggml_vk_get_64b_indexing_pipeline(ggml_backend_vk_context * c
     return pipeline;
 }
 
+// W4e R-13: the ONE place that turns a mul_mat node's RAW types and layout into the (family, acc)
+// OBJECT its tuned rows live in -- plus the effective types the pipeline guess inside that object needs.
+//
+// WHY THIS IS A FUNCTION AND NOT A PARAGRAPH.  Production resolves that object from the tensors; the probe
+// has to answer the SAME question about a SHAPE, because the legality of a (shape, candidate) pair is
+// "does the candidate target the object this shape resolves to" -- and that is deliberately NOT "are the
+// two type pairs equal": the term that makes them differ is precisely this body (on a coopmat2 device an
+// F32 src1 is dispatched as f16, so such a shape lives in the (F16,F16) object even though its tensor
+// says F32).  Deriving it a second time on the probe's side is the "one rule, two implementations"
+// defect this file has paid for repeatedly.
+//
+// THE BODY IS MOVED VERBATIM from ggml_vk_mul_mat_q_f16, with exactly two mechanical substitutions:
+// `dst->op_params[0]` becomes the `prec` argument (the probe has no dst to read it from, and the caller
+// passes the same expression), and `x_non_contig` moves IN because it is part of the same rule and both
+// sides need it.  Everything else is character for character, so the move cannot change semantics -- and
+// the move is PROVED by the install path's own object set rather than by the fact that it compiled:
+// `install (ctx=...)` counts, the item-12 `dispatch geometry: pipeline=<name>` lines (the <name> is the
+// pipeline the resolved object chose) and the `tuned row hit` lines must be unchanged, leg for leg.
+//
+// What the caller must NOT do is re-derive any field of this struct: every one of them is a fact about
+// the object, and a second derivation is how the two answers drift apart.
+struct vk_matmul_object_res {
+    vk_matmul_pipeline obj;                 // the (family, acc) object the selector will use
+    ggml_type src0_type;                    // what that object's pipeline guess receives
+    ggml_type effective_src1_type;          // ditto, for src1
+    ggml_type f16_type;                     // BF16 keeps BF16 through the dequant fallback
+    bool x_non_contig;
+    bool y_non_contig;
+    bool y_f32_kernel;
+    bool quantize_y;
+    bool qx_needs_dequant;
+    bool qy_needs_dequant;
+};
+
+static vk_matmul_object_res ggml_vk_matmul_resolve_object(ggml_backend_vk_context * ctx,
+                                                         const ggml_tensor * src0, const ggml_tensor * src1,
+                                                         uint64_t ne10, uint64_t ne11, ggml_prec prec) {
+    vk_matmul_object_res r {};
+
+    // Reformat and convert to fp16 if non-contiguous, or for coopmat2 for better perf
+    r.x_non_contig = (ctx->device->coopmat2 && src0->type == GGML_TYPE_F32) ||
+                     !ggml_vk_dim01_contiguous(src0);
+    r.y_non_contig = (ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
+                     (src0->type == GGML_TYPE_BF16 && src1->type != GGML_TYPE_BF16) ||
+                     !ggml_vk_dim01_contiguous(src1);
+
+    // If src0 is BF16, try to use a BF16 x BF16 multiply
+    r.f16_type = src0->type == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
+
+    r.y_f32_kernel = src1->type == GGML_TYPE_F32 && !r.y_non_contig;
+
+    r.quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !r.y_non_contig && (ne11 * ne10) % 4 == 0;
+
+    // Check for mmq first
+    r.obj = r.quantize_y ? ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, prec) : nullptr;
+
+    if (r.obj == nullptr) {
+        // Fall back to f16 dequant mul mat
+        r.obj = ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, r.y_non_contig ? r.f16_type : src1->type, prec);
+        r.quantize_y = false;
+    }
+
+    r.qx_needs_dequant = r.obj == nullptr || r.x_non_contig;
+    r.qy_needs_dequant = !r.quantize_y && ((src1->type != r.f16_type && !r.y_f32_kernel) || r.y_non_contig);
+
+    if (r.qx_needs_dequant) {
+        // Fall back to dequant + f16 mulmat
+        r.obj = ggml_vk_get_mul_mat_mat_pipeline(ctx, r.f16_type, r.y_f32_kernel ? GGML_TYPE_F32 : r.f16_type, prec);
+    }
+
+    // Not implemented
+    GGML_ASSERT(r.y_non_contig || !r.qy_needs_dequant);  // NOLINT
+
+    r.effective_src1_type = r.quantize_y ? GGML_TYPE_Q8_1 : (r.y_f32_kernel ? GGML_TYPE_F32 : src1->type);
+    r.src0_type = r.qx_needs_dequant ? r.f16_type : src0->type;
+    return r;
+}
+
 static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_q_f16((" << src0 << ", name=" << src0->name << ", type=" << ggml_type_name(src0->type) << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << ggml_type_name(src1->type) << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
@@ -11094,46 +11172,27 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         src1_uma = d_Qy != nullptr;
     }
 
-    // Reformat and convert to fp16 if non-contiguous, or for coopmat2 for better perf
-    const bool x_non_contig = (ctx->device->coopmat2 && src0->type == GGML_TYPE_F32) ||
-                              !ggml_vk_dim01_contiguous(src0);
-    const bool y_non_contig = (ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
-                              (src0->type == GGML_TYPE_BF16 && src1->type != GGML_TYPE_BF16) ||
-                              !ggml_vk_dim01_contiguous(src1);
+    // W4e R-13: the object resolution lives in ggml_vk_matmul_resolve_object now, because the probe
+    // asks the same question about a shape and a second copy of this derivation is exactly the defect
+    // this file keeps paying for.  The body was MOVED (see that function): every name below is the same
+    // fact under a struct name, and the field list is the whole contract -- if this function ever needs a
+    // new input it must come out of that struct, not out of a fresh derivation here.
+    const vk_matmul_object_res res = ggml_vk_matmul_resolve_object(ctx, src0, src1, ne10, ne11, (ggml_prec) dst->op_params[0]);
 
-    // If src0 is BF16, try to use a BF16 x BF16 multiply
-    ggml_type f16_type = src0->type == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
+    const bool x_non_contig = res.x_non_contig;
+    const bool y_non_contig = res.y_non_contig;
+    ggml_type f16_type = res.f16_type;
+    const bool y_f32_kernel = res.y_f32_kernel;
+    bool quantize_y = res.quantize_y;
+    vk_matmul_pipeline mmp = res.obj;   // NOT const: the (non-const) `vk_matmul_pipeline&` selector and align-probe take it by reference
+    const bool qx_needs_dequant = res.qx_needs_dequant;
+    const bool qy_needs_dequant = res.qy_needs_dequant;
+    const ggml_type effective_src1_type = res.effective_src1_type;
 
-    const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
-
-    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
-
-    // Check for mmq first
-    vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0]) : nullptr;
-
-    if (mmp == nullptr) {
-        // Fall back to f16 dequant mul mat
-        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, y_non_contig ? f16_type : src1->type, (ggml_prec)dst->op_params[0]);
-        quantize_y = false;
-    }
-
-    const bool qx_needs_dequant = mmp == nullptr || x_non_contig;
-    const bool qy_needs_dequant = !quantize_y && ((src1->type != f16_type && !y_f32_kernel) || y_non_contig);
-
-    if (qx_needs_dequant) {
-        // Fall back to dequant + f16 mulmat
-        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, f16_type, y_f32_kernel ? GGML_TYPE_F32 : f16_type, (ggml_prec)dst->op_params[0]);
-    }
-
-    // Not implemented
-    GGML_ASSERT(y_non_contig || !qy_needs_dequant);  // NOLINT
-
-    const ggml_type effective_src1_type = quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type);
-
-    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align(ctx, mmp, ne01, ne11, ne10, qx_needs_dequant ? f16_type : src0->type, effective_src1_type));
+    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align(ctx, mmp, ne01, ne11, ne10, res.src0_type, effective_src1_type));
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
 
-    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline(ctx, mmp, ne01, ne11, ne10, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
+    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline(ctx, mmp, ne01, ne11, ne10, aligned, res.src0_type, effective_src1_type);
 
     // T3 item 12 (t3-shell-plan.md section 6.1): prove the dispatched K is the true K
     // and not the padded one.  This is the link that decides whether a row's align is
@@ -21748,6 +21807,9 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
     std::vector<ggml_context *> shape_gctx(params->nShapes, nullptr);
     std::vector<ggml_backend_buffer_t> shape_buf(params->nShapes, nullptr);
     std::vector<ggml_cgraph *> shape_graph(params->nShapes, nullptr);
+    // R-13: the object each shape resolves to, filled in the build loop below because that is where
+    // the shape's tensors exist.  It is the object the DISPATCHER will use, not a type comparison.
+    std::vector<vk_matmul_pipeline> shape_obj(params->nShapes, nullptr);
 
     // Per-CALL RAII, and it has to be: the graphs outlive every early return below (a refusal half way
     // through the passes must not leave VRAM held for the rest of the process), and a `shots`-sized
@@ -21797,6 +21859,13 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
         shape_gctx[s] = gctx;
         ggml_tensor * p_src0 = ggml_new_tensor_3d(gctx, (ggml_type) params->shapes[s].src0_type, k, m, 1);
         ggml_tensor * p_src1 = ggml_new_tensor_3d(gctx, (ggml_type) params->shapes[s].src1_type, k, n, 1);
+        // R-13: ask the SAME function the dispatch site calls, on this shape's own tensors.  The
+        // graph above is contiguous by construction, which is what makes this the dispatcher's own
+        // answer for this family rather than a guess about it -- the device terms (coopmat2 on an
+        // F32 src1, integer_dot_product, the prec) are all read by that function itself.
+        shape_obj[s] = ggml_vk_matmul_resolve_object(ctx, p_src0, p_src1,
+                                                    (uint64_t) p_src1->ne[0], (uint64_t) p_src1->ne[1],
+                                                    probe_prec).obj;
         ggml_cgraph * p_graph = ggml_new_graph(gctx);
         for (uint32_t i = 0; i < params->shots; i++) {
             // A distinct node AND a distinct dst: that is what makes the `shots` dispatches overlap
@@ -21821,6 +21890,69 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
                           "run's blocks were shortened)");
         }
         shape_buf[s] = p_buf;
+    }
+
+    // ---- R-13: a candidate must target the SHAPE'S object, and a mismatch refuses the whole call -------
+    //
+    // WHAT WAS WRONG WITHOUT THIS.  The probe forces one candidate pipeline onto every block of a shape.
+    // The pair accounting above decides "legal" from the ROUTING KEY alone (does the row's (m,k) match
+    // this shape), so a candidate whose declared family resolves to a DIFFERENT object than the shape's
+    // was still measured -- and the number it produced described a kernel this shape never dispatches.
+    // The wrong predicate here is "the two declared type pairs are equal", and it is wrong in a way that
+    // matters: on a coopmat2 device an F32 src1 is dispatched as f16, so a shape declaring (F16,F32) lives
+    // in the (F16,F16) object, and a candidate declaring (F16,F16) is the CORRECT one for it -- comparing
+    // types would refuse the legal pair and admit the illegal one.
+    //
+    // WHY THE WHOLE CALL AND NOT A DROPPED PAIR (ruled 2026-09-25).  Same shape as 2c-b's illegal
+    // geometry: dropping the pair would silently shrink the set the judgement layer compares, and the
+    // missing member reads as a verdict -- here it would read as "no candidate is better", produced by a
+    // wiring error.  A wiring error is not a property of one candidate, it holds for the whole call, so
+    // the call refuses and says so (NOT_MEASURED: no comparison can be produced from it).
+    //
+    // THE GUARD THAT KEEPS IT FROM BACKFIRING.  "No tunable object for this shape" is NOT this error: a
+    // shape whose object is null or carries no stock bucket has nothing a row could serve, so a mismatch
+    // there is the expected state of the world and stays silent.  The two meanings of "empty" must not be
+    // merged -- the same rule the coverage accounting already carries ("an empty denominator is not a
+    // complete one").  Deliberately NOT used as the guard: re-listing the wired family pairs here, which
+    // would be a second copy of the table ggml_vk_tuned_row_targets owns (its answer grows with that
+    // table; a list here would not).
+    {
+        std::vector<vk_matmul_pipeline> cand_obj(n_cands, nullptr);
+        for (size_t i = 0; i < n_cands; i++) {
+            vk_matmul_pipeline t[2] = { nullptr, nullptr };
+            if (ggml_vk_tuned_row_targets(ctx->device, cands[i].src0_type, cands[i].src1_type, t) > 0) {
+                cand_obj[i] = f16acc ? t[0] : t[1];
+            }
+        }
+        for (uint32_t s = 0; s < params->nShapes; s++) {
+            const vk_matmul_pipeline want = shape_obj[s];
+            if (want == nullptr || want->is_empty()) {
+                continue;                                    // the guard: nothing tunable can serve this shape
+            }
+            for (uint32_t o = 0; o < params->nObjects; o++) {
+                if (params->objects[o].stock) {
+                    continue;                                // the anchor IS the shape's object by construction
+                }
+                if (pair_legal[(size_t) s * params->nObjects + o] == 0) {
+                    continue;                                // already excluded by the routing predicate
+                }
+                const uint32_t ci = params->objects[o].rowIndex;
+                if (cand_obj[ci] == want) {
+                    continue;
+                }
+                const vk_pipeline want_stock = ggml_vk_tuned_row_first_stock(want);
+                const vk_pipeline cand_stock = ggml_vk_tuned_row_first_stock(cand_obj[ci]);
+                return refuse(VK_TUNE_PROBE_NOT_MEASURED,
+                              "the candidate does not target the shape's object (R-13): shape "
+                              + std::to_string(s) + " runs in object "
+                              + (want_stock != nullptr ? want_stock->name : std::string("<empty>"))
+                              + ", but candidate " + std::to_string(ci) + " targets "
+                              + (cand_stock != nullptr ? cand_stock->name : std::string("<none>"))
+                              + " -- a row installed on that object is never looked up by this shape, so "
+                              "measuring them together would compare two different objects (this is a "
+                              "wiring error, not a slow candidate: the whole call is refused)");
+            }
+        }
     }
 
     // ---- the passes: warmupBlocks over every slot, then reps of them, rotating --------------------
