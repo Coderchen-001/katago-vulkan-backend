@@ -38,6 +38,15 @@
 
 #include <algorithm>
 #include <cmath>
+// 🔴 <cstdio> and <cstdlib> are here because this file USES what they declare -- fprintf/stderr at
+// seven sites and getenv at eleven -- and until now it got them by TRANSITIVE include only (this file
+// deliberately does not include global.h, so it has no such backstop).  The comment on faEnabled()
+// below even says "Char compare, no <cstring>", i.e. the author was thinking about which headers this
+// needs; the two that were actually missing are these.  Not a style change: a different standard
+// library version is free to stop re-exporting them through <fstream>/<memory>, and the failure mode is
+// a compile error on a machine we cannot reproduce.
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -170,8 +179,25 @@ struct OnnxToGgml {
   static bool faEnabled() {
     // fa-default (2026-09-02, fa-default-exec.md): ON by default; KATAGO_VK_FA=0
     // is the explicit opt-out (rollback channel). Char compare, no <cstring>.
-    const char* v = getenv("KATAGO_VK_FA");
-    static const bool e = (v == nullptr) || !(v[0] == '0' && v[1] == '\0');
+    //
+    // 🔴 2026-09-24: THE READ MOVED INSIDE THE static INITIALIZER, which fixes a BROKEN cache rather
+    // than a slow one.  It used to be:
+    //     const char* v = getenv("KATAGO_VK_FA");                      // runs on EVERY call
+    //     static const bool e = (v == nullptr) || !(v[0]=='0' && v[1]=='\0');   // runs ONCE
+    // so the value READ and the value USED came from different invocations.  The consequence is not
+    // mainly speed -- getenv is a cheap scan and this is called at graph-build time -- it is that the
+    // function is neither "the env is live" nor "the env is frozen": a later change to KATAGO_VK_FA
+    // takes effect on the next call, while the branch that USES the answer was decided by the first,
+    // which is exactly the kind of half-state this project refuses elsewhere.  The comment above always
+    // declared the intended semantics ("read once"); now the code has it.
+    //
+    // The call sites (four, all in graph construction) are deliberately left alone: freezing the other
+    // ten env reads in this file would CHANGE their semantics from "read at use" to "read at first use",
+    // and each of those would need its own justification.
+    static const bool e = [] {
+      const char* v = getenv("KATAGO_VK_FA");
+      return (v == nullptr) || !(v[0] == '0' && v[1] == '\0');
+    }();
     return e;
   }
 
