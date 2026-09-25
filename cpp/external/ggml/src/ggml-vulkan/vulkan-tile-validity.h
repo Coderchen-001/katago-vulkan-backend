@@ -199,6 +199,11 @@ struct vk_tune_probe_shape {
     uint32_t m;
     uint32_t n;
     uint32_t k;
+    // The FAMILY, and it is not decoration: the two tensors a block dispatches have types, and
+    // a row is keyed by (family, ...), so a shape without its family cannot be turned into a
+    // graph at all.  Same transcoded vk_tune_src_type numbers used elsewhere in this header.
+    int src0_type;
+    int src1_type;
 };
 
 // One measured pipeline.  `stock` means the backend's OWN choice for that shape -- the anchor every

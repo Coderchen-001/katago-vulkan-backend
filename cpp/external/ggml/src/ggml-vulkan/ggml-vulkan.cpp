@@ -21370,11 +21370,70 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
                       "nothing to measure and \"complete\" would be vacuous");
     }
 
+    // ---- 2c-a: the block graph, and whether it can be allocated at all --------------------------
+    // One graph per shape, holding `shots` INDEPENDENT matmul nodes, each writing its own dst tensor.
+    // Reusing one dst would make the backend place a barrier between them, which is the per-op-sync +
+    // cold-L2 regime this whole design exists to avoid (tune-measurement.md section 2.2) -- so the
+    // dsts are a per-block VRAM cost, and that cost is the only resource question in the primitive.
+    //
+    // It is answered by TRYING, never by reading a reported VRAM size: a numeric budget would be a
+    // per-device table in disguise, which section 2.6 forbids outright.  A failure here aborts the
+    // whole probe (class (c)) and says what did not fit, so the caller can retry with a smaller
+    // `shots` -- the min() of section 2.2 is the caller's half of exactly that.
+    ggml_init_params probe_iparams = {
+        /*.mem_size   =*/ (size_t) 16 * 1024 * 1024,   // metadata only: the tensors are device-allocated
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+
+    for (uint32_t s = 0; s < params->nShapes; s++) {
+        const uint32_t m = params->shapes[s].m;
+        const uint32_t n = params->shapes[s].n;
+        const uint32_t k = params->shapes[s].k;
+        if (m == 0 || n == 0 || k == 0) {
+            return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
+                          "shape " + std::to_string(s) + " has a zero dimension");
+        }
+        if (params->shapes[s].src0_type != VK_TUNE_SRC_F16 && params->shapes[s].src0_type != VK_TUNE_SRC_F32) {
+            return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
+                          "shape " + std::to_string(s) + " names a src0 type this protocol does not carry");
+        }
+
+        ggml_context * gctx = ggml_init(probe_iparams);
+        if (gctx == nullptr) {
+            return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION, "ggml_init failed for the probe graph");
+        }
+        ggml_tensor * p_src0 = ggml_new_tensor_3d(gctx, (ggml_type) params->shapes[s].src0_type, k, m, 1);
+        ggml_tensor * p_src1 = ggml_new_tensor_3d(gctx, (ggml_type) params->shapes[s].src1_type, k, n, 1);
+        ggml_cgraph * p_graph = ggml_new_graph(gctx);
+        for (uint32_t i = 0; i < params->shots; i++) {
+            // A distinct node AND a distinct dst: that is what makes the `shots` dispatches overlap
+            // instead of serialising on one accumulator.
+            ggml_tensor * out = ggml_mul_mat(gctx, p_src0, p_src1);
+            ggml_build_forward_expand(p_graph, out);
+        }
+
+        ggml_backend_buffer_t p_buf = ggml_backend_alloc_ctx_tensors(gctx, backend);
+        if (p_buf == nullptr) {
+            ggml_free(gctx);
+            return refuse(VK_TUNE_PROBE_NOT_MEASURED,
+                          "the block graph for shape " + std::to_string(s) + " (" + std::to_string(m)
+                          + "x" + std::to_string(n) + "x" + std::to_string(k) + ", shots="
+                          + std::to_string(params->shots) + ") could not be allocated: the destination "
+                          "tensors a block needs do not fit, so this shape cannot be measured");
+        }
+        // No block has been measured yet in this cut, so release immediately rather than holding
+        // device memory for a shape we cannot yet time.  The timing cut is what makes the graph worth
+        // keeping alive.
+        ggml_backend_buffer_free(p_buf);
+        ggml_free(gctx);
+    }
+
     // ---- the measurement itself (W4e, next cut) -------------------------------------------------
-    // The window is open.  The block loop -- own warmup + R blocks, one graph_compute + synchronize
-    // each, objects rotated per block, the amplitude-band spike count -- is NOT implemented yet, and
-    // refusing here is the only honest answer: returning samples this process never took would be
-    // read by the judgement layer as evidence.
+    // The window is open and the graphs allocate.  The block loop -- own warmup + R blocks, one
+    // graph_compute + synchronize each, objects rotated per block, the amplitude-band spike count --
+    // is NOT implemented yet, and refusing here is the only honest answer: returning samples this
+    // process never took would be read by the judgement layer as evidence.
     return refuse(VK_TUNE_PROBE_NOT_MEASURED,
                   "the interference window is open, but the block loop is not implemented in this "
                   "build: refusing rather than returning samples this process never took");
