@@ -2398,6 +2398,9 @@ struct vk_t2_stats {
     bool selftest_done = false;
     bool mm_tile_ignored_logged = false;   // S2': "env override ignored" warning, once per context
     std::map<std::string, bool> dispatch_geom_logged;   // item 12: one-shot k_arg/kpad proof
+    // W4e wiring item (1): which exit ggml_vk_mul_mat took, one line per real geometry.
+    std::map<std::string, bool> mul_mat_exit_logged;
+    bool mul_mat_exit_capped = false;
     bool pr_recording_logged = false;   // item 10: first pr_recording transition, once per context
 };
 static bool vk_enable_sync_logger = false;
@@ -10084,6 +10087,53 @@ static void ggml_vk_t2_log_tuned_row(ggml_backend_vk_context * ctx, const vk_mat
                     + " k=" + std::to_string(k) + " (applied)");
 }
 
+// W4e wiring item (1): WHICH exit ggml_vk_mul_mat took, per real geometry.  Diagnostics only (bit 8).
+//
+// WHY THIS EXISTS.  The coverage set excludes the shapes the dispatcher sends down the mat-vec / dmmv
+// path, because the row table -- and with it the probe's override -- lives on the matmul side only
+// (ggml-vulkan.cpp:11927 vs :11929).  That exclusion was written from the DISPATCH CONDITION, and the
+// condition carries a BATCH term (`src1->ne[2]*src1->ne[3] == 1`) that no list of (m,n,k) can see.  So
+// the honest question is not "which shapes are small" but "which exit does each real geometry take",
+// and this line is that reading rather than an argument about it.
+//
+// WHY DEDUPED PER (exit, m, n, k, batch).  What is wanted is the SHAPE SET, not the dispatch count: a
+// per-dispatch log lets the highest-frequency shape drown the tail, and the tail is the whole point
+// (one shape that takes the row-less exit is one shape outside the tuner's reach).  `batch` travels
+// WITH the geometry because it is the term the exclusion turns on, so "did this shape hit the batch
+// clause" is readable from the line itself instead of being recomputed by whoever reads it.
+//
+// WHY IT IS SILENT WITH NO DECLARED SET.  It reuses the used-side coverage leg's guard 1
+// (ggml_vk_tuned_row_note_used): with no rows declared there is no coverage set to judge, and an
+// unconditional per-geometry record would print in every run -- a resident log, not a reading.  The
+// consequence is stated rather than implied: the reading comes from a run that installs a row file.
+//
+// The cap REPORTS, unlike the item-12 geometry log whose 32 sits above any real count: six exits times
+// the model's distinct shapes can exceed a small cap, and a truncation that prints nothing is the
+// lossy-silent shape this project forbids (the R16 lesson).
+static void ggml_vk_t2_log_mul_mat_exit(ggml_backend_vk_context * ctx, const char * exit_name,
+                                        uint32_t m, uint32_t n, uint32_t k, int64_t batch) {
+    if (!vk_t2_on(8u) || ctx->coverage.declared.empty()) {
+        return;
+    }
+    const std::string key = std::string(exit_name)
+                          + "|m=" + std::to_string(m) + "|n=" + std::to_string(n)
+                          + "|k=" + std::to_string(k) + "|batch=" + std::to_string(batch);
+    if (ctx->t2.mul_mat_exit_logged.find(key) != ctx->t2.mul_mat_exit_logged.end()) {
+        return;
+    }
+    if (ctx->t2.mul_mat_exit_logged.size() >= 128) {
+        if (!ctx->t2.mul_mat_exit_capped) {
+            ctx->t2.mul_mat_exit_capped = true;
+            ggml_vk_t2_line("mul_mat exit: further distinct (exit,m,n,k,batch) suppressed (cap 128)");
+        }
+        return;
+    }
+    ctx->t2.mul_mat_exit_logged[key] = true;
+    ggml_vk_t2_line("mul_mat exit: " + std::string(exit_name)
+                    + " m=" + std::to_string(m) + " n=" + std::to_string(n)
+                    + " k=" + std::to_string(k) + " batch=" + std::to_string(batch));
+}
+
 // The invariants a candidate row must satisfy before it is installed.  Returns nullptr
 // when the row may be installed, otherwise a reason string the loader must print loudly
 // before refusing -- never install a row that fails this, and never fail silently.
@@ -11872,6 +11922,12 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
     ggml_tensor * src1 = dst->src[1];
     VK_LOG_DEBUG("ggml_vk_mul_mat(" << src0 << ", " << src1 << ", " << dst << ")");
 
+    // W4e wiring item (1): the exit this dispatch takes, named after the CALLEE it lands on --
+    // "q_f16" is the row-table side, every "vec_*" is a row-less side.  "unset" is not expected
+    // (the chain ends in an else) and exists so that a future path added without a label fails
+    // VISIBLY in the reading instead of becoming a null dereference.
+    const char * exit_name = "unset";
+
     // Handle huge A matrix by splitting the M dimensions. This works well for convolution use cases
     // where the M dimension is very large.
     // Split_k doesn't work with M splitting.
@@ -11879,6 +11935,7 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
     const size_t nbytes = ggml_nbytes(src0);
     const bool needs_split = dst->ne[2] == 1 && dst->ne[3] == 1 && nbytes > ctx->device->properties.limits.maxStorageBufferRange;
     if (needs_split) {
+        exit_name = "q_f16_split_m";   // per-M-slice calls, still into the row-table side
         // Choose the number of rows that can fit (and divide by two, to allow for any additional offsets)
         const uint32_t M_split = ctx->device->properties.limits.maxStorageBufferRange / (2 * src0->nb[1]);
         uint32_t m_offset = 0;
@@ -11900,6 +11957,7 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
             m_offset += cur_M_size;
         }
     } else if (ggml_vk_can_use_fwht(ctx, src1, dst)) {
+        exit_name = "fwht";
         ggml_vk_fwht(ctx, subctx, src1, dst);
     } else if (src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && dst->ne[1] == 1 &&
         // detect 0213 permutation, and batch size of 1
@@ -11913,21 +11971,30 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
         src1->ne[3] == 1 &&
         src0->ne[1] <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
         src1->ne[2] <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]) {
+        exit_name = "vec_p021";
         ggml_vk_mul_mat_vec_p021_f16_f32(ctx, subctx, cgraph, node_idx);
     } else if (src0->type == GGML_TYPE_F16 && !ggml_is_contiguous(src0) && !ggml_is_transposed(src1) && dst->ne[1] == 1 &&
                !ggml_is_permuted(src0) && !ggml_is_permuted(src1) &&
                src0->ne[3] <= ctx->device->properties.limits.maxComputeWorkGroupCount[0] &&
                src0->ne[1] <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
                src1->ne[2] <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]) {
+        exit_name = "vec_nc";
         ggml_vk_mul_mat_vec_nc_f16_f32(ctx, subctx, cgraph, node_idx);
     // mul_mat_vec supports batching ne12*ne13 when ne11==1, or treating ne11 as the batch size (up to four)
     // when ne12 and ne13 are one.
     } else if ((dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1)) &&
                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type))) {
+        exit_name = "vec_q_f16";   // the ROW-LESS exit the coverage set excludes shapes for
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
     } else {
+        exit_name = "q_f16";   // the row-table side: the resolver runs inside this callee
         ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false);
     }
+
+    // W4e wiring item (1): the reading.  m/n/k are the SAME definitions the row-table side uses
+    // (ne01/ne11/ne10), so this line and the item-12 geometry line stay comparable field by field.
+    ggml_vk_t2_log_mul_mat_exit(ctx, exit_name, (uint32_t) src0->ne[1], (uint32_t) src1->ne[1],
+                               (uint32_t) src1->ne[0], (int64_t) (src1->ne[2] * src1->ne[3]));
 }
 
 static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
