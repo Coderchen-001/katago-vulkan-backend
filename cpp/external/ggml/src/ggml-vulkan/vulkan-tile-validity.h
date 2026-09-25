@@ -244,6 +244,14 @@ struct vk_tune_probe_result {
     uint32_t objects;
     uint32_t blocks;         // blocks actually timed (warmup excluded)
     uint32_t samples;        // paired samples written into the caller's buffer
+    // The DENOMINATOR, decided by the same predicate the production lookup uses
+    // (ggml_vk_tuned_row_matches): a (shape, candidate) pair whose routing key does not serve
+    // that shape is NOT an error and NOT a refusal -- the row simply would never be picked for
+    // it, so measuring it there would report another pipeline's number.  Such a pair enters
+    // neither the measurement nor the denominator, and an empty denominator must never be read
+    // as "complete" (tune-measurement.md section 2.6).
+    uint32_t pairs_legal;
+    uint32_t pairs_illegal;
     uint32_t spikes;         // blocks the amplitude-band detector marked
     uint32_t dropped_too_slow;
     uint32_t dropped_build_failed;

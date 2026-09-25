@@ -21307,6 +21307,69 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
                       "changes what a block IS");
     }
 
+    // ---- the anchor, then the legal-pair accounting (tune-measurement.md section 2.6) -----------
+    // The anchor first, because without it no paired difference means anything: `stock` is what every
+    // candidate is compared against inside one rep.
+    bool have_stock = false;
+    for (uint32_t o = 0; o < params->nObjects; o++) {
+        if (params->objects[o].stock) {
+            have_stock = true;
+            break;
+        }
+    }
+    if (!have_stock) {
+        return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
+                      "no stock object: a paired difference needs the stock anchor in the same rep");
+    }
+
+    // "Legal" is decided by the SAME predicate the production lookup uses, so a pair this code calls
+    // legal is exactly a pair the dispatcher would serve -- and a pair it calls illegal is one the row
+    // would never be picked for.  Illegal pairs are counted and skipped, not refused: refusing the
+    // whole call would turn "this row does not serve this shape" into "the machine cannot be tuned".
+    uint32_t pairs_legal = 0;
+    uint32_t pairs_illegal = 0;
+    for (uint32_t s = 0; s < params->nShapes; s++) {
+        const uint32_t m = params->shapes[s].m;
+        const uint32_t k = params->shapes[s].k;
+        for (uint32_t o = 0; o < params->nObjects; o++) {
+            const vk_tune_probe_object & obj = params->objects[o];
+            if (obj.stock) {
+                pairs_legal++;
+                continue;
+            }
+            if (obj.rowIndex >= n_cands) {
+                return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
+                              "object " + std::to_string(o) + " names candidate "
+                              + std::to_string(obj.rowIndex) + " but only " + std::to_string(n_cands)
+                              + " candidate(s) were passed");
+            }
+            // A temporary row carrying ONLY the routing key.  The predicate reads nothing else, so
+            // this is the production rule rather than a second copy of it -- the pipelines are built
+            // later, and only for the pairs that actually get measured.
+            vk_tuned_row key_only {};
+            key_only.src0_type = (ggml_type) cands[obj.rowIndex].src0_type;
+            key_only.src1_type = (ggml_type) cands[obj.rowIndex].src1_type;
+            key_only.key_m = cands[obj.rowIndex].key_m;
+            key_only.key_k = cands[obj.rowIndex].key_k;
+            if (ggml_vk_tuned_row_matches(key_only, m, k)) {
+                pairs_legal++;
+            } else {
+                pairs_illegal++;
+            }
+        }
+    }
+    if (result != nullptr) {
+        result->pairs_legal = pairs_legal;
+        result->pairs_illegal = pairs_illegal;
+    }
+    if (pairs_legal == 0) {
+        // An empty denominator must never be read as "complete": a claim that passes on empty
+        // evidence is the shape this project has paid for more than once (section 2.6's C3).
+        return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
+                      "no legal pair: every (shape, object) combination is excluded, so there is "
+                      "nothing to measure and \"complete\" would be vacuous");
+    }
+
     // ---- the measurement itself (W4e, next cut) -------------------------------------------------
     // The window is open.  The block loop -- own warmup + R blocks, one graph_compute + synchronize
     // each, objects rotated per block, the amplitude-band spike count -- is NOT implemented yet, and
