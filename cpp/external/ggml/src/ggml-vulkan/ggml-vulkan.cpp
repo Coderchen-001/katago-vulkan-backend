@@ -2717,6 +2717,15 @@ struct ggml_backend_vk_context {
     // Null means "not measuring", i.e. every production path.  The override is read in the SAME
     // resolver the rows are read in, which is what keeps "the pipeline a block measured" and "the
     // pipeline that takes effect" from becoming two decisions (tune-measurement.md section 2.6 K1).
+    // W4e leg (R-12): the ONE thing that proves a timed block really dispatched through the override.
+    // It is incremented WHERE THE OVERRIDE IS READ (the one resolver), so "the block ran this
+    // candidate's pipeline" is measured instead of inferred from the timing: a block that quietly fell
+    // back to stock would otherwise be reported as the candidate's number, and the A/A sentinel would
+    // look perfect for exactly the wrong reason.  No production path sets the override, so this counter
+    // stays 0 there.  The exact MULTIPLICITY is deliberately not a contract: the align probe calls back
+    // into the same resolver, so the probe requires > 0 per candidate block and == 0 per anchor block
+    // instead of asserting a call count that an unrelated refactor could halve.
+    uint64_t probe_override_hits {};
     vk_pipeline probe_override_pipeline {};
     bool pr_recorded {};    // cache ready: subsequent evals replay
     // Multi-segment replay cache: the graph may be recorded as several command
@@ -10454,6 +10463,7 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
     // resolver -- so that a block's pipeline and the dispatched pipeline cannot be two decisions.
     // Every production path leaves this null.
     if (ctx->probe_override_pipeline != nullptr) {
+        ctx->probe_override_hits++;   // W4e leg: "the block really ran the measured pipeline"
         return ctx->probe_override_pipeline;
     }
 
@@ -21271,6 +21281,17 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
         // reps is the DECLARED budget (never adjusted by looking at the data); warmup is per object.
         return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION, "reps or warmupBlocks is 0");
     }
+    if (params->stallBlocks == 0) {
+        // W4e leg (R-12): `stallBlocks` is the no-progress window, and 0 would mean "a stall may
+        // never be declared" -- i.e. the backstop for a device that accepts the submission and never
+        // finishes is switched OFF by an argument.  A field whose only job is to bound a detector is
+        // exactly the kind that otherwise reaches production with nobody checking it, so the value is
+        // refused here rather than trusted.
+        return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
+                      "stallBlocks is 0: the stall detector would be switched off, and a device that "
+                      "accepts the submission without finishing it would hang the process instead of "
+                      "being cut off");
+    }
     if (n_cands > 0 && cands == nullptr) {
         return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION, "candidate array is null but nCands > 0");
     }
@@ -21281,10 +21302,17 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
     }
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
-    if (ctx->pr_recording) {
+    // `pr_recorded` is here as well as `pr_recording`, and it is not redundant: with a recording CACHED
+    // the replay branch returns SUCCESS without dispatching a single node, so a candidate block would
+    // time an empty submission and an ANCHOR block would time it too (hits == 0 is legal for an anchor,
+    // so the leg above would not catch it).  pr_evals != 0 implies both, but naming the state the
+    // probe actually depends on is what keeps this check true if the state machine ever moves.
+    if (ctx->pr_recording || ctx->pr_recorded) {
         return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
-                      "pr_recording is already set: the replay branch would skip the measurement and "
-                      "record the probe's blocks into the user's graph");
+                      "pr_recording is already set, or a recording is cached for replay: the replay "
+                      "branch returns SUCCESS without dispatching anything, so a timed block would be "
+                      "a submission that did nothing -- and a RECORDING one would write the probe's "
+                      "blocks into the user's graph");
     }
     if (ctx->pr_evals != 0) {
         return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
@@ -21322,6 +21350,77 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
                       "no stock object: a paired difference needs the stock anchor in the same rep");
     }
 
+    // ---- 2c-b: what the probe needs before it can time anything --------------------------------
+    // Three things, and each closes a way for "the number measured" to differ from "the number that
+    // takes effect" (tune-measurement.md section 2.6's K1).
+
+    // (a) The accumulator variant.  KATAGO_VK_MMPREC_F32 rewrites the USER graph's mul_mat nodes to
+    // GGML_PREC_F32, and the acc variant is part of which pipeline object a row lives on.  The probe's
+    // own nodes are built below at GGML_PREC_DEFAULT, so under a forced precision it would measure the
+    // f16acc pipeline while production dispatches the f32acc one.  Same shape of gap as the MM_TILE
+    // check above, so it fails closed the same way.  Measuring a forced precision needs the OBJECT to
+    // declare its acc variant, which this protocol does not carry yet: that is a recorded gap, not an
+    // impossibility, and it must not be papered over by measuring the wrong variant quietly.
+    if (getenv("KATAGO_VK_MMPREC_F32") != nullptr) {
+        return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
+                      "KATAGO_VK_MMPREC_F32 is set: it rewrites the user graph's mul_mat nodes to "
+                      "GGML_PREC_F32, so production would dispatch the f32acc pipeline while the probe's "
+                      "own nodes stay at GGML_PREC_DEFAULT: the number measured would not be the number "
+                      "that takes effect");
+    }
+
+    // (b) The anchor must really be the anchor.  A row already installed in this context is what the
+    // dispatcher serves for that shape, so a `stock` block would measure a TUNED row -- and a stock
+    // object is precisely the one object the probe does not override, so nothing else would catch it.
+    // The probe runs before the shell's first install (that ordering is the design, section 2.4), so
+    // this is a check rather than a hope.
+    {
+        size_t rows_installed = 0;
+        for (const auto & kv : ctx->tuned.rows) {
+            rows_installed += kv.second.size();
+        }
+        if (rows_installed != 0) {
+            return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
+                          "this context already carries " + std::to_string(rows_installed)
+                          + " installed tuned row(s): the stock anchor would resolve to one of THEM, "
+                          "so every paired difference would be taken against a candidate");
+        }
+    }
+
+    // (c) The candidates themselves, BEFORE anything is built.  ggml_vk_tuned_row_build does not
+    // validate a geometry -- it assembles the spec and hands it to the driver -- and the install path
+    // deliberately validates FIRST (the shared geometry predicate, then the build).  The probe must not
+    // be the one caller that skips that step: it builds pipelines the install path may never see, on the
+    // same device, and an illegal geometry is a driver abort rather than a slow kernel (the
+    // STATUS_INTEGER_DIVIDE_BY_ZERO note in vulkan-tile-validity.h is the measurement behind that).
+    //
+    // A malformed candidate REFUSES the call instead of being dropped from the comparison: a dropped
+    // candidate would silently shrink the set the judgement layer compares, and the missing entry
+    // would be read as a verdict rather than as a gap (the empty-denominator shape).  It cannot arrive
+    // by accident either: these candidates come from the SAME table the install path validates
+    // against, so an illegal one is an enumerator bug, which the shared header's own precedent says
+    // must be loud rather than absorbed.
+    for (size_t i = 0; i < n_cands; i++) {
+        const vk_tune_row_spec & c = cands[i];
+        if (const char * why = vk_tune_row_family_reason(c.src0_type, c.src1_type, c.path)) {
+            return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
+                          "candidate " + std::to_string(i) + " is not a wired (family, path): " + why);
+        }
+        // The wave and the predicate are on ONE line on purpose: the wave census (R21/R23 in
+        // t3-guardrails.py) classifies a site by whether the predicate and its wave sit in the same
+        // statement, and a site it cannot classify is reported as an unjudgeable wave source rather
+        // than as a new one.  Both other callers (the custom tile probe, the install path) do the same.
+        if (const char * why = vk_tile_candidate_reason(c.path, c.geom, vk_tile_wave_for(ctx->device->subgroup_size))) {
+            return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
+                          "candidate " + std::to_string(i) + " has an illegal geometry: " + why);
+        }
+    }
+
+    // Which (shape, object) pairs survive the routing predicate, RECORDED rather than re-derived: the
+    // timing loop below must skip exactly what the accounting excluded, and calling the same predicate
+    // a second time is how one rule becomes two.
+    std::vector<unsigned char> pair_legal((size_t) params->nShapes * params->nObjects, 0);
+
     // "Legal" is decided by the SAME predicate the production lookup uses, so a pair this code calls
     // legal is exactly a pair the dispatcher would serve -- and a pair it calls illegal is one the row
     // would never be picked for.  Illegal pairs are counted and skipped, not refused: refusing the
@@ -21334,6 +21433,7 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
         for (uint32_t o = 0; o < params->nObjects; o++) {
             const vk_tune_probe_object & obj = params->objects[o];
             if (obj.stock) {
+                pair_legal[(size_t) s * params->nObjects + o] = 1;
                 pairs_legal++;
                 continue;
             }
@@ -21352,6 +21452,7 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
             key_only.key_m = cands[obj.rowIndex].key_m;
             key_only.key_k = cands[obj.rowIndex].key_k;
             if (ggml_vk_tuned_row_matches(key_only, m, k)) {
+                pair_legal[(size_t) s * params->nObjects + o] = 1;
                 pairs_legal++;
             } else {
                 pairs_illegal++;
@@ -21370,21 +21471,112 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
                       "nothing to measure and \"complete\" would be vacuous");
     }
 
-    // ---- 2c-a: the block graph, and whether it can be allocated at all --------------------------
-    // One graph per shape, holding `shots` INDEPENDENT matmul nodes, each writing its own dst tensor.
-    // Reusing one dst would make the backend place a barrier between them, which is the per-op-sync +
-    // cold-L2 regime this whole design exists to avoid (tune-measurement.md section 2.2) -- so the
-    // dsts are a per-block VRAM cost, and that cost is the only resource question in the primitive.
+    // ---- 2c-b: the candidate pipelines, then ONE timed block per legal pair ---------------------
+    //
+    // What this cut DOES establish, stated rather than implied -- the two mechanisms the whole
+    // measurement rests on are built and exercised end to end:
+    //
+    //   * a candidate's pipeline is created by the SAME builder the install path uses
+    //     (ggml_vk_tuned_row_build), so a measured number and an installed row cannot come to describe
+    //     two different pipelines;
+    //   * a block is ONE ggml_backend_graph_compute plus ONE synchronize, timed by WALL CLOCK around
+    //     both (tune-measurement.md section 2.2).  Timing the submit alone would measure the queue
+    //     hand-off instead of the work, because the async entry returns while the GPU is still busy.
+    //
+    // What it does NOT establish: any READING.  One block per pair is COLD, and the plan's t_block_hot
+    // is a median over the hot blocks and never the first one -- so the numbers below are printed as
+    // mechanism evidence and are NOT handed to the judgement layer.  The rep loop that turns blocks
+    // into paired samples is the next cut; until it exists this function keeps refusing with
+    // NOT_MEASURED rather than return a difference taken from a single cold block.
+
+    // The accumulator variant, read from the ONE predicate the family selector uses, and paired with
+    // the prec written into every dst below: those two must be the same fact, which is why the prec is
+    // written explicitly instead of being left at whatever ggml_mul_mat defaults to.
+    const ggml_prec probe_prec = GGML_PREC_DEFAULT;
+    const bool f16acc = ggml_vk_prefers_f16acc(ctx->device, probe_prec);
+
+    // ONE pipeline per (candidate, variant) that some object asks for, MEMOISED: the A/A sentinel is
+    // two objects pointing at the same pipeline on purpose, so building it twice would give the
+    // sentinel two pipelines that are merely equal in intent (and compile the same shader twice).
+    // Cost note: this build happens once per probe call, outside every timed region by design -- it is
+    // shader creation, not measurement, and folding it into a block would charge the driver compile to
+    // whichever object happened to be first.
+    std::vector<vk_pipeline> obj_pipe(params->nObjects, nullptr);
+    std::vector<unsigned char> obj_pipe_ok(params->nObjects, 0);
+    uint32_t build_failed = 0;
+    for (uint32_t o = 0; o < params->nObjects; o++) {
+        const vk_tune_probe_object & obj = params->objects[o];
+        if (obj.stock) {
+            continue;   // the anchor is whatever the dispatcher picks once the override is clear
+        }
+        // obj.rowIndex was bounds-checked by the pair accounting above, which runs before this loop.
+        bool shared = false;
+        for (uint32_t prev = 0; prev < o; prev++) {
+            if (params->objects[prev].stock) {
+                continue;
+            }
+            if (params->objects[prev].rowIndex == obj.rowIndex
+                && params->objects[prev].aligned == obj.aligned) {
+                obj_pipe[o] = obj_pipe[prev];
+                obj_pipe_ok[o] = obj_pipe_ok[prev];
+                shared = true;
+                break;
+            }
+        }
+        if (shared) {
+            continue;
+        }
+        vk_pipeline built = nullptr;
+        std::string why;
+        if (!ggml_vk_tuned_row_build(ctx->device, cands[obj.rowIndex], f16acc, obj.aligned, built, why)) {
+            // NO fallback to the other variant: the object DECLARED which variant it is, and measuring
+            // the other one would report a pipeline the caller did not ask about.  The install path's
+            // fallback exists to keep a ROW usable, which is a different question.
+            build_failed++;
+            ggml_vk_t3_line("probe: candidate " + std::to_string(obj.rowIndex) + " ("
+                            + (obj.aligned ? "aligned" : "unaligned") + ") not built: " + why);
+            continue;
+        }
+        obj_pipe[o] = built;
+        obj_pipe_ok[o] = 1;
+    }
+
+    // The override guard.  Same-in-same-out lives in a DESTRUCTOR on purpose:
+    // ggml_backend_graph_compute is a vk:: call underneath and can throw, and a residue here would
+    // silently re-route every later graph of the USER onto a probe pipeline -- a performance change
+    // with no line anywhere to explain it.
+    struct override_guard {
+        ggml_backend_vk_context * ctx;
+        vk_pipeline prev;
+        uint64_t hits_before;
+        override_guard(ggml_backend_vk_context * c, vk_pipeline p)
+            : ctx(c), prev(c->probe_override_pipeline), hits_before(c->probe_override_hits) {
+            ctx->probe_override_pipeline = p;
+        }
+        uint64_t hits() const { return ctx->probe_override_hits - hits_before; }
+        ~override_guard() {
+            ctx->probe_override_pipeline = prev;
+        }
+    };
+
+    // The block graph, and whether it can be allocated at all.  One graph per shape, holding `shots`
+    // INDEPENDENT matmul nodes, each writing its own dst tensor: reusing one dst would make the backend
+    // place a barrier between them, which is the per-op-sync + cold-L2 regime this design exists to
+    // avoid (tune-measurement.md section 2.2), so the dsts are the block's VRAM cost and that cost is
+    // the only resource question in the primitive.
     //
     // It is answered by TRYING, never by reading a reported VRAM size: a numeric budget would be a
-    // per-device table in disguise, which section 2.6 forbids outright.  A failure here aborts the
-    // whole probe (class (c)) and says what did not fit, so the caller can retry with a smaller
-    // `shots` -- the min() of section 2.2 is the caller's half of exactly that.
+    // per-device table in disguise, which section 2.6 forbids outright.  A failure aborts the probe
+    // (class (c)) and says what did not fit, so the caller can retry with a smaller `shots` -- the
+    // min() of section 2.2 is the caller's half of exactly that.
     ggml_init_params probe_iparams = {
         /*.mem_size   =*/ (size_t) 16 * 1024 * 1024,   // metadata only: the tensors are device-allocated
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
+
+    uint32_t blocks_timed = 0;
+    uint64_t elapsed_us_total = 0;
 
     for (uint32_t s = 0; s < params->nShapes; s++) {
         const uint32_t m = params->shapes[s].m;
@@ -21410,6 +21602,10 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
             // A distinct node AND a distinct dst: that is what makes the `shots` dispatches overlap
             // instead of serialising on one accumulator.
             ggml_tensor * out = ggml_mul_mat(gctx, p_src0, p_src1);
+            // The prec this block runs at, written from the SAME constant the acc variant above was
+            // read with: a node whose op_params[0] disagreed with f16acc would be measuring one variant
+            // through the machinery of the other.
+            ggml_mul_mat_set_prec(out, probe_prec);
             ggml_build_forward_expand(p_graph, out);
         }
 
@@ -21422,21 +21618,102 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
                           + std::to_string(params->shots) + ") could not be allocated: the destination "
                           "tensors a block needs do not fit, so this shape cannot be measured");
         }
-        // No block has been measured yet in this cut, so release immediately rather than holding
-        // device memory for a shape we cannot yet time.  The timing cut is what makes the graph worth
-        // keeping alive.
-        ggml_backend_buffer_free(p_buf);
-        ggml_free(gctx);
+        {
+            // RAII, and it also BOUNDS the probe's footprint: only ONE shape's graphs are alive at a
+            // time, so the per-block VRAM question (shots x m*n x 4) is asked of the heaviest SHAPE
+            // rather than of the sum over the covered set -- which is what the accumulated
+            // try-allocate callers are told to respect.  Declared inside the loop so every early
+            // return below frees the block it was holding.
+            struct shape_guard {
+                ggml_context * gctx = nullptr;
+                ggml_backend_buffer_t buf = nullptr;
+                ~shape_guard() {
+                    if (buf != nullptr) {
+                        ggml_backend_buffer_free(buf);
+                    }
+                    ggml_free(gctx);
+                }
+            };
+            shape_guard sg;
+            sg.gctx = gctx;
+            sg.buf = p_buf;
+
+            for (uint32_t o = 0; o < params->nObjects; o++) {
+                const vk_tune_probe_object & obj = params->objects[o];
+                if (pair_legal[(size_t) s * params->nObjects + o] == 0) {
+                    continue;   // the row would never be picked for this shape (already counted)
+                }
+                if (!obj.stock && obj_pipe_ok[o] == 0) {
+                    continue;   // no pipeline to run; counted as a build failure above
+                }
+
+                const override_guard og(ctx, obj.stock ? nullptr : obj_pipe[o]);
+                // steady_clock, not high_resolution_clock: the latter is system_clock on some
+                // standard libraries, and a wall-clock jump in the middle of a block would enter the
+                // sample set as a spike that no envelope generator could attribute.
+                const auto t0 = std::chrono::steady_clock::now();
+                const ggml_status gst = ggml_backend_graph_compute(backend, p_graph);
+                ggml_backend_synchronize(backend);
+                const auto t1 = std::chrono::steady_clock::now();
+
+                if (gst != GGML_STATUS_SUCCESS) {
+                    return refuse(VK_TUNE_PROBE_NOT_MEASURED,
+                                  "the block for shape " + std::to_string(s) + " object "
+                                  + std::to_string(o) + " did not compute (status "
+                                  + std::to_string((int) gst) + "): a failed submission must not be "
+                                  "timed as a block");
+                }
+                const uint64_t dt_us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                                           t1 - t0).count();
+                const uint64_t hits = og.hits();
+                if (!obj.stock && hits == 0) {
+                    // The override was installed and the block ran, but the resolver never returned
+                    // it: whatever was timed, it was not this candidate's pipeline.  Fail-closed -- a
+                    // number attributed to the wrong pipeline is worse than no number at all.
+                    return refuse(VK_TUNE_PROBE_NOT_MEASURED,
+                                  "the block for shape " + std::to_string(s) + " object "
+                                  + std::to_string(o) + " never dispatched the measured pipeline (the "
+                                  "override was not consumed), so its timing would describe a "
+                                  "different pipeline");
+                }
+                if (obj.stock && hits != 0) {
+                    return refuse(VK_TUNE_PROBE_NOT_MEASURED,
+                                  "the anchor block for shape " + std::to_string(s) + " dispatched the "
+                                  "probe's override: the anchor is not stock, so no difference taken "
+                                  "against it would mean anything");
+                }
+
+                blocks_timed++;
+                elapsed_us_total += dt_us;
+                ggml_vk_t3_line("probe block: shape=" + std::to_string(s) + " (" + std::to_string(m)
+                                + "x" + std::to_string(n) + "x" + std::to_string(k) + ") object="
+                                + std::to_string(o)
+                                + (obj.stock ? std::string(" stock")
+                                             : (" cand#" + std::to_string(obj.rowIndex)
+                                                + (obj.aligned ? " aligned" : " unaligned")))
+                                + " shots=" + std::to_string(params->shots) + " us="
+                                + std::to_string(dt_us) + " override_hits=" + std::to_string(hits));
+            }
+        }
     }
 
-    // ---- the measurement itself (W4e, next cut) -------------------------------------------------
-    // The window is open and the graphs allocate.  The block loop -- own warmup + R blocks, one
-    // graph_compute + synchronize each, objects rotated per block, the amplitude-band spike count --
-    // is NOT implemented yet, and refusing here is the only honest answer: returning samples this
-    // process never took would be read by the judgement layer as evidence.
+    if (result != nullptr) {
+        result->blocks = blocks_timed;
+        result->elapsed_us = elapsed_us_total;
+        result->dropped_build_failed = build_failed;
+    }
+
+    // NOT_MEASURED, and the message says exactly what DID happen.  "The mechanism ran" and "there is a
+    // reading" are two different claims, and this is the line that keeps them apart: the block count
+    // and the elapsed time are facts about this process, while the sample count is 0 because the rep
+    // loop does not exist yet.  Handing the judgement layer cold single-block times would make it
+    // report a decision built on samples nobody took.
     return refuse(VK_TUNE_PROBE_NOT_MEASURED,
-                  "the interference window is open, but the block loop is not implemented in this "
-                  "build: refusing rather than returning samples this process never took");
+                  "the block submit-and-time mechanism ran (" + std::to_string(blocks_timed)
+                  + " block(s) timed, " + std::to_string(build_failed) + " candidate pipeline(s) not "
+                  "built, " + std::to_string(elapsed_us_total) + " us total), but the rep loop that "
+                  "turns blocks into paired samples is not implemented in this build: 0 samples were "
+                  "written, so there is no comparison to read");
 }
 
 // Install a row set into ONE backend context.  Called by the shell once per context,
