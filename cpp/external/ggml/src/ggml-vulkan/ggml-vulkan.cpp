@@ -20793,16 +20793,12 @@ static const vk_tuned_row_capability_class VK_TUNE_CAPABILITY_CLASSES[] = {
     { "row sets RESHAPE, which is not row-overridable: it selects which shared-memory "
       "index formula is compiled in, and a wrong driver fold there is a driver fault "
       "(not a wrong value) that the sizing and precision gates cannot see", true },
-    // 2026-09-24 (item 4).  The E1 driver boundary, as the install firewall's own class.  OUR GAP,
-    // deliberately: the hang is a measured fact about a configuration WE made reachable by opening an
-    // upstream constant into a row-settable axis, so it is a decision about what we expose, not a
-    // capability of the device.  Classifying it as a device verdict would let a machine that merely
-    // met one bad row write down a durable "this device cannot do cm1".  The STRING is not
-    // duplicated here: it is vk_tile_e1_blacklist_reason() (vulkan-tile-validity.h), shared with the
-    // shell's rule table.
-    { "WM == 16 && WN == 16 && BS >= 256, which hung the driver (E1: t1-predicate.md:136); "
-      "the custom: parser admits it, this geometry is not row-overridable, and the boundary "
-      "needs the device's wave so the device-free predicate cannot state it", true },
+    // 🔴 2026-09-25: an E1 class row stood here and was REMOVED with the install-path clause it
+    // classified.  The rule's carrier is the shell's candidate table, per `t1-predicate.md:138` ("not in
+    // the predicate" => "laid down as candidate-table ruling DATA", direction MUST); this table is the
+    // INSTALL firewall's vocabulary, and E1 was never part of it in the plan.  Removing the row is safe
+    // because the census runs one way: `ggml_vk_tuned_row_capability_is_our_gap` looks up the reasons
+    // the firewall RETURNS, so an unused row was only ever unreachable data.
     // --- W1: the install path's WHOLE refusal vocabulary, so that no reason is left to the
     // fail-closed default by accident.  Classifying the DEVICE ones below as our gap would silently
     // switch the negative verdict off (allRejectReasonsAreDevice would never become true), so each
@@ -20909,39 +20905,30 @@ static const char * ggml_vk_tuned_row_capability_reason(const vk_device & device
                    "index formula is compiled in, and a wrong driver fold there is a driver fault "
                    "(not a wrong value) that the sizing and precision gates cannot see";
         }
-        // 🔴 2026-09-24 (item 4, the OTHER half of §E -- see runtime-tuner-spec.md:75): the E1 driver
-        // boundary, refused BY NAME on the INSTALL path.
+        // 🔴 2026-09-25: AN E1 REFUSAL STOOD HERE AND WAS REMOVED, because the PLAN puts E1 somewhere
+        // else.  `t1-predicate.md:138` defines the rule and its carrier in one line: E1 is
+        // "not in the predicate", therefore it is "laid down as candidate-table ruling DATA", with
+        // direction MUST -- i.e. it is excluded at ENUMERATION by the shell's candidate table
+        // (`vulkantuner.cpp`, rule "E1-blacklist"), which is where it lives today.  An install-path
+        // clause is a carrier the plan never asked for.
         //
-        // ⚠️ WHAT THIS CLAUSE IS *NOT* (item 4 deletion review): it is NOT what protects a user today,
-        // and reading it as the defence is the mistake it most invites.  The predicate three steps up
-        // already refuses every row that could carry the boundary -- BS is DERIVED, so a row declaring
-        // BS>=256 fails `BS != num_warps * wave` and is dropped as ILLEGAL before this function is ever
-        // asked.  Measured: deleting this clause leaves every smoke leg green.  So today's protection is
-        // the PREDICATE plus the shell's candidate table; this clause is INSURANCE.
+        // It was also unreachable, which is the second and sufficient reason: BS is DERIVED, so a row
+        // declaring BS>=256 fails the predicate's `BS != num_warps * wave` clause and is dropped as
+        // ILLEGAL three steps up, before this function is ever asked.  Measured: deleting it left every
+        // smoke leg green, and NO smoke fixture uses WM=WN=16, so nothing exercised the boundary here
+        // in either direction.
         //
-        // 🔴 WHEN IT STOPS BEING INSURANCE AND BECOMES THE ONLY LINE, i.e. the condition to watch:
-        // `vk_tile_candidate_reason`'s derived-BS clause being RELAXED, or the install loop's ORDER
-        // changing so the capability call runs first.  Either one makes this clause reachable AND
-        // load-bearing -- on a path no test has ever exercised.  That is not a hypothetical shape: the
-        // boundary is a measured driver hang, and the clause exists so that the day the predicate stops
-        // covering it, the refusal is still there and still named.
+        // The SHARED PREDICATE it used stays: `vk_tile_e1_blacklist_hit` / `_reason`
+        // (vulkan-tile-validity.h) remain the ONE spelling of the boundary, so the shell's rule table
+        // cannot drift from itself, and R47 pins their numbers, direction (a floor, never an equality)
+        // and scope.  What is gone is only the second CARRIER, not the boundary.
         //
-        // Why an unreachable clause is kept rather than deleted, per this repo's own precedent
-        // (w1-preview.md:66-69, the same decision for the family/targets asymmetry): the unreachability
-        // is BY CONSTRUCTION, and deleting the guard would leave only prose saying so.  Cost is ~zero
-        // (it is called, so no unused-function warning); benefit is that a measured hang cannot come
-        // back silently.
-        //
-        // The SENTENCE is not written here: vk_tile_e1_blacklist_reason() (vulkan-tile-validity.h) is
-        // the ONE spelling, called by BOTH the shell's rule table and this firewall, so the two
-        // readers cannot drift (G-D26 -- same discipline as the "path is neither scalar, cm1 nor cm2"
-        // string three rows up in VK_TUNE_CAPABILITY_CLASSES).  R47 pins that boundary's numbers, its
-        // direction (a floor, never an equality) and its scope; R23 pins THIS call site's existence.
-        // Classified OUR GAP in that table: opening an upstream constant into a row-settable axis is
-        // OUR decision, not a capability of the device (G-D20 / the note at :20790-20792).
-        if (const char * e1 = vk_tile_e1_blacklist_reason(r.path, r.geom)) {
-            return e1;
-        }
+        // ⚠️ Reconciling with the earlier "keep the unreachable guard" precedent (w1-preview.md:66-69):
+        // that one was kept because the residual ASYMMETRY it guards -- a predicate that accepts a pair
+        // the object switch never enumerates -- cannot be eliminated by sharing a spelling.  E1 has no
+        // such residual: the rule is already data in the candidate table, and the predicate is shared.
+        // So the precedent does not apply, and keeping the clause would have added a third place where
+        // the same boundary is written down.
     } else {
         return "path is neither scalar, cm1 nor cm2";
     }
