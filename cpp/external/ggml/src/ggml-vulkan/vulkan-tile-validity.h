@@ -520,33 +520,36 @@ static inline constexpr int vk_tile_axis_class(int path, int axis) {
         case VK_TILE_AXIS_TK:
         case VK_TILE_AXIS_WARP:
             return VK_TILE_AXIS_PINNED;
+        // The two cm1-only spec constants (12/13) took ONE case until 2026-09-25; they are split now
+        // because the closure gave them different answers on cm1.  What they still share is the SCALAR
+        // story: there they are not specs at all -- SHMEM_STRIDE_PAD / APPLY_SLM_A_RESHAPE stay
+        // compile-time consts (mul_mm.comp:124-133, the "DO NOT spec-ize" note, lesson #41: spec-ing
+        // them miscompiles on the Blackwell driver) -- so a scalar row carrying them is a silent no-op,
+        // which is what INERT is for.  On cm1 both values DO reach their spec: cm1-d wired them (spec
+        // builder call at ggml-vulkan.cpp:21035) and added them to the dedup key.
+        //
+        // (This block used to also carry a cm1-c-era sentence saying the two fields had "NO reader
+        // anywhere", with the cm1-d correction appended after it -- so it said both things and
+        // contradicted the `return` below it.  The historical text is recoverable from git.)
         case VK_TILE_AXIS_SPEC_PAD:
-        case VK_TILE_AXIS_SPEC_RESHAPE:
-            // 🔴 ONE statement, present tense (2026-09-24).  What stood here was cm1-c's text
-            // ("INERT on BOTH paths ... the row's own two fields have NO reader anywhere") with the
-            // cm1-d correction APPENDED to it, so the block said both things and contradicted the
-            // `return` two lines below -- a reader had no way to tell which half was current.  The
-            // historical text is recoverable from git; it is not kept here.
-            //
-            // TODAY: cm1 = ENUMERABLE, scalar = INERT, and the two INERT/ENUMERABLE reasons differ:
-            //   scalar: not specs there at all -- SHMEM_STRIDE_PAD / APPLY_SLM_A_RESHAPE stay
-            //           compile-time consts (mul_mm.comp:124-133, the "DO NOT spec-ize" note,
-            //           lesson #41: spec-ing them miscompiles on the Blackwell driver).  So a scalar
-            //           row carrying them is a silent no-op, which is what INERT is for.
-            //   cm1:    they ARE specs (:121-123) and the row's values DO reach them -- cm1-d wired
-            //           them (spec builder call at ggml-vulkan.cpp:21035), added them to the dedup
-            //           key and flipped this entry, which is why sweeping them is a real axis here.
-            // ⚠️ RESHAPE is no longer ROW-overridable as of 2026-09-24 (see the clause in the row
-            //    check and runtime-tuner-spec 5.3.1): ENUMERABLE describes what the AXIS is, while
-            //    the row-override closure is a separate decision, made in the row check.  The two
-            //    must not be conflated -- an axis can be enumerable and still not be exposed to the
-            //    wire.
-            // cm1-d: cm1 = ENUMERABLE, scalar = INERT.  This is the flip the cm1-c note below
-            // predicted ("Wiring them per row is cm1-d's job"), and it is safe only because the
-            // wiring landed in the same batch: before it, sweeping these produced N identical rows.
-            // The scalar side stays INERT for its own reason -- there they are not specs at all
-            // (mul_mm.comp:124-133, lesson #41).
+            // PAD stays SWEEPABLE on cm1: M tier, real measured effect (shmem 10240 vs 12288), and it
+            // is how "this device wants a different layout" is expressed.  Scalar stays INERT.
             return path == VK_TILE_PATH_CM1 ? VK_TILE_AXIS_ENUMERABLE : VK_TILE_AXIS_INERT;
+        case VK_TILE_AXIS_SPEC_RESHAPE:
+            // ⚠️ 2026-09-25: the paragraph that stood here argued RESHAPE could stay ENUMERABLE because
+            //    "row-override closure is a separate decision".  THAT POSITION IS WITHDRAWN, because the
+            //    closure has to live in the CLASSIFICATION or it does not live anywhere: `ALL_AXES` in
+            //    the tuner's domain audit sweeps exactly the axes this function reports ENUMERABLE, so
+            //    leaving RESHAPE there meant (a) it was still treated as a sweepable axis, and (b) the
+            //    audit REQUIRED a declared domain for it -- i.e. adding a cm1 domain would silently
+            //    un-do the closure.  Dormant until then only because no cm1 domain exists yet.
+            //
+            //    Why PINNED and not INERT: the value still has to be filled in CORRECTLY (it reaches
+            //    spec 13, see above), it simply may not be SWEPT.  INERT would claim the value never
+            //    arrives, which the cm1-d wiring made false.  Same shape and reason as the TM/TN PINNED
+            //    entries: a value the decision dictates.  The basis is 5.3.1's H tier -- a wrong
+            //    constant fold there is a DRIVER FAULT, so SWEEPING the axis is what creates the hazard.
+            return path == VK_TILE_PATH_CM1 ? VK_TILE_AXIS_PINNED : VK_TILE_AXIS_INERT;
         case VK_TILE_AXIS_BK:
             // f16 family: compile-time constant in the shader.  Per path: on cm2 the spec really
             // is {BLOCK_SIZE, BM, BN, BK, smaller}, so BK is live THERE -- this table is only ever
@@ -693,17 +696,24 @@ static_assert(vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_WMITER) == VK_TI
               "cm1: WMITER / BK must not be swept on cm1 -- sweeping them would emit N identical "
               "rows (the shader does not read the row's value on either path).");
 // 2) The other direction, so that INERT cannot spread over the real geometry by accident: what cm1
-//    may sweep is the four FREE geometry axes (BM/BN/WM/WN) PLUS pad/reshape since cm1-d -- six --
-//    and BS is DERIVED from the geometry plus the wave.  TM/TN left this set in F14: they are this
-//    device's fragment shape, so they are PINNED (case body above).  The value must be right, but
-//    sweeping it would only produce rows the device refuses, and those refusals are classed as
-//    DEVICE verdicts -- i.e. a sweep of OUR choosing could mint a durable device claim.
+//    may sweep is the four FREE geometry axes (BM/BN/WM/WN) PLUS pad -- FIVE, was six until RESHAPE
+//    left the set on 2026-09-25 -- and BS is DERIVED from the geometry plus the wave.  TM/TN left this
+//    set in F14: they are this device's fragment shape, so they are PINNED (case body above).  The
+//    value must be right, but sweeping it would only produce rows the device refuses, and those
+//    refusals are classed as DEVICE verdicts -- i.e. a sweep of OUR choosing could mint a durable
+//    device claim.  RESHAPE joined them for a DIFFERENT reason (5.3.1's H tier: sweeping it is what
+//    creates a driver-fault hazard, not what creates a wrong answer), which is why it is PINNED and
+//    not INERT -- INERT would say the value never arrives, and it does.
 static_assert(vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_BM) == VK_TILE_AXIS_ENUMERABLE &&
               vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_BN) == VK_TILE_AXIS_ENUMERABLE &&
               vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_WM) == VK_TILE_AXIS_ENUMERABLE &&
               vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_WN) == VK_TILE_AXIS_ENUMERABLE &&
               vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_SPEC_PAD) == VK_TILE_AXIS_ENUMERABLE &&
-              vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_SPEC_RESHAPE) == VK_TILE_AXIS_ENUMERABLE &&
+              // 2026-09-25: RESHAPE left the sweepable set.  PINNED, not INERT: the value still has to
+              // be right (it reaches spec 13), it just may not be swept.  This is the line that makes
+              // the closure real -- changing the case body alone would leave this failing to compile,
+              // which is the intended behaviour of an assert that pins a decision.
+              vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_SPEC_RESHAPE) == VK_TILE_AXIS_PINNED &&
               vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_BS) == VK_TILE_AXIS_DERIVED &&
               // F14: and the two the device dictates are PINNED, not INERT -- the value they carry
               // must be the device's, they simply may not be swept.  Without these two claims the
@@ -711,8 +721,10 @@ static_assert(vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_BM) == VK_TILE_A
               // nothing would redden (R35 checks that these claims EXIST; the compiler checks them).
               vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_TM) == VK_TILE_AXIS_PINNED &&
               vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_TN) == VK_TILE_AXIS_PINNED,
-              "cm1: the sweepable cm1 axis space is the free geometry (BM/BN/WM/WN) plus pad/reshape "
-              "since cm1-d (six), with BS derived and the fragment shape (TM/TN) pinned");
+              "cm1: the sweepable cm1 axis space is the free geometry (BM/BN/WM/WN) plus PAD (five, was "
+              "six until RESHAPE was closed on 2026-09-25), with BS derived and the fragment shape "
+              "(TM/TN) pinned -- RESHAPE is PINNED too, for the H-tier reason, not because its value "
+              "does not arrive");
 // 3) WMITER is the one axis whose answer DIFFERS between the two warptile paths, so it is the one a
 //    refactor can collapse without noticing: scalar runs the `#else` side that reads WSUBM/WNITER.
 static_assert(vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_WMITER) == VK_TILE_AXIS_ENUMERABLE &&

@@ -10338,7 +10338,12 @@ static void ggml_vk_tuned_row_selftest(ggml_backend_vk_context * ctx) {
         vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_SPEC_PAD)   == VK_TILE_AXIS_INERT &&
         vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_WMITER)     == VK_TILE_AXIS_ENUMERABLE &&
         vk_tile_axis_class(VK_TILE_PATH_CM1,    VK_TILE_AXIS_SPEC_PAD)   == VK_TILE_AXIS_ENUMERABLE &&
-        vk_tile_axis_class(VK_TILE_PATH_CM1,    VK_TILE_AXIS_SPEC_RESHAPE) == VK_TILE_AXIS_ENUMERABLE &&
+        // 2026-09-25: RESHAPE left the sweepable set, so this copy says PINNED.  It is the VISIBLE twin
+        // of the static_assert in vulkan-tile-validity.h, and the A3o leg reads this very line -- which
+        // is exactly how this change announced itself: the smoke went red on A3o before anything else
+        // noticed, i.e. the executor caught a classification change the compiler-side assert could not
+        // (it only pins the table, not this second copy of the claim).
+        vk_tile_axis_class(VK_TILE_PATH_CM1,    VK_TILE_AXIS_SPEC_RESHAPE) == VK_TILE_AXIS_PINNED &&
         vk_tile_axis_class(VK_TILE_PATH_CM1,    VK_TILE_AXIS_WMITER)     == VK_TILE_AXIS_INERT &&
         vk_tile_axis_class(VK_TILE_PATH_CM1,    VK_TILE_AXIS_BK)         == VK_TILE_AXIS_INERT &&
         // F14 (G-C4): the fragment shape is the device's, so cm1 PINS it -- it must not be swept.
