@@ -277,7 +277,8 @@ namespace VulkanTuner {
     //
     // What must NOT be in here: class (b) (every candidate rejected by the validation gate) and
     // class (c) (timeout / IO failure / DEVICE_LOST / no winner).  (b) is only sound to write once
-    // the gate parameters are part of policyFingerprint -- otherwise changing a gate parameter
+    // the gate parameters are part of policyFingerprint -- which they now ARE (POLICY_CONSTANTS, read
+    // by policyFingerprint; R-28 step (1), 2026-09-26) -- because otherwise changing a gate parameter
     // would leave the key permanently skipped -- and (c) is not a property of the device at all
     // (t1-schema.md section 1 discipline (b): "we ran out of time" must never be remembered as
     // "this device cannot be tuned").  Adding a name here is therefore a deliberate act, and both
@@ -584,10 +585,14 @@ namespace VulkanTuner {
     // (a row set vs a NEGATIVE entry), which is why the class is declared as well -- the class is
     // what section 6.4's rule table names, and what step 4/5 will branch on.
     //
-    // Class (b) (every candidate rejected by the validation gate) is declared NOT writable and
-    // stays that way until the gate / tau / soft-gate parameters enter policyFingerprint, or
-    // changing a gate parameter would leave the key permanently skipped (section 6.4 items 1/5 --
-    // the same argument R17 makes for the file's reason).
+    // Class (b) (every candidate rejected by the validation gate) was declared NOT writable until
+    // the gate / tau / soft-gate parameters entered policyFingerprint, because changing a gate
+    // parameter would otherwise leave the key permanently skipped (section 6.4 items 1/5 -- the same
+    // argument R17 makes for the file's reason).  THAT CONDITION IS NOW MET: the gate/statistics
+    // constants are rows of POLICY_CONSTANTS and policyFingerprint() appends them, so a gate change
+    // changes the key by construction instead of by trusting that the revision moved (R-28 step (1),
+    // 2026-09-26).  The writable flag itself is flipped in the next step of the same batch, with the
+    // same-spelling NEGATIVE reason.
     //
     // The lookup is FAIL-CLOSED (see outcomeWritable): an outcome this build does not know is not
     // writable, so a caller that invents a state cannot write by accident.
@@ -1438,6 +1443,46 @@ namespace VulkanTuner {
     // also depends on the device, which is already in the fingerprint/name, so the pair
     // (device, policy) is fully covered.
     string policyFingerprint() {
+    // ── THE DECLARED POLICY CONSTANTS (R-28 step (1), 2026-09-26) ────────────────────────────────
+    // ONE table, read by policyFingerprint() (it BUILDS the string from these rows) and by the smoke's
+    // A1 export clause (it checks that the header the product actually writes carries them).  `text` is
+    // computed FROM the constant, so a value and its spelling cannot drift apart, and removing the loop
+    // or a row cannot land green: the exported file stops carrying the constant.
+    //
+    // WHY THESE ARE IN THE POLICY AT ALL, and it is the plan's own requirement rather than this batch's
+    // idea: tune-gaps.md says "代码 / 谓词 / 规则表 / 枚举器 / 判据 / 门参数 -> b<rev16>; **门参数进
+    // policyFingerprint 才能写 class-(b)**" (tune-gaps.md:208, restated at :288).  "class (b)" is "every
+    // candidate was rejected by the validation gate", i.e. exactly what `gate-reject` is about to become,
+    // and the outcome table's own comment refuses to make it writable "until the gate / tau / soft-gate
+    // parameters enter policyFingerprint".
+    //
+    // WHY NOT LEAN ON `b<rev16>` ALONE: the revision is a COARSE automatic identity -- it moves only if a
+    // commit moves AND the build actually picks the new revision up, and this repo has produced the
+    // opposite (a silently failed build, a regenerated gitinfo: source changed, revision unchanged).
+    // In that state a file written under the OLD gate constant would MATCH the stale-revision binary and
+    // be adopted -- the one hole the revision chain cannot see.  A value in this string cannot be stale.
+    // t1-schema.md's hand-bump list for TUNER_POLICY_VERSION stays for every OTHER code-level semantic
+    // change; these rows are simply no longer on it, because here the invalidation is automatic.
+    //
+    // WHAT BELONGS HERE: a value that changes what a DURABLE VERDICT means -- the spike gate and its
+    // band, the drop ratio, and the statistics the interval and the block definition are computed with.
+    // What does NOT: the self-test's trial count (it changes no verdict), the rotation seed (it changes
+    // the ORDER, which is already covered by the revision), and everything that is an env knob.
+    struct PolicyConstantSpec {
+      const char* name;
+      std::string text;
+    };
+    const PolicyConstantSpec POLICY_CONSTANTS[] = {
+      { "spike_rate_gate", std::to_string(TuneStats::SPIKE_RATE_GATE) },
+      { "spike_band_lo",   std::to_string(TuneStats::SPIKE_BAND_LO)   },
+      { "spike_band_hi",   std::to_string(TuneStats::SPIKE_BAND_HI)   },
+      { "too_slow_w",      std::to_string(TuneStats::TOO_SLOW_W)      },
+      { "alpha",           std::to_string(TuneStats::ALPHA)           },
+      { "tolerance",       std::to_string(TuneStats::TOLERANCE)       },
+      { "min_block_ms",    std::to_string(TuneStats::MIN_BLOCK_TIME_MS) },
+      { "pairs_floor",     std::to_string(TuneStats::PAIRS_FLOOR)     },
+    };
+
       // The DEV-SURFACE knobs: everything that can change what this tuner may select (or the
       // computation it selects for), so a dev A/B run cannot silently reuse a cache measured
       // under a different setting.  Added in one cut from the census tool, which is the ONE
@@ -1491,6 +1536,16 @@ namespace VulkanTuner {
             s += "#" + shortHash(raw) + "/" + std::to_string(raw.size());
           }
         }
+      }
+      // The declared judgement-layer constants, appended LAST so that a reader of the string sees the
+      // knobs (env, human-set) before the values that are baked into this binary.  They are appended by
+      // the loop rather than spelled here: POLICY_CONSTANTS is the one place a value and its spelling
+      // live, and the loop's absence is visible in the exported file (the smoke asserts it).
+      for (const PolicyConstantSpec & c : POLICY_CONSTANTS) {
+        s += "|";
+        s += c.name;
+        s += "=";
+        s += c.text;
       }
       return s;
     }
