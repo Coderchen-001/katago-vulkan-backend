@@ -761,13 +761,15 @@ namespace VulkanTuner {
     // install, so there is no mask to reconcile -- and if a caller ever ran this after an install,
     // `rowsForWrite`'s size mismatch is the fail-closed, LOUD answer rather than a silent guess).
     //
-    // ⚠️ WHAT THIS FUNCTION DOES NOT SETTLE (registered for the batch that wires the primitive into
-    // production, R-28 step (5)): the order against the THREE-BRANCH decision is fixed by the ruling --
-    // the gate judges the MEASUREMENT, which is upstream of the install accounting, so it runs FIRST
-    // and a gate-rejected run never reaches the three branches -- but the order against the FINALIZER is
-    // not exercised by anything today, because no production path calls this function yet.  The ⑤
-    // author must say which wins, and what a row that installs AFTER a gate rejection means.  Until
-    // then it is a window obligation, not an implied guarantee.
+    // ⚠️ WHAT THIS FUNCTION DOES NOT SETTLE, split by which half has a CARRIER (R-28 step (3) tightened
+    // this note, because a half that can be executed must not be left as a sentence):
+    //   * the order against the THREE-BRANCH decision is FIXED by the ruling -- the gate judges the
+    //     MEASUREMENT, which is upstream of the install accounting, so it runs FIRST and a gate-rejected
+    //     run never reaches the three branches.
+    //   * the order against the FINALIZER on an EMPTY-INSTALL decision is now EXECUTED by the self-test's
+    //     (k) case: the finalizer must return Nothing and leave this verdict and its marker alone.
+    //   * what still has NO carrier is the protocol side (⑤): a row that installs AFTER a gate rejection.
+    //     That half stays a registered window obligation, not an implied guarantee.
     void rejectBySpikeGate(Decision & d, const SpikeGateVerdict & v) {
       d.rows.clear();
       d.negative = true;
@@ -787,6 +789,97 @@ namespace VulkanTuner {
                 "again).  The interval assumes INDEPENDENT blocks and spikes are clustered, so it is if "
                 "anything too NARROW: the DIRECTION is fail-closed (the upper bound decides), the "
                 "CONSTRUCTION is not conservative");
+    }
+
+    // ── R-28 step (3): THE CANDIDATE-DROP ACCOUNTING AND THE THIRD BRANCH ─────────────────────────
+    //
+    // WHAT A DROP IS, and why only TWO of the three buckets are in the table (tune-measurement.md
+    // section 2.6(a), restated in t3-shell-plan.md:442): a DETERMINISTIC rejection -- `illegal` (the rule
+    // table says this geometry cannot exist) or `unsupported` (this device/family cannot build it) --
+    // never entered the denominator at all, because the candidate was never going to be compared; an
+    // ACCIDENTAL or budget-shaped one (`too-slow`, `build-failed`) did enter it, so it LEAVES the
+    // judgeable set and has to be counted.  The two names below are therefore the GATING set, and their
+    // counts are what the suppression loud prints.
+    //   🔴 `illegal` IS NOT A MEMBER, and that is the rule rather than an omission: folding it in would
+    //   make "the denominator shrank because our own rule table refused everything" look like "we measured
+    //   what we set out to measure" -- the false green section 2.6(a) warns about.  Its count lives on the
+    //   probe side (`vk_tune_probe_result::pairs_illegal`), whose own log line is registered as R-11's
+    //   window item and is deliberately NOT discharged (or pre-empted) by this batch.
+    //
+    // The table PAIRS each name with the Decision field that counts it, and the loud is BUILT from the
+    // table: a new drop reason therefore cannot be added without appearing in the line a reader greps,
+    // and the line cannot name a reason whose count nobody keeps.
+    struct CandidateDropSpec {
+      const char* name;
+      uint32_t Decision::*count;
+    };
+    const CandidateDropSpec CANDIDATE_DROPS[] = {
+      { "too-slow",     &Decision::droppedTooSlow },
+      { "build-failed", &Decision::droppedBuildFailed },
+    };
+
+    // The drop list EXACTLY as the suppression loud carries it, built from the table above so the line
+    // and the declared set cannot drift apart.
+    string formatCandidateDrops(const Decision & d) {
+      string out;
+      for (const CandidateDropSpec & c : CANDIDATE_DROPS) {
+        out += (out.empty() ? "" : ", ") + string(c.name) + "=" + to_string(d.*(c.count));
+      }
+      return out;
+    }
+
+    // ONE place the measurement's accounting enters the Decision (R-12: a new field needs a producer and
+    // a consumer in the same batch).  `enumeratedCandidates` is a PARAMETER rather than a field of the
+    // result, because the result describes what was MEASURED: how many candidates the caller's enumerator
+    // produced for this key is a fact about the caller's set, and only the caller knows it.  The two
+    // definitions are written HERE, with the first producer, rather than left to the reader -- the plan
+    // fixes the fields' SHAPE (`cands=<measured>/<enumerated>`), not their sources.
+    void noteMeasurementAccounting(Decision & d, const vk_tune_probe_result & r,
+                                   uint32_t enumeratedCandidates) {
+      d.pairsComplete = r.pairs_complete;
+      d.droppedTooSlow = r.dropped_too_slow;
+      d.droppedBuildFailed = r.dropped_build_failed;
+      d.candidatesMeasured = r.objects;
+      d.candidatesEnumerated = enumeratedCandidates;
+      d.pairsLegal = r.pairs_legal;
+      d.shapesCount = r.shapes;
+    }
+
+    // THE THIRD BRANCH (tune-measurement.md section 2.6(a)): "nothing was better" AND the pair set is
+    // incomplete.  It is ONE decision point rather than a sentence scattered through the branches, and
+    // that is the requirement -- the clause that PICKS THE OUTCOME is the clause that reads
+    // `pairsComplete`, so the flag cannot be consulted somewhere else and ignored here.
+    //
+    //   * "nothing was better" is read as `rowsForWrite(d).empty()`, i.e. through the SAME helper the
+    //     write gate and the formatter use, so "no winner" cannot mean one thing here and another there.
+    //   * BRANCH ① IS NOT AFFECTED BY INCOMPLETENESS: a candidate that won may still be written, because
+    //     what was dropped was an ALTERNATIVE (section 2.6(a) states this explicitly -- reading the flag
+    //     as "suppress the whole write" would let one slow candidate void a safe row set).
+    //   * BRANCH ② (a complete measurement with no winner) is NOT this function's business and is not in
+    //     this build: its outcome (`measured-no-gain`) and its writer (`NEGATIVE no-gain`) land with the
+    //     protocol that produces them, and R17 pins `no-gain`'s writer count at 0 until then.  So a
+    //     decision whose set is complete is left EXACTLY as it was found, not re-labelled here.
+    //   * BRANCH ③'s outcome is `no-winner` -- an already DECLARED, unwritable outcome -- so this branch
+    //     adds no state and no gate, and "we could not finish the comparison" can never be written down
+    //     as a property of the device.
+    //
+    // ⚠️ ORDERING AGAINST THE FINALIZER: the finalizer recomputes the outcome from the INSTALL accounting
+    // at every install and again at the once point.  It LEAVES this branch's outcome alone as long as the
+    // decision installs nothing (`install.declared == 0`), which is what "no winner" means -- and the (l)
+    // case of the self-test EXECUTES that rather than registering it, because the empty-install half has a
+    // carrier here.  What has no carrier is the protocol side (⑤): a branch-③ decision that somehow hands
+    // rows to the installer.  That half stays a registered window obligation.
+    bool noGainSuppressedOnIncompleteSet(Decision & d) {
+      if (d.pairsComplete) {
+        return false;
+      }
+      if (!rowsForWrite(d).empty()) {
+        return false;
+      }
+      d.outcome = "no-winner";
+      logLine("NOTICE: " + d.deviceName
+              + ": no-gain suppressed: candidate set incomplete (" + formatCandidateDrops(d) + ")");
+      return true;
     }
 
     // The extra conditions named by a table row (G-D20 + W3-P1).  Fail-closed: EVERY name in the list
@@ -2337,6 +2430,13 @@ namespace VulkanTuner {
          << " baseline=" << d.baselineVersion
          << " rows=" << d.rowCount
          << " source=" << d.rowSource
+         // R-28 step (3) / section 2.6: the TWO denominators, with names that cannot be confused.
+         // `cands=` is candidates MEASURED over candidates ENUMERATED (a numerator above the denominator
+         // is a wiring bug a reader can SEE, which is why they are printed as a pair), and `pairs=` is
+         // legal pairs over shapes.  They are READINGS, not judgements: 0/0 says "no measurement has been
+         // accounted for", never "a complete measurement of nothing".
+         << " cands=" << d.candidatesMeasured << "/" << d.candidatesEnumerated
+         << " pairs=" << d.pairsLegal << "/" << d.shapesCount
          << " tuneMode=" << d.tuneModeText
          << " cache_state=" << d.cacheState
          << " tune_ms=" << d.tuneMs
@@ -3311,6 +3411,112 @@ namespace VulkanTuner {
                      + (emitErr.empty() ? "" : (" formatter refused: " + emitErr));
           }
         }
+        // 🔴 THE EMPTY-INSTALL HALF OF THE ORDERING QUESTION, now EXECUTED instead of registered
+        // (R-28 step (3) tightened this note, and the half that has a carrier must not stay a sentence):
+        // the finalizer recomputes the outcome from the INSTALL accounting, so on a decision that
+        // installed nothing it must leave a `SpikeGate`-origin verdict alone -- retitling it, or dropping
+        // the marker, would turn "the measurement was too spiky to trust" into a claim about the device.
+        // The OTHER half (a row installing AFTER a gate rejection) still has no carrier and stays
+        // registered for ⑤.
+        const Decision::FinalizeVerdict vGate = finalizeOutcome(g);
+        if (vGate != Decision::FinalizeVerdict::Nothing || g.outcome != "gate-reject" || !g.negative
+            || g.negativeOrigin != Decision::NegativeOrigin::SpikeGate) {
+          ok = false;
+          if (firstBad.empty()) {
+            firstBad = string("(k) the finalizer did not leave the gate's verdict alone on an "
+                              "empty-install decision: verdict ") + verdictName(vGate) + ", outcome '"
+                     + g.outcome + "', marker " + (g.negative ? "set" : "GONE (BUG)");
+          }
+        }
+      }
+    }
+
+    { // (l) THE THIRD BRANCH (R-28 step (3)): the drop accounting, and the THREE directions the branch
+      // has to get right -- including the one that would be a disaster read the other way (an incomplete
+      // pair set must NOT veto a row set).
+      //
+      // A synthetic result, not a device run: the accounting is a copy plus one branch, and the numbers
+      // that matter (which pairs were dropped, how many candidates were enumerated) are the CALLER's
+      // facts.  The device half -- that `dropped_too_slow` really moves when `W` moves -- is the probe
+      // self-test's own leg, and duplicating it here would only make one of the two rot unnoticed.
+      {
+        auto makeResult = [](uint32_t objs, bool complete, uint32_t tooSlow, uint32_t buildFailed) {
+          vk_tune_probe_result r {};
+          r.st = VK_TUNE_PROBE_OK;
+          r.shapes = 3;
+          r.objects = objs;
+          r.pairs_legal = 12;
+          r.pairs_illegal = 2;
+          r.dropped_too_slow = tooSlow;
+          r.dropped_build_failed = buildFailed;
+          r.pairs_complete = complete;
+          return r;
+        };
+        // (A) incomplete + no winner -> the branch FIRES, and its outcome is `no-winner` (declared and
+        // unwritable), so nothing can be remembered from a comparison that could not be finished.
+        Decision a;
+        a.deviceName = "self-test";
+        noteMeasurementAccounting(a, makeResult(6u, false, 3u, 2u), 9u);
+        const bool accountedOk = !a.pairsComplete && a.droppedTooSlow == 3u
+                              && a.droppedBuildFailed == 2u && a.candidatesMeasured == 6u
+                              && a.candidatesEnumerated == 9u && a.pairsLegal == 12u
+                              && a.shapesCount == 3u;
+        const bool firedA = noGainSuppressedOnIncompleteSet(a);
+        // ... and the FINALIZER must leave that verdict alone on an empty-install decision, which is the
+        // ordering claim this case can execute (the protocol half is registered, not claimed).
+        const Decision::FinalizeVerdict vA = finalizeOutcome(a);
+        const bool finalizerOk = vA == Decision::FinalizeVerdict::Nothing && a.outcome == "no-winner"
+                              && !outcomeWritable(a) && !cacheEntryWritable(a);
+        // (B) COMPLETE + no winner -> NOT this branch.  Branch ② (a complete measurement with no winner)
+        // is not in this build, so the branch must leave the decision exactly as it found it instead of
+        // re-labelling it: an outcome nothing produces would be the "name before producer" drift this
+        // project refuses for outcomes (unlike reasons, which may be reserved).
+        Decision b;
+        b.deviceName = "self-test";
+        noteMeasurementAccounting(b, makeResult(6u, true, 0u, 0u), 9u);
+        const bool firedB = noGainSuppressedOnIncompleteSet(b);
+        const bool untouchedB = (b.outcome == "running");
+        // (C) incomplete + A WINNER -> the ROW SET STANDS.  This is the direction section 2.6(a) calls
+        // out: what was dropped was an ALTERNATIVE, so one too-slow candidate must not void a safe row.
+        Decision c;
+        c.deviceName = "self-test";
+        c.install.declared = 1;
+        c.install.installed = 1;
+        c.rows.push_back(vk_tune_row_spec {});
+        c.rows[0].path = VK_TILE_PATH_SCALAR;
+        c.rows[0].src0_type = 1;
+        c.rows[0].src1_type = 0;
+        c.rows[0].geom.BM = 64; c.rows[0].geom.BN = 64; c.rows[0].geom.BK = 0;
+        c.rows[0].geom.WM = 32; c.rows[0].geom.WN = 32; c.rows[0].geom.WMITER = 1;
+        c.rows[0].geom.TM = 4;  c.rows[0].geom.TN = 4;  c.rows[0].geom.BS = 128;
+        c.rows[0].geom.pad = -1; c.rows[0].geom.reshape = -1; c.rows[0].geom.smaller = -1;
+        c.rowInstalledSeen = true;
+        c.rowInstalled.push_back(1);
+        noteMeasurementAccounting(c, makeResult(6u, false, 1u, 0u), 9u);
+        c.outcome = "measured";
+        const bool firedC = noGainSuppressedOnIncompleteSet(c);
+        const bool rowsStand = (c.outcome == "measured") && !rowsForWrite(c).empty();
+        // (D) the DECISION LINE is the constant evidence for the two denominators (section 2.6: the hint
+        // only exists when a row set is written, the line always does), so the accounted numbers must be
+        // READABLE off the line this process would print.
+        const string dl = formatDecisionLine(a, 19, 19, 8);
+        const bool lineOk = dl.find(" cands=6/9 pairs=12/3") != string::npos;
+        if (!accountedOk || !firedA || !finalizerOk || firedB || !untouchedB || firedC || !rowsStand
+            || !lineOk) {
+          ok = false;
+          if (firstBad.empty()) {
+            firstBad = string("(l) the third branch is not the decision section 2.6(a) describes: "
+                              "accounting=") + (accountedOk ? "ok" : "BAD")
+                     + " (A) fired=" + (firedA ? "yes" : "NO (BUG)")
+                     + " finalizer=" + (finalizerOk ? "ok" : "BAD")
+                     + " outcome='" + a.outcome + "'"
+                     + " (B) fired=" + (firedB ? "YES (BUG: branch 2 is not in this build)" : "no")
+                     + " untouched=" + (untouchedB ? "yes" : ("NO (BUG: outcome '" + b.outcome + "')"))
+                     + " (C) fired=" + (firedC ? "YES (BUG: an incomplete set vetoed a row set)" : "no")
+                     + " rows-stand=" + (rowsStand ? "yes" : "NO (BUG)")
+                     + " decision-line=" + (lineOk ? "ok" : ("BAD (" + dl + ")"));
+          }
+        }
       }
     }
 
@@ -3319,7 +3525,7 @@ namespace VulkanTuner {
             + " state-writable; probe file " + (absent ? "absent" : "PRESENT")
             + "; encoding probe (non-ASCII name) written+read-back+removed ["
             + ((encWrote && encReadBack && encRemoved) ? "ok" : "FAIL") + "]"
-            + "; (a)(b) no marker / (c) from-file retirement / (d) measured control / (e) our-gap / (f) all-reject->measured retracts / (g)(h) fold AND+mismatch / (i) unmeasured marker refused by name / (j) the formatter's throw is contained / (k) spike gate: both directions + no-row-set + the durable entry's write/read pair ["
+            + "; (a)(b) no marker / (c) from-file retirement / (d) measured control / (e) our-gap / (f) all-reject->measured retracts / (g)(h) fold AND+mismatch / (i) unmeasured marker refused by name / (j) the formatter's throw is contained / (k) spike gate: both directions + no-row-set + the durable entry's write/read pair / (l) third branch: drop accounting + the three directions + the finalizer leaves it alone ["
             + (verdictOk ? "ok" : "FAIL: " + verdictBad) + "]"
             + " [" + ((ok && absent && encWrote && encReadBack && encRemoved && verdictOk) ? "ok" : "FAIL") + "]"
             + (ok ? "" : " first problem: " + firstBad));

@@ -22354,9 +22354,12 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
         result->spikes = spikes;
         // The count the exclusion above produced: section 2.6's third bucket, reported rather than folded
         // into the flag, so that "nothing was slow" and "two pairs were excluded" are different readings.
-        // ⚠️ Its consumer in the DECISION layer (CANDIDATE_DROPS[]'s `too-slow` item) arrives with the
-        // production probe caller; until then the primitive's count, the flag and the per-pair line are
-        // the whole surface.  Registered as a window obligation, the same shape as R-11's `pairs_illegal`.
+        // ✅ Its consumer in the DECISION layer LANDED in R-28 step (3): `CANDIDATE_DROPS[]`'s `too-slow`
+        // item is paired with `Decision::droppedTooSlow`, `noteMeasurementAccounting()` is the one place a
+        // result enters a decision, and the suppression loud is BUILT from that table -- so this count can
+        // no longer be read only by the primitive.  What is still owed is the PRODUCTION filler (a real
+        // probe result reaching a Decision), which goes with the probe's own production caller; that half
+        // stays registered, the same shape as R-11's `pairs_illegal`.
         result->dropped_too_slow = dropped_too_slow;
         result->dropped_build_failed = build_failed;
         result->pairs_complete = pairs_complete;

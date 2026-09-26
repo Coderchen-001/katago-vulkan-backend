@@ -307,6 +307,35 @@ namespace VulkanTuner {
     // express the per-row intersection, so this is a sound bound rather than the set itself.
     vk_tune_install_result install {};
     bool installSeen = false;
+    // ── R-28 step (3): THE MEASUREMENT'S OWN ACCOUNTING ────────────────────────────────────────────
+    // Why these live HERE, next to the INSTALL accounting, rather than inside the probe result: the
+    // result describes ONE measurement, while a decision is the durable statement made from it -- and
+    // the statement's scope depends on facts the result cannot carry (whether a winner exists at all,
+    // and how many candidates the caller's enumerator produced).  These are the inputs the
+    // three-branch decision reads, so they belong to the thing being decided.
+    //
+    // 🔴 `pairsComplete` DEFAULTS TO FALSE, and that is the fail-closed direction: it decides whether a
+    // "nothing was better" claim may be written, so "nobody told us" must not read as "we measured
+    // everything".  It is NOT the same flag as `coverageComplete` (tune-measurement.md section 2.6,
+    // "两个旗标别混进一个名字"): that one is the CALLER's statement about the shape set (an input, R-25)
+    // and decides whether a whole-slot row is admissible, while this one decides whether the NEGATIVE
+    // claim is.
+    bool pairsComplete = false;
+    // The DECLARED drop accounting (R-28 step (3)): the reasons a candidate LEFT the judgeable set,
+    // counted separately per reason.  `CANDIDATE_DROPS[]` in vulkantuner.cpp is the ONE place the names
+    // and these fields are paired, and it is READ (the suppression loud is built from it), so a new
+    // reason cannot be added in one place and forgotten in the other.
+    uint32_t droppedTooSlow = 0;
+    uint32_t droppedBuildFailed = 0;
+    // The decision line's TWO denominators, named so they cannot be confused (section 2.6 requires
+    // different names because they have different denominators): `cands=` = candidates MEASURED over
+    // candidates ENUMERATED; `pairs=` = legal pairs over shapes.  ⚠️ 0/0 is the honest reading while no
+    // measurement has been accounted for (the primitive has no production caller yet) -- it must NOT be
+    // read as "a complete measurement of nothing".
+    uint32_t candidatesMeasured = 0;
+    uint32_t candidatesEnumerated = 0;
+    uint32_t pairsLegal = 0;
+    uint32_t shapesCount = 0;
     // W2 (decision C): the PER-ROW truth, the same order as `rows` (index i describes rows[i]),
     // folded with AND across this device's contexts -- a row is durable only if EVERY context
     // installed it.  🔴 The aggregate fields above can only BOUND this set (min/max), so the WRITE
