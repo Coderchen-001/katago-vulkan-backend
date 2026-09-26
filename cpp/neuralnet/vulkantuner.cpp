@@ -1456,6 +1456,10 @@ namespace VulkanTuner {
     // and the outcome table's own comment refuses to make it writable "until the gate / tau / soft-gate
     // parameters enter policyFingerprint".
     //
+    // The names are LOWERCASE on purpose: every KNOBS[] name is uppercase, so the two segments of POLICY
+    // are distinguishable at a glance -- and the smoke's default-leg check relies on exactly that (it
+    // asserts that no UPPERCASE |NAME= carries a value, which is what "the default sets no dev knob"
+    // means now that the string legitimately contains valued lowercase rows).
     // WHY NOT LEAN ON `b<rev16>` ALONE: the revision is a COARSE automatic identity -- it moves only if a
     // commit moves AND the build actually picks the new revision up, and this repo has produced the
     // opposite (a silently failed build, a regenerated gitinfo: source changed, revision unchanged).
