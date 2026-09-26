@@ -112,8 +112,7 @@ namespace VulkanTuner {
   //
   //   Auto -- read the cache; on a miss, tune and save (today: nothing to tune yet).
   //   Off  -- READ-ONLY: read the cache, use a hit, fall back to stock on a miss, never tune,
-  //           never write the cache and never write a negative entry.  IMPORT is still
-  //           honoured, because it is a read.
+  //           never write the cache and never write a negative entry.
   //
   // ⚠️ Off is NOT a reference arm: it may install tuned rows, so "bit-identical to stock"
   // acceptance may only ever use KATAGO_VK_TUNE=0.
@@ -182,10 +181,11 @@ namespace VulkanTuner {
     std::string negativeReason;
     // W2 (post-review): WHO put the marker above there, which is what decides who may take it away.
     //   None      -- no marker.
-    //   FromFile  -- the LOADER read it from a file (the cache channel or an IMPORT; one entry point,
-    //                vulkantuner.cpp load path).  It is load-bearing: EXPORT re-emits the marker, and
-    //                the read-side legs assert "nothing to do means nothing written" byte for byte, so
-    //                the FINALIZER never touches it -- except for the ONE transition that makes it false
+    //   FromFile  -- the LOADER read it from a file at this device's cache path (one entry point,
+    //                vulkantuner.cpp load path).  It is load-bearing: the writer must be able to tell a
+    //                marker it owns from one the loader handed it, and the read-side legs assert
+    //                "nothing to do means nothing written" byte for byte, so the FINALIZER never
+    //                touches it -- except for the ONE transition that makes it false
     //                by this process's own account (a durable row was installed for this key), which it
     //                retires loudly.
     //   AllReject -- THIS process concluded "deterministically all-rejected" from the install
@@ -222,21 +222,19 @@ namespace VulkanTuner {
     int nnXLen = 0;
     int nnYLen = 0;
     int maxBatchSize = 0;
-    bool imported = false;        // row set came from KATAGO_VK_TUNE_IMPORT
-    std::string importedFrom;     // path the import came from
     // The rows to hand to the backend, in the wire form both sides share.  Parsed from the
-    // cache or the import file; still refused by the backend's T4 gate today (loudly), and
-    // never silently dropped.
+    // file at this device's cache path; still refused by the backend's T4 gate today (loudly),
+    // and never silently dropped.
     std::vector<vk_tune_row_spec> rows;
-    // W3-P1: WHERE THE CANDIDATE SET CAME FROM.  Four states, and the fourth is the one the write
+    // W3-P1: WHERE THE CANDIDATE SET CAME FROM.  Three states, and the third is the one the write
     // side reads: "none" (nothing was loaded -- the declared set is empty, or the self-test
-    // synthesized it), "cache"/"import" (a FILE produced the candidates), "measured" (THIS process's
+    // synthesized it), "cache" (a FILE produced the candidates), "measured" (THIS process's
     // own enumeration produced them).  The value is what `negativeProvable` tests, so the initial
     // value is the fail-closed one: a decision nobody marked can never mint a durable verdict.
     // 🔴 Production has NO setter of "measured" today -- the enumerator is step 5 -- which is exactly
     // why the key-scoped NEGATIVE entry is unreachable until then.  R42 counts the setters rather
     // than trusting this sentence: production 0, the self-test's one named fixture 1.
-    std::string rowSource = "none";   // "none" / "cache" / "import" / "measured"
+    std::string rowSource = "none";   // "none" / "cache" / "measured"
     // W4b (⑤ first cut): WHICH SUBSET of the declared domain this process actually looked at, as THREE
     // states rather than a bool.  "who measured it" (rowSource above) and "how much of the domain was
     // covered" are ORTHOGONAL questions -- both must be answered before a NEGATIVE entry may be
@@ -394,15 +392,13 @@ namespace VulkanTuner {
     //   Nothing                      -- nothing to conclude yet (declared == 0): the ordinary production
     //                                   form of step 1b-2b, and never a loud line.
     //   Measured                     -- at least one row is durable; the file (if any) carries rows.
-    //   ImportedRejected             -- an IMPORTed row set was all-rejected: (a) an import may not
-    //                                   create a durable verdict.
     //   AnyRowInstalled              -- every declared row was rejected HERE, but some context of this
     //                                   device installed a row for this SAME key: (b) the key-scoped
     //                                   marker would be false by our own account.
     //   OurGap                       -- all rejected, but not every reason is a device property (G-D20).
     //   DeviceOnlyAllReject          -- all rejected, every reason a device property: the marker stands.
     //   StaleFromFileNegativeRetired -- a row is durable, so a marker READ FROM A FILE was retired.
-    enum class FinalizeVerdict { Nothing, Measured, ImportedRejected, AnyRowInstalled, OurGap,
+    enum class FinalizeVerdict { Nothing, Measured, AnyRowInstalled, OurGap,
                                  DeviceOnlyAllReject, StaleFromFileNegativeRetired };
     // The last verdict REPORTED for this decision.  The finalizer runs more than once (once per context
     // install, then once at the once point) and its answer may legitimately CHANGE between those calls,
@@ -417,8 +413,8 @@ namespace VulkanTuner {
   };
 
   // THE decision entry point.  Returns nullptr when the tuner is off -- including the
-  // KATAGO_VK_TUNE=0 case, which must stay a complete no-op except for one loud line if
-  // KATAGO_VK_TUNE_IMPORT was also requested (t3-shell-plan.md section 6.1 item 7).
+  // KATAGO_VK_TUNE=0 case, which must stay a complete no-op except for one loud line when a
+  // request switch that cannot be honoured was set (t3-shell-plan.md section 6.1 item 7).
   // Never throws: a failure here must fail open (behave exactly like "no tuned rows") and
   // say so loudly, never take the process down (section 3).
   std::shared_ptr<Decision> makeDecision(
@@ -439,16 +435,18 @@ namespace VulkanTuner {
   // before the first graph build; idempotent by construction (the context is fresh).
   void installForHandle(const std::shared_ptr<Decision>& decision, ggml_backend_t backend);
 
-  // The ONE row-set file format (t1-schema.md section 1): the cache file, KATAGO_VK_TUNE_IMPORT
-  // and KATAGO_VK_TUNE_EXPORT all use it, so a file written by one run can be read by the
-  // next, by another machine, and by a hand-written fixture in a test.
+  // The ONE row-set file format (t1-schema.md section 1): the cache file uses it, so a file
+  // written by one run can be read by the next, and a hand-written fixture -- a file dropped at
+  // the cache path -- is read by exactly the same parser.  What that does NOT settle: the
+  // fingerprint names the device CLASS, not the machine, so a copied file is readable by an
+  // identical card; that is an OPEN ITEM registered with the R-29 plan row, not a claim here.
   //
   //   VERSION <n>            schema version (refused on mismatch)
   //   TUNER_VERSION <n>      enumerator version (refused on mismatch)
   //   FINGERPRINT <string>   the full device/driver fingerprint (refused on mismatch)
   //   POLICY <string>        policy fingerprint: build revision + policy version + knobs
   //   BASELINE <string>      policy baseline version (bump when a default changes)
-  //   MODEL <string>         outer key part 2 (absent = not key-checked)
+  //   MODEL <string>         outer key part 2 (absent = refused: the name routes, the header verifies)
   //   BOARD <X>x<Y>          outer key part 3
   //   MAXBATCH <n>           outer key part 4
   //   ROWSET_HASH <hex>      hash of the row set, computed from the rows at write time
@@ -460,21 +458,20 @@ namespace VulkanTuner {
   //                          no tuning is attempted.  Never written on a timeout, and never
   //                          written for a partial result.  `<reason>` is one of the CLOSED
   //                          SET declared in vulkantuner.cpp -- a reason outside it refuses the
-  //                          file on BOTH channels, because the reason is the part of the claim
+  //                          file, because the reason is the part of the claim
   //                          that has to stay comparable across releases.
   //
-  // WHICH HEADER KEYS ARE REQUIRED DEPENDS ON THE CHANNEL, and the split follows what each
-  // key GUARANTEES (2026-09-13 review):
-  //   required on BOTH channels -- POLICY, BASELINE: they carry "the policy changed, so this
-  //     row set is void".  A missing one would make that guarantee vanish silently, because
-  //     the parser accepts a file that is missing a merely-advisory key.
-  //   required on the CACHE channel only -- MODEL, BOARD, MAXBATCH, ROWSET_HASH, CREATED:
-  //     a cache is written by us, so there is no legitimate reason for a field to be absent,
-  //     and the filename routing alone would otherwise be the only check left.  IMPORT
-  //     tolerates their absence (hand-written fixtures must stay possible) and prints
-  //     "[not key-checked: ...]" so a human can see what was not verified.
-  //   ROWSET_HASH additionally never *refuses* on IMPORT: the parsed rows are hashed live and
-  //     the declared value is only a hint there, since a hand-written fixture cannot compute it.
+  // WHICH HEADER KEYS ARE REQUIRED (2026-09-13 review; ONE channel left since R-29):
+  //   POLICY, BASELINE -- they carry "the policy changed, so this row set is void".  A missing
+  //     one would make that guarantee vanish silently, because the parser accepts a file that
+  //     is missing a merely-advisory key.
+  //   MODEL, BOARD, MAXBATCH, ROWSET_HASH, CREATED, VERSION, TUNER_VERSION, MODE -- a cache is
+  //     written by us, so there is no legitimate reason for a field to be absent, and the
+  //     filename routing alone would otherwise be the only check left.  R-29 removed the
+  //     channel that tolerated their absence, so a missing key is a REFUSAL that names it --
+  //     never a note that leaves the check silently undone.
+  //   ROWSET_HASH is compared against the hash of the parsed rows; a file that cannot carry a
+  //     correct one is refused (tools/rowsethash.py is the independent implementation).
   //
   // ONE FILE = ONE KEY (2026-09-13 decision): the file NAME carries the whole outer key --
   //   <sha256(fingerprint)[0:16]>-<model mvV-shaS>-<X>x<Y>-mb<N>.txt

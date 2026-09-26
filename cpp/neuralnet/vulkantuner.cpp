@@ -123,15 +123,15 @@ namespace VulkanTuner {
     //     key, putting such a key in the other bucket would make the guarantee vanish
     //     silently: the file loads, the policy changes, nothing invalidates anything.
     //   REQUIRED_FOR_CACHE -- a cache is written by us, so absence has no legitimate
-    //     explanation; tolerated on IMPORT (hand-written fixtures) with a "[not key-checked]"
-    //     note.  For ROWSET_HASH the tolerance goes further on IMPORT: the parsed rows are
-    //     hashed live and the declared value is only a hint, since a human cannot compute it.
+    //     explanation.  R-29 removed the other channel, and with it the tolerance: an absent
+    //     key is a REFUSAL that names the key, and ROWSET_HASH is compared against the hash
+    //     of the parsed rows instead of being taken as a hint.
     const char* const REQUIRED_ANY_CHANNEL[] = { "POLICY", "BASELINE" };
     // VERSION / TUNER_VERSION are here to CLOSE the gap that NegativeReasonSpec used to
     // self-document: a file omitting them was neither refused nor reported.  MODE is the
     // user-facing precision request (Decision::modeString).  All three are name-routed exactly
     // like MODEL/BOARD -- the file NAME already carries the key, so the header only has to
-    // confirm it: absence is refused on the cache channel and loudly NOTED on IMPORT.
+    // confirm it: absence is refused on the cache channel -- the one channel left.
     const char* const REQUIRED_FOR_CACHE[] = { "MODEL", "BOARD", "MAXBATCH", "ROWSET_HASH", "CREATED",
                                                "VERSION", "TUNER_VERSION", "MODE" };
 
@@ -193,10 +193,9 @@ namespace VulkanTuner {
     //                     warning about "auto" on every reference-arm run would train people to
     //                     ignore warnings -- while the reference arm's probe face is itself an
     //                     acceptance criterion.  A non-default PRIME really was asked for.
-    //   ignoredUnderOff   is it ALSO ignored when cfg vulkanTune=off?  IMPORT is a read, so it
-    //                     is honoured; EXPORT writes a file the operator named (not the cache),
-    //                     so it is honoured too; RETUNE and PRIME ask for TUNING, which off
-    //                     forbids.
+    //   ignoredUnderOff   is it ALSO ignored when cfg vulkanTune=off?  Both rows left in the
+    //                     table (RETUNE, PRIME) ask for TUNING, which a read-only tuner cannot
+    //                     do, and both are `true` below.
     //   consequence       what the operator needs to hear.
     struct RequestSwitch {
       const char* env;
@@ -205,8 +204,6 @@ namespace VulkanTuner {
       const char* consequence;
     };
     static const RequestSwitch REQUESTS[] = {
-      { "KATAGO_VK_TUNE_IMPORT", nullptr, false, "nothing was imported and no tuned row will be used" },
-      { "KATAGO_VK_TUNE_EXPORT", nullptr, false, "nothing was exported" },
       { "KATAGO_VK_TUNE_RETUNE", nullptr, true,  "nothing was re-tuned and the cache was not even read" },
       { "KATAGO_VK_TUNE_PRIME",  "auto",  true,  "no prime-time tuning happened (auto is the tool's own setting)" },
     };
@@ -316,9 +313,9 @@ namespace VulkanTuner {
     // have to be revisited.
     //
     // ✅ GAP CLOSED (C2, 2026-09-18): VERSION / TUNER_VERSION are now IN REQUIRED_FOR_CACHE, which
-    // is the fix this note recommended -- absence is refused on the cache channel and reported as
-    // "[not key-checked: VERSION,TUNER_VERSION]" on IMPORT.  The comparisons below still keep their
-    // `found*` guard, and that is not redundant: they answer "is it the RIGHT version", while
+    // is the fix this note recommended -- absence is refused on the cache channel.  The comparisons
+    // below still keep their `found*` guard, and that is not redundant: they answer "is it the
+    // RIGHT version", while
     // REQUIRED_FOR_CACHE answers "did it say at all".  Dropping the guard would make an absent key
     // read as a mismatching one and would name the wrong cause in the refusal line.
     struct NegativeReasonSpec {
@@ -408,16 +405,16 @@ namespace VulkanTuner {
     // ── W3-P1: PROVENANCE -- "this candidate set is THIS process's own measurement" ────────────────
     // "This key has no injection slot" is a KEY-SCOPED and STICKY claim: once it is in the cache the
     // key is skipped until the file's invalidation rule voids it.  It may therefore only be concluded
-    // from a candidate set this process produced ITSELF -- a set read from a file (cache or IMPORT)
+    // from a candidate set this process produced ITSELF -- a set read from a file (the cache)
     // says what SOME OTHER run saw, and a hand-made or dev-reflowed file says nothing at all.  This is
     // the ONE predicate that answers that question, and it is named and printable because the write
     // path has to cite it (R42 pins the citation).
     //
     // Fail-closed by construction: the tested value is the string "measured", and nothing but the
     // enumerator (step 5) ever writes it.  So today the durable negative entry is UNREACHABLE, which
-    // is the intended state until that writer exists -- no writer, no verdict.  The two older guards
-    // (`imported` / `anyRowInstalled`) stay in place: they still decide what the FILE would carry on
-    // the ungated EXPORT channel, which is a different question from what may be remembered.
+    // is the intended state until that writer exists -- no writer, no verdict.  The older guard
+    // (`anyRowInstalled`) stays in place: it answers "did anything install here", which is a
+    // different question from "may a durable verdict be minted from this decision".
     bool negativeProvable(const Decision & d) {
       return d.rowSource == "measured";
     }
@@ -536,8 +533,8 @@ namespace VulkanTuner {
     // separate because they fail for different reasons and are fixed by different people.  The
     // state it rejects is real: a file carrying neither ROW nor NEGATIVE loads without complaint
     // and reads as "this key is already decided" (see the writer comment in formatRowsFileImpl),
-    // so the CACHE path must refuse to create one while EXPORT may still write it (that is how
-    // the format is demonstrated in tests).
+    // so the CACHE write path must refuse to create one -- it is the only writer left, and a
+    // decision that says nothing may not become "this key is already decided".
     // W2: THE effective row set this process may write down -- ONE spelling, used by BOTH the write
     // gate below and the formatter.  Why one spelling and not two: the gate answers "is there anything
     // to write?" and the formatter emits it, so if they disagreed about a set whose rows were all
@@ -545,11 +542,10 @@ namespace VulkanTuner {
     // reader treats as "this key is already decided", i.e. tuning suppressed for ever.
     //
     // 🔴 THREE states, and the third one is why this is not a two-line predicate:
-    //   Absent       (no install recorded)         -> the DECLARED rows.  The EXPORT demonstration path,
-    //                                                 an IMPORTed set that was never installed, the
-    //                                                 self-test's synthetic decisions: an ABSENT mask
-    //                                                 must never silently turn an export into an empty
-    //                                                 file.
+    //   Absent       (no install recorded)         -> the DECLARED rows.  The self-test's synthetic
+    //                                                 decisions and a set that never reached install:
+    //                                                 an ABSENT mask must never silently turn a
+    //                                                 declared set into an empty file.
     //   Present      (mask and sizes match)        -> the rows the mask marks installed (decision C).
     //   Inconsistent (mask, sizes DO NOT match)    -> the EMPTY set + loud.  This is an INTERNAL ERROR,
     //                                                 and returning the declared rows here would write
@@ -661,7 +657,7 @@ namespace VulkanTuner {
       // R-28 step (2): THE ONE ROW WHOSE FLAG IS TRUE AND WHOSE CLASS IS `gate`.  It carries
       // `measured-here` for the same reason the rows above do (W3-P1): what a gate refusal remembers --
       // "this device's block times spike too often for the comparison to be trusted" -- is a claim
-      // about the DEVICE, so only a candidate set THIS process measured may mint it.  A cache/IMPORT
+      // about the DEVICE, so only a candidate set THIS process measured may mint it.  A cache file
       // channel cannot even supply the inputs (a file carries no spike count), and the provenance
       // condition is what makes that structural instead of hopeful.
       // Its durable effect is a NEGATIVE entry and NEVER a row set: `rejectBySpikeGate` clears the rows
@@ -1216,8 +1212,8 @@ namespace VulkanTuner {
     // observed driver boundary (E1) is stated in `vulkan-tile-validity.h`
     // (vk_tile_e1_blacklist_hit / vk_tile_e1_blacklist_reason), because it has TWO readers -- this
     // table, which keeps the combination out of the ENUMERATED set, and the backend's install
-    // firewall, which must refuse a row that came from the cache or from KATAGO_VK_TUNE_IMPORT and
-    // therefore never passed through enumeration.
+    // firewall, which must refuse a row that came from a FILE (the cache) and therefore never
+    // passed through enumeration.
     // Why a FUNCTION POINTER and not the three ints it used to hold: two hand-written copies of the
     // same boundary drift, and the drift is invisible -- a rule whose numbers say `== 256` while the
     // firewall's says `>= 256` leaves a whole half-line reachable through whichever gate is weaker.
@@ -1665,9 +1661,9 @@ namespace VulkanTuner {
     string policyFingerprint() {
     // ── THE DECLARED POLICY CONSTANTS (R-28 step (1), 2026-09-26) ────────────────────────────────
     // ONE table, read by policyFingerprint() (it BUILDS the string from these rows) and by the smoke's
-    // A1 export clause (it checks that the header the product actually writes carries them).  `text` is
+    // A33 clause (it checks that the `POLICY` row the real formatter emits carries them).  `text` is
     // computed FROM the constant, so a value and its spelling cannot drift apart, and removing the loop
-    // or a row cannot land green: the exported file stops carrying the constant.
+    // or a row cannot land green: the emitted `POLICY` row stops carrying the constant.
     //
     // WHY THESE ARE IN THE POLICY AT ALL, and it is the plan's own requirement rather than this batch's
     // idea: tune-gaps.md says "代码 / 谓词 / 规则表 / 枚举器 / 判据 / 门参数 -> b<rev16>; **门参数进
@@ -1767,7 +1763,8 @@ namespace VulkanTuner {
       // The declared judgement-layer constants, appended LAST so that a reader of the string sees the
       // knobs (env, human-set) before the values that are baked into this binary.  They are appended by
       // the loop rather than spelled here: POLICY_CONSTANTS is the one place a value and its spelling
-      // live, and the loop's absence is visible in the exported file (the smoke asserts it).
+      // live, and the loop's absence is visible in the formatter's own output (the self-test probe
+      // reports the emitted `POLICY` row and the smoke's A33 votes on it).
       for (const PolicyConstantSpec & c : POLICY_CONSTANTS) {
         s += "|";
         s += c.name;
@@ -1856,9 +1853,9 @@ namespace VulkanTuner {
     }
 
     // ---- the ONE row-set file format (see vulkantuner.h for the field list) ----------
-    // The cache file, KATAGO_VK_TUNE_IMPORT and KATAGO_VK_TUNE_EXPORT all go through these
-    // functions, so "the file the tuner writes" and "the file a human can hand-write" are
-    // the same thing -- there is no second parser to drift.
+    // The cache file goes through these functions, so "the file the tuner writes" and "the
+    // file a developer drops at the cache path" are the same thing -- there is no second
+    // parser to drift.
     struct RowsFile {
       bool foundVersion = false;
       int version = 0;
@@ -1891,26 +1888,25 @@ namespace VulkanTuner {
       // REQUIRED on the line (an unscoped marker would have to be read as "some kind", the fail-open
       // default the closed set refuses), so an empty vector here can only mean "no NEGATIVE line".
       vector<string> negativeScope;
-      // Human-readable keys that were ABSENT; the caller logs them as "not key-checked"
-      // rather than pretending the check happened.
+      // Human-readable keys that were ABSENT.  The loader REFUSES a file carrying any (a
+      // machine-written cache has no excuse), and the refusal NAMES them, so "missing" is
+      // never read as "verified".
       vector<string> absentKeys;
     };
 
     // ── W3b: MAY THE LOADER BELIEVE A FILE'S NEGATIVE ENTRY? ─────────────────────────────────────────
-    // The read side of the same rule W3-P1 closed on the write side.  Two channels share this loader and
-    // they are NOT the same kind of statement:
+    // The read side of the same rule W3-P1 closed on the write side.  There is ONE channel left (the
+    // cache), and it is not the same kind of statement as a set THIS process measured:
     //   cache  -- this device's own MEMORY.  It is key-checked (fingerprint, version, policy, baseline,
     //             the outer keys, ROWSET_HASH), it is the file the writer maintains, and the operator's
     //             "I do not trust this" switch is KATAGO_VK_TUNE_RETUNE.  Believing it is the DESIGN.
-    //   IMPORT -- a REQUEST (a reflow/development channel): the outer keys and ROWSET_HASH are skipped
-    //             for it, so it is not even key-checked.  The write side already refuses to mint a
-    //             verdict from one ("an IMPORT is not evidence that we measured this key"); the same
-    //             sentence has to hold on the read side, or a hand-passed file would decide for this
-    //             device by simply asserting it.
+    //   a file whose rows this process did not measure -- the write side refuses to mint a verdict from
+    //             one ("a set that came from a FILE is not evidence that we measured this key"), so a
+    //             file that ASSERTS a marker does not make the write side re-assert it.
     // Named and printable for the same reason `negativeProvable` is: R43 pins that the ONE adoption site
     // CITES this predicate instead of re-deriving the rule from a boolean expression in place.
-    bool negativeAdoptable(const RowsFile& file, bool fromImport) {
-      return !fromImport && file.negative && file.rows.empty();
+    bool negativeAdoptable(const RowsFile& file) {
+      return file.negative && file.rows.empty();
     }
 
     // Read the whole file rather than using FileUtils::readFile: that helper throws on failure
@@ -2314,9 +2310,9 @@ namespace VulkanTuner {
       // One file = one key, so "this key has rows" and "this key was all-rejected" are
       // mutually exclusive statements.  The writer refuses to emit both; the reader still
       // copes with a hand-edited file containing both (rows win, loudly).  The remaining
-      // case -- neither -- is only reachable through EXPORT of an empty row set, which is
-      // how the format is demonstrated in tests; the CACHE write path cannot create one
-      // because cacheEntryWritable() refuses it before this function is called.
+      // case -- neither -- has no producer at all since R-29: the cache write path cannot
+      // create one (cacheEntryWritable() refuses it before this function is called), so the
+      // refusal below is a guard rather than a branch any run can reach.
       // W2: this test now runs on the rows actually emitted.  When every row was dropped the emitted
       // set is EMPTY and a NEGATIVE-only file is exactly the right statement -- which is the
       // structural-all-reject outcome; the old `d.rows` spelling would have refused to write it.
@@ -2375,7 +2371,7 @@ namespace VulkanTuner {
       }
       if (d.negative) {
         // The NEGATIVE segment.  Without this the negative channel had no WRITER at all: a
-        // decision that was (or had loaded) a negative entry exported as `ROWS 0` and nothing
+        // decision that was (or had loaded) a negative entry written as `ROWS 0` and nothing
         // else -- i.e. the marker was silently dropped and the round trip was broken, which is
         // the same "it looked fine" failure the read side already refuses to make.
         //
@@ -2641,6 +2637,10 @@ namespace VulkanTuner {
     int declared = 0, refused = 0, allowed = 0;
     bool ok = true;
     string firstBad;
+    // R-29 Cut 5: the moved `A1_export` POLICY assertion's two readings (see the probe block at
+    // the end of this function).  Declared here so the final verdict can include them.
+    bool policyRowOk = false;
+    string policyRowText = "FAIL: the POLICY-row probe did not run";
     // R0 legs: pin rowSetHash() to the STANDARD FNV-1a 64 parameters AND to the wire protocol
     // (field set, field order, 4-byte little-endian feed).  Both expected values come from an
     // INDEPENDENT implementation (python, logs-t3/1b2b/r0-*), never from this function:
@@ -2989,7 +2989,7 @@ namespace VulkanTuner {
     // reason.  Here the judgement is driven directly -- AND through the real writer, so a deleted branch
     // shows up as a FAIL in this line instead of as a missing NOTICE in some future leg.
     //
-    // The cases are the closed set of "what may happen to the marker": (a) an import may not create one,
+    // The cases are the closed set of "what may happen to the marker": (a) a file-sourced set may not create one,
     // (b) one is not created when our own account refutes it, (c) a from-file marker is retired by a
     // durable row, (d) a device-only all-reject DOES create one, (e) our-gap creates none.  (d) is the
     // CONTROL: without it, a finalizer that simply never set a marker would pass all the others.
@@ -2999,8 +2999,7 @@ namespace VulkanTuner {
       switch (v) {
         case Decision::FinalizeVerdict::Nothing: return "Nothing";
         case Decision::FinalizeVerdict::Measured: return "Measured";
-        case Decision::FinalizeVerdict::ImportedRejected: return "ImportedRejected";
-        case Decision::FinalizeVerdict::AnyRowInstalled: return "AnyRowInstalled";
+          case Decision::FinalizeVerdict::AnyRowInstalled: return "AnyRowInstalled";
         case Decision::FinalizeVerdict::OurGap: return "OurGap";
         case Decision::FinalizeVerdict::DeviceOnlyAllReject: return "DeviceOnlyAllReject";
         case Decision::FinalizeVerdict::StaleFromFileNegativeRetired: return "StaleFromFileNegativeRetired";
@@ -3047,22 +3046,6 @@ namespace VulkanTuner {
     // condition and that its sentence equals the one the harness greps are R42's (b) and (e).
     const char * measuredMarker = MEASURED_MARKER;
 
-    { // (a) an IMPORTed set may not create a durable verdict
-      Decision d;
-      d.deviceName = "self-test";
-      d.cachePath = probePath;
-      d.imported = true;
-      d.install.declared = 1;
-      d.install.installed = 0;
-      d.allRejectReasonsAreDevice = true;   // so no OTHER condition can be the reason it is refused
-      // 🔴 W3-P1 moved the durable refusal one step earlier for every structural all-reject this process
-      // did not measure, so this call no longer reaches the CONTENT refusal ("nothing to write") it used
-      // to reach: what it pins now is that the refusal NAMES provenance.  The guard's own effect -- no
-      // marker AT ALL -- is the `wantNegative == false` half, and that is the half that keeps an
-      // IMPORTed set from carrying a marker onto the ungated EXPORT channel.
-      verdictCase("(a) imported all-reject", d, Decision::FinalizeVerdict::ImportedRejected,
-                  Decision::FinalizeVerdict::ImportedRejected, false, measuredMarker);
-    }
     { // (b) our own account refutes the marker
       Decision d;
       d.deviceName = "self-test";
@@ -3268,7 +3251,7 @@ namespace VulkanTuner {
       // The shape it builds is one the FORMATTER refuses by throwing (a marker AND a row for the SAME
       // kind), and the point is that the refusal comes back as a REFUSAL rather than as an exception out
       // of the shell.  Every other case above either has no rows or a marker of another kind, so without
-      // this one the `try`/`catch` around the export and cache paths would be a clause nothing could
+      // this one the `try`/`catch` around the cache write path would be a clause nothing could
       // falsify -- which is the "declared but never executed" gap this project refuses to ship.  The
       // criterion is the refusal's OWN prefix: a writer that crashed would not produce a string at all.
       Decision d;
@@ -3520,6 +3503,65 @@ namespace VulkanTuner {
       }
     }
 
+    // ── R-29 Cut 5: THE MOVED `A1_export` ASSERTION, READ FROM THE REAL FORMATTER ─────────────────
+    // The `A1_export` Check voted on the header of the file the EXPORT channel wrote, and the export
+    // channel is gone (Cut 1).  Its POLICY half -- "the header the product writes carries all 8 declared
+    // constants, in order" -- must keep a carrier: it is the mechanical witness that a gate parameter
+    // cannot leave policyFingerprint unnoticed.  The carrier is the SAME function the cache write path
+    // calls (formatRowsFileImpl), driven with the REAL policy string and one LEGAL row.  The row is not
+    // decoration: the formatter refuses a decision carrying neither rows nor a marker, which is the rule
+    // A8c/A10 assert, so a row-less probe would throw instead of proving anything.
+    // The emitted `POLICY` row is reported VERBATIM so the smoke can hold the declared constants as an
+    // INDEPENDENT spelling -- a check that compares the product with itself cannot fail (R47's comment
+    // names that disease), and the second spelling is the same discipline rowsethash.py follows for
+    // ROWSET_HASH.
+    {
+      Decision pd;
+      pd.policyFingerprint = policyFingerprint();
+      pd.baselineVersion = "1";
+      pd.modelIdentity = "self-test";
+      aMeasuredSet(pd);
+      vk_tune_row_spec pr {};
+      pr.path = VK_TILE_PATH_SCALAR;
+      pr.src0_type = 1;
+      pr.src1_type = 0;
+      pr.geom.BM = 64;   pr.geom.BN = 64;      pr.geom.BK = 0;
+      pr.geom.WM = 32;   pr.geom.WN = 32;      pr.geom.WMITER = 1;
+      pr.geom.TM = 4;    pr.geom.TN = 4;       pr.geom.BS = 128;
+      pr.geom.pad = -1;  pr.geom.reshape = -1; pr.geom.smaller = -1;
+      pd.rows.push_back(pr);
+      // The marker is not a shortcut, it is the shape this file can WRITE: the formatter emits the
+      // durable per-row set (rowsForWrite), and a synthetic decision installs no row anywhere, so a
+      // row-only probe would come out EMPTY and the formatter refuses "neither rows nor a marker".
+      // The (k) case above uses exactly this marker shape and its output is already read back.
+      rejectBySpikeGate(pd, judgeSpikeRate(25u, 100u, 6u));
+      string emittedPolicy;
+      try {
+        emittedPolicy = formatRowsFileImpl(pd);
+      }
+      catch (const std::exception & e) {
+        policyRowText = string("FAIL: the formatter threw: ") + e.what();
+      }
+      if (policyRowText.compare(0, 5, "FAIL:") != 0) {
+        const size_t at = emittedPolicy.find("\nPOLICY ");
+        if (at == string::npos) {
+          policyRowText = "FAIL: the emitted file carries no POLICY row";
+        } else {
+          const size_t eol = emittedPolicy.find('\n', at + 1);
+          policyRowText = emittedPolicy.substr(at + 1, (eol == string::npos ? emittedPolicy.size() : eol) - at - 1);
+          policyRowOk = policyRowText.compare(0, 7 + pd.policyFingerprint.size(),
+                                              "POLICY " + pd.policyFingerprint) == 0;
+          if (!policyRowOk) {
+            policyRowText = "FAIL: the emitted POLICY row is not the string policyFingerprint() built: " + policyRowText;
+          }
+        }
+      }
+    }
+    if (!policyRowOk) {
+      ok = false;
+      if (firstBad.empty()) { firstBad = string("(m) the POLICY row the formatter emits: ") + policyRowText; }
+    }
+
     const bool absent = !FileUtils::exists(probePath);    logLine("cache write self-test: " + to_string(declared) + " outcome(s) declared, "
             + to_string(refused) + " refused by the state gate, " + to_string(allowed)
             + " state-writable; probe file " + (absent ? "absent" : "PRESENT")
@@ -3527,7 +3569,8 @@ namespace VulkanTuner {
             + ((encWrote && encReadBack && encRemoved) ? "ok" : "FAIL") + "]"
             + "; (a)(b) no marker / (c) from-file retirement / (d) measured control / (e) our-gap / (f) all-reject->measured retracts / (g)(h) fold AND+mismatch / (i) unmeasured marker refused by name / (j) the formatter's throw is contained / (k) spike gate: both directions + no-row-set + the durable entry's write/read pair / (l) third branch: drop accounting + the three directions + the finalizer leaves it alone ["
             + (verdictOk ? "ok" : "FAIL: " + verdictBad) + "]"
-            + " [" + ((ok && absent && encWrote && encReadBack && encRemoved && verdictOk) ? "ok" : "FAIL") + "]"
+            + "; POLICY row [" + policyRowText + "]"
+            + " [" + ((ok && absent && encWrote && encReadBack && encRemoved && verdictOk && policyRowOk) ? "ok" : "FAIL") + "]"
             + (ok ? "" : " first problem: " + firstBad));
   }
 
@@ -4002,12 +4045,6 @@ namespace VulkanTuner {
     const ModelIdentity& model,
     const TunePolicy& policy
   ) {
-    // Path-valued env vars are read through the ONE reader (r6, FileUtils::readPathEnv) so that a
-    // non-ASCII path is UTF-8 here and means the same file to every layer below.  The callers test
-    // `.empty()`, which is what `!= nullptr && [0] != '\0'` used to express: unset and empty both
-    // mean "not given".
-    const string importEnv = FileUtils::readPathEnv("KATAGO_VK_TUNE_IMPORT");
-    const string exportEnv = FileUtils::readPathEnv("KATAGO_VK_TUNE_EXPORT");
     // KATAGO_VK_TUNE_RETUNE=1: ignore whatever is on disk (rows AND the negative entry) and
     // decide again.  It is the operator's "I do not trust this file" switch, and it is
     // deliberately about the whole file rather than about the rows or the negative marker:
@@ -4155,18 +4192,12 @@ namespace VulkanTuner {
         }
       }
 
-      // One loader for both channels: an import is just a cache file that lives somewhere
-      // else and is keyed by the operator instead of by the device.  Sharing it is what
-      // makes "the file I hand-wrote behaves exactly like the file the tuner wrote" true.
+      // One loader, one channel (R-29 left exactly one).  The file is read from the cache path
+      // and keyed by the device: a file a developer drops there IS the input, by design, and
+      // "the file I hand-wrote behaves exactly like the file the tuner wrote" stays true.
       const char* loadPath = nullptr;
       const char* loadKind = nullptr;
-      bool fromImport = false;
-      if (!importEnv.empty()) {
-        loadPath = importEnv.c_str();
-        loadKind = "KATAGO_VK_TUNE_IMPORT";
-        fromImport = true;
-      }
-      else if (d->cacheFileExists) {
+      if (d->cacheFileExists) {
         loadPath = d->cachePath.c_str();
         loadKind = "cache";
       }
@@ -4246,36 +4277,28 @@ namespace VulkanTuner {
                               + " current=" + d->baselineVersion + ")");
           d->note = string(loadKind) + " was measured against another policy baseline";
         }
-        else if (!fromImport && !file.absentKeys.empty()) {
-          // Channel-dependent required keys (2026-09-13 review).  Both channels share this
-          // loader, but they differ in what they may tolerate:
-          //   cache  -- written by us, so there is NO legitimate reason for a header key to
-          //             be missing.  "The name routes, the header verifies" only holds if the
-          //             header actually carries the key: without MODEL, a cache copied from
-          //             another model and renamed to this key's name would pass every check
-          //             left.  That is the one path where the model dimension would silently
-          //             stop being verified, so the cache channel requires it.
-          //   IMPORT -- the operator names the file explicitly, and hand-written fixtures must
-          //             stay possible; absence is tolerated and loudly REPORTED ("[not
-          //             key-checked: ...]") rather than only noted internally, so a human can
-          //             see that the model dimension was not verified on this channel.
+        else if (!file.absentKeys.empty()) {
+          // A machine-written cache has NO legitimate reason to be missing a header key, and
+          // "the name routes, the header verifies" only holds if the header actually carries
+          // the key: without MODEL, a file copied from another model and renamed to this key's
+          // name would pass every check left.  So a missing key is a REFUSAL on the one channel
+          // that is left (the import channel, whose fixtures are hand-written, is retired).
           string missing;
           for (size_t i = 0; i < file.absentKeys.size(); i++) {
             missing += (i ? "," : "") + file.absentKeys[i];
           }
           d->cacheState = "rejected";
           refuseLoad(loadKind, "missing header key(s) " + missing
-                              + " (a machine-written cache always carries them;"
-                                " KATAGO_VK_TUNE_IMPORT tolerates their absence for hand-written files)");
+                              + " (a machine-written cache always carries them)");
           d->note = string(loadKind) + " is missing " + missing + ", so the model dimension would not be verified";
         }
         else if (file.foundMode && file.mode != d->modeString) {
           // The user-facing mode is part of the key even though the NAME already routes by it:
           // this check is what turns "a file renamed to look like another mode's file" into a
           // REFUSAL instead of an install of rows measured for a different precision.  It is
-          // guarded by foundMode so an IMPORTed hand-written fixture that never mentions MODE is
-          // still tolerated (and loudly noted) rather than refused as a mismatch -- the same
-          // split the channel-dependent required keys use.
+          // guarded by foundMode for the same reason the version comparisons keep theirs: MODE is
+          // in REQUIRED_FOR_CACHE, so an absent one is refused above, and the guard keeps "is it the
+          // RIGHT mode" from being answered by "did it say at all".
           d->cacheState = "rejected";
           refuseLoad(loadKind, "mode mismatch (file=" + file.mode + " current=" + d->modeString + ")");
           d->note = string(loadKind) + " was measured with another precision mode";
@@ -4299,7 +4322,7 @@ namespace VulkanTuner {
             refuseLoad(loadKind, "outer key mismatch on " + keyMismatch);
             d->note = string(loadKind) + " is for a different model/board/batch";
           }
-          else if (!fromImport && file.foundRowSetHash
+          else if (file.foundRowSetHash
                    && file.declaredRowSetHash != rowSetHash(file.rows)) {
             // The cache channel: the file must describe the rows it contains.  A mismatch means
             // it was edited or truncated after it was written.
@@ -4310,29 +4333,6 @@ namespace VulkanTuner {
             d->note = string(loadKind) + " was edited after it was written";
           }
           else {
-            string keyNote;
-            if (!file.absentKeys.empty()) {
-              keyNote = " [not key-checked:";
-              for (size_t i = 0; i < file.absentKeys.size(); i++) {
-                keyNote += (i ? "," : " ") + file.absentKeys[i];
-              }
-              keyNote += "]";
-            }
-            if (fromImport && file.foundRowSetHash
-                && file.declaredRowSetHash != rowSetHash(file.rows)) {
-              // IMPORT: the declared hash is a HINT, never a refusal reason -- a hand-written
-              // fixture cannot compute it, and the rows that were actually parsed are what get
-              // used.  But it must be LOUD: silently accepting a file that carries a hash for
-              // different rows is exactly the "it looked fine" trap (lesson #46).
-              logLine("WARNING: " + string(loadKind) + " declares ROWSET_HASH "
-                      + file.declaredRowSetHash + " but the parsed rows hash to "
-                      + rowSetHash(file.rows) + "; using the parsed rows"
-                      " (IMPORT treats the declared hash as a hint)");
-            }
-            d->imported = fromImport;
-            if (fromImport) {
-              d->importedFrom = loadPath;
-            }
             // W4b: THE SCOPE CHECK, and it is DEEPENED DEFENCE rather than a production guard -- stated
             // here so nobody strengthens the claim later by accident.  Two INDEPENDENT reasons make a
             // mismatching file unreachable from our own writer:
@@ -4385,40 +4385,28 @@ namespace VulkanTuner {
             if (d->cacheState != "rejected") {
             d->rows = file.rows;
             d->rowCount = d->rows.size();
-            d->rowSource = fromImport ? "import" : "cache";
+            d->rowSource = "cache";
             // 🔴 ONE fact, ONE spelling (W3b): `cacheState` and `negative` used to be two independent
             // expressions of the same question, so limiting only one of them would have printed
             // `cache_state=negative` next to `d->negative == false` -- two readings of ONE run that
             // contradict each other.  Both derive from the named predicate now.
-            const bool adoptedNegative = negativeAdoptable(file, fromImport);
+            const bool adoptedNegative = negativeAdoptable(file);
             d->cacheState = adoptedNegative ? "negative" : "loaded";
             d->negative = adoptedNegative;
             if (adoptedNegative) {
-              // W4b: the SCOPE travels with the marker.  EXPORT re-emits the line, so dropping it here
-              // would make the round trip lose the very field this batch added -- and the cache writer
-              // refuses an unscoped marker, so a loaded-then-exported file would become unwritable.
+              // W4b: the SCOPE travels with the marker.  The cache writer refuses an unscoped marker,
+              // so dropping it here would make a file that loaded fine become unwritable on the next
+              // write -- the very field this batch added would be lost on the way through.
               d->negativeScope = file.negativeScope;
             }
-            if (fromImport && file.negative && file.rows.empty()) {
-              // The marker is NOT adopted, and that must be LOUD: with an empty row set this file is
-              // byte-shape-identical to the trap file that says neither ROW nor NEGATIVE, so
-              // `cache_state=loaded` + `rows=0` cannot tell them apart -- the loud is the only
-              // discriminator, which is why the acceptance leg asserts on it.  (Registered as a counted
-              // line: the smoke's A27 parses the literal below, so it must stay on ONE source line.)
-              logLine("WARNING: " + string(loadKind) + " carries a NEGATIVE entry ("
-                      + file.negativeReason + ")"
-                      + " but NEGATIVE entry ignored: an IMPORT is a request, not a durable verdict"
-                      + " (a cache file is this device's memory and is key-checked; an IMPORT file is "
-                        "neither)");
-            }
             if (d->negative) {
-              // Carried onto the Decision, not just into the note: EXPORT has to re-emit the
-              // marker (it writes what a cache file would contain), and the cache writer has to
-              // check the reason against the closed set.  In the "both ROW and NEGATIVE" case
+              // Carried onto the Decision, not just into the note: the cache writer checks the
+              // reason against the closed set and writes the marker back out, so it has to be
+              // here.  In the "both ROW and NEGATIVE" case
               // below the reason is deliberately dropped with the stale entry.
               d->negativeReason = file.negativeReason;
-              // W2 (post-review): record WHO wrote this marker.  EXPORT re-emits it and the read-side
-              // legs assert that "nothing to do" means "nothing written", so the finalizer must be able
+              // W2 (post-review): record WHO wrote this marker.  The read-side legs assert that
+              // "nothing to do" means "nothing written", so the finalizer must be able
               // to tell a marker it owns from one the loader handed it -- see Decision::NegativeOrigin.
               // (`d->negative` is false on the other branch, where NegativeOrigin::None is already the
               // value, so this one assignment is the only place a from-file origin can be born.)
@@ -4441,58 +4429,16 @@ namespace VulkanTuner {
               // written on a timeout (t1-schema.md section 1), because "we ran out of time"
               // is not a property of the device.
               d->note = string(loadKind) + ": negative entry (" + file.negativeReason
-                       + "), no tuning attempted" + keyNote;
+                       + "), no tuning attempted";
             }
             else {
-              d->note = string(loadKind) + " loaded: " + to_string(d->rowCount) + " row(s)"
-                      + keyNote;
+              d->note = string(loadKind) + " loaded: " + to_string(d->rowCount) + " row(s)";
             }
             }
           }
         }
       }
 
-      // EXPORT writes exactly what a cache file would contain, through the same writer, so
-      // the format's round trip is exercised on every run that asks for it (and so a failed
-      // write is loud rather than a missing file nobody notices).
-      if (!exportEnv.empty()) {
-        // W4b (D3b): the EXPORT path is wrapped in its own protection, because `formatRowsFile` REFUSES
-        // some decisions by THROWING (a NEGATIVE entry whose reason or scope is outside its closed set,
-        // more rows than the cap, ROW and NEGATIVE for the same kind).  Until this batch that refusal
-        // escaped to makeDecision's outer catch and killed the run after the work was already done; the
-        // contract every other write path already states -- "every load failure is fail-open + loud, never
-        // an exception out of the hook" -- applies to a write path at least as much, since a tuner that
-        // can take down a search is worse than no tuner.  Same shape as the cache path: convert to an
-        // error string and say so, loudly, rather than propagating.
-        // R16's clause about this: EVERY declared write path must be exception-safe, export and cache
-        // alike -- the declaration is what makes the next write path have to answer the same question.
-        string path = exportEnv;
-        string err;
-        string content;
-        // WRITE-PATH: export
-        // Declared for guardrail R16.  An export writes a file the OPERATOR named, never the
-        // cache, so it is allowed even in read-only mode (vulkanTune=off) -- which is why this
-        // is the one write path that does not have to sit behind a policy.off gate.  The cache
-        // write path (step 3) carries its own tag and MUST be gated.
-        bool wrote = false;
-        try {
-          content = formatRowsFile(*d);
-          wrote = writeFileAtomic(path, content, err);
-        }
-        catch (const std::exception& e) {
-          wrote = false;
-          err = string("the export was refused by the formatter: ") + e.what();
-        }
-        // ONE reporting site for both outcomes, so the success line and the failure line cannot drift
-        // apart and neither can be forgotten.
-        if (wrote) {
-          logLine("export path=" + path + " rows=" + to_string(d->rowCount)
-                  + " bytes=" + to_string(content.size()) + " ok");
-        }
-        else {
-          logLine("WARNING: export to " + path + " failed: " + err + " (fail-open: nothing changed)");
-        }
-      }
 
       d->tuneMs = chrono::duration<double, milli>(chrono::steady_clock::now() - t0).count();
       logLine(formatDecisionLine(*d, nnXLen, nnYLen, maxBatchSize));
@@ -4538,8 +4484,8 @@ namespace VulkanTuner {
   //     printed every (a)/(b) NOTICE exactly twice -- once from the install path, once from the once
   //     point -- because this function both computed AND printed.  A finalizer that is not idempotent is
   //     what made that possible; making it a pure function removes the whole class.
-  //   * NegativeOrigin::AllReject only => a marker READ FROM A FILE belongs to the loader (EXPORT
-  //     re-emits it; the read-side legs assert "nothing to do means nothing written"), so all this
+  //   * NegativeOrigin::AllReject only => a marker READ FROM A FILE belongs to the loader (the
+  //     read-side legs assert "nothing to do means nothing written"), so all this
   //     function may do to it is RETIRE it on the one transition that makes it false by our own account
   //     -- a durable row was installed for this key -- and say so as StaleFromFileNegativeRetired.
   // Together those two rules make `formatRowsFileImpl`'s "both ROW and NEGATIVE" throw (:1078)
@@ -4566,14 +4512,6 @@ namespace VulkanTuner {
     }
     if (d.install.declared > 0) {
       d.outcome = "structural-all-reject";
-      if (d.imported) {
-        // (a) An IMPORTed row set may not CREATE a durable verdict.  The product says so itself in the
-        // same runnable path ("IMPORT ... not evidence that we measured it"): a hand-off is a REQUEST,
-        // while the negative entry outlives the process.  Reading an existing file stays allowed; only
-        // concluding from an imported set is refused.  The write gate then refuses by itself (rows
-        // empty and no negative), which is also why no file appears.
-        return Decision::FinalizeVerdict::ImportedRejected;
-      }
       if (d.anyRowInstalled) {
         // (b) Self-falsification guard.  Some context of this device installed a row for this very key,
         // so "this key has no injection slot" is false BY THIS PROCESS'S OWN ACCOUNT.  The trigger is
@@ -4609,11 +4547,6 @@ namespace VulkanTuner {
       case Decision::FinalizeVerdict::Measured:
       case Decision::FinalizeVerdict::DeviceOnlyAllReject:
         break;
-      case Decision::FinalizeVerdict::ImportedRejected:
-        logLine("NOTICE: " + d.deviceName + ": every imported row was rejected, but an IMPORT is not "
-                "evidence that we measured this key (it is a reflow/development channel): NO negative "
-                "entry is created -- nothing durable may be concluded from an imported set");
-        break;
       case Decision::FinalizeVerdict::AnyRowInstalled:
         logLine("NOTICE: " + d.deviceName + ": rows were rejected, but another context of this device "
                 "INSTALLED at least one row for this SAME key, so 'no-injection-slot' would be false: NO "
@@ -4642,8 +4575,8 @@ namespace VulkanTuner {
       return;
     }
     // The backend prints the per-context install line (it is the only side that can name
-    // the context), so this side reports a failure, and -- B1 -- the IMPORT face: an
-    // imported row set is USER DATA that decides which production pipelines get built, and
+    // the context), so this side reports a failure, and -- B1 -- the from-file face: a row
+    // set that came from a FILE is USER DATA that decides which production pipelines get built, and
     // the one thing it must never do is change behaviour without saying so (lesson #46).
     const vk_tune_row_spec* rows = decision->rows.empty() ? nullptr : decision->rows.data();
     vk_tune_install_result installed {};
@@ -4792,11 +4725,6 @@ namespace VulkanTuner {
                    ? ("the written file " + decision->writeTarget
                       + " does NOT contain this context's rows")
                    : ("no file was written (the write gate refused: " + decision->writeRefusal + ")")));
-    }
-    if (decision->imported && installed.declared > 0) {
-      logLine("IMPORT installed " + to_string(installed.installed) + " of "
-              + to_string(installed.declared) + " row(s) from " + decision->importedFrom
-              + " (not key-checked: IMPORT is a reflow/development channel, not evidence that we measured it)");
     }
   }
 
