@@ -348,6 +348,22 @@ namespace VulkanTuner {
       // loader comparison + an R12 update), not an edit to this row; a per-shape LIFETIME is not
       // expressible at all, because the file name carries the whole key.
       { "no-gain",           "full-key-set" },
+      // R-28 step (2), 2026-09-26: `gate-reject` is the FOURTH name, and it is the first one whose
+      // producer lands in the SAME batch that declares it.  The reason and the OUTCOME share the
+      // spelling deliberately: they are TWO closed sets (this one is the file's reason token, the other
+      // is the decision's state) that name ONE meaning -- "the runtime spike-rate gate refused this
+      // run's measurement" -- so neither may be read as "there was nothing to measure" (that is the
+      // primitive's own NOT_MEASURED, and R-10 keeps the two names apart).
+      // WHY IT IS DURABLE AT ALL (the ruling, tune-gaps.md A1-A): a fail-closed gate plus the deleted
+      // ceiling (R-1) means a machine whose TRUE spike rate sits near the bound would pay the whole
+      // measurement on every start and never land anything (13-26 s per start on the 5080) -- this
+      // entry IS the backoff that ends that loop, and it is what the writable outcome above is FOR.
+      // SCOPE vs FACT: the fact is device-level (the spike rate follows the device, not the run), while
+      // the entry is key-level, so every key pays its own measurement and records its own entry.  That
+      // is accepted and written down rather than read as "one entry should have been enough".
+      // Its lifetime is `full-key-set` like every other reason here (R17 pins the whole set and the
+      // loader comparisons that redeem that value).
+      { "gate-reject",       "full-key-set" },
     };
 
     // The closed set holds on BOTH sides: the parser (so an uninterpretable file is refused
@@ -585,14 +601,20 @@ namespace VulkanTuner {
     // (a row set vs a NEGATIVE entry), which is why the class is declared as well -- the class is
     // what section 6.4's rule table names, and what step 4/5 will branch on.
     //
-    // Class (b) (every candidate rejected by the validation gate) was declared NOT writable until
-    // the gate / tau / soft-gate parameters entered policyFingerprint, because changing a gate
-    // parameter would otherwise leave the key permanently skipped (section 6.4 items 1/5 -- the same
-    // argument R17 makes for the file's reason).  THAT CONDITION IS NOW MET: the gate/statistics
-    // constants are rows of POLICY_CONSTANTS and policyFingerprint() appends them, so a gate change
-    // changes the key by construction instead of by trusting that the revision moved (R-28 step (1),
-    // 2026-09-26).  The writable flag itself is flipped in the next step of the same batch, with the
-    // same-spelling NEGATIVE reason.
+    // Class (b) -- a run the RUNTIME GATE refused -- was declared NOT writable until the gate / tau /
+    // soft-gate parameters entered policyFingerprint, because changing a gate parameter would
+    // otherwise leave the key permanently skipped (section 6.4 items 1/5 -- the same argument R17 makes
+    // for the file's reason).  🔴 ONE MEANING FOR THE DEPLOYED NAME: this comment used to say "every
+    // candidate rejected by the validation gate", which is a DIFFERENT claim; the name's carrier is
+    // settled by the ruling row in tune-gaps.md A1-A (the P12 runtime spike-rate gate), and
+    // `rejectBySpikeGate` below is the only thing that mints it.
+    // THAT CONDITION IS NOW MET: the gate/statistics constants are rows of POLICY_CONSTANTS and
+    // policyFingerprint() appends them, so a gate change changes the key by construction instead of by
+    // trusting that the revision moved (R-28 step (1), 2026-09-26).  The writable flag is TRUE and the
+    // same-spelling NEGATIVE reason is in NEGATIVE_REASONS in THIS batch (R-28 step (2)) -- the two are
+    // indivisible: a same-spelling reason whose outcome row stayed unwritable would be a name the cache
+    // writer can never emit, and a writable row with nothing that produces it would be a state with no
+    // producer.
     //
     // The lookup is FAIL-CLOSED (see outcomeWritable): an outcome this build does not know is not
     // writable, so a caller that invents a state cannot write by accident.
@@ -636,7 +658,16 @@ namespace VulkanTuner {
       // over.  Today this row cannot fire either (nothing installs a row yet); it is what keeps the
       // rule attached to the SET rather than to one outcome's spelling.
       { "measured",              "completed",   true,  "measured-here,swept-here,no-prune-in-effect" },
-      { "gate-reject",           "gate",        false, ""            },
+      // R-28 step (2): THE ONE ROW WHOSE FLAG IS TRUE AND WHOSE CLASS IS `gate`.  It carries
+      // `measured-here` for the same reason the rows above do (W3-P1): what a gate refusal remembers --
+      // "this device's block times spike too often for the comparison to be trusted" -- is a claim
+      // about the DEVICE, so only a candidate set THIS process measured may mint it.  A cache/IMPORT
+      // channel cannot even supply the inputs (a file carries no spike count), and the provenance
+      // condition is what makes that structural instead of hopeful.
+      // Its durable effect is a NEGATIVE entry and NEVER a row set: `rejectBySpikeGate` clears the rows
+      // for exactly that reason.  Note the class token is unchanged -- the class is the guardrail's
+      // whitelist key and the self-test's fixture selector, not the runtime verdict.
+      { "gate-reject",           "gate",        true,  "measured-here" },
       { "running",               "measurement", false, ""            },
       { "timeout",               "measurement", false, ""            },
       { "io-error",              "measurement", false, ""            },
@@ -661,6 +692,102 @@ namespace VulkanTuner {
       // ledger is what makes that an obligation someone can check instead of prose.
       { "unstable",              "measurement", false, ""            },
     };
+
+    // ── P12: THE RUNTIME SPIKE-RATE GATE (R-28 step (2), 2026-09-26) ──────────────────────────────
+    //
+    // WHERE THE JUDGEMENT LIVES (R-10): the primitive MEASURES and REPORTS -- its result carries
+    // `spikes` / `blocks` / `objects` and says nothing about any gate -- and the COMPARISON happens
+    // HERE, on the shell side.  That is why the outcome below is `gate-reject` while the primitive's own
+    // `VK_TUNE_PROBE_NOT_MEASURED` keeps its single meaning ("I could not produce a usable
+    // comparison").  Merging the two names would let "this measurement is too spiky to trust" be read
+    // as "there was nothing to measure", which is the opposite claim.
+    //
+    // FAIL-CLOSED, AND IN WHICH SENSE (the correction R-4(ii) forces into the open): the DECISION reads
+    // the interval's UPPER bound (`high`) -- never the point estimate, never the lower bound -- because
+    // "we cannot rule out a rate above the measured support" is what refuses a write.  The CONSTRUCTION
+    // is NOT conservative in the same direction, and the loud says so: `rateInterval` is the i.i.d.
+    // Wilson interval and spikes are CLUSTERED rather than drifting (tunestats.h states that assumption
+    // next to the estimator), so the interval is if anything too NARROW and the bound therefore too EASY
+    // to pass.  Direction fail-closed / construction not -- the two halves must never be read as one.
+    //
+    // The instrument is the EXISTING one (`TuneStats::rateInterval`, the same interval family the
+    // decisions use, with the declared `ALPHA`) because R-9(i) forbids inventing a metric here;
+    // R-4(ii)'s clustering-aware interval is registered, not implemented.
+    struct SpikeGateVerdict {
+      bool reject = false;                  // true => this measurement may not become a durable row set
+      TuneStats::RateInterval interval {};  // the i.i.d. interval the decision actually read
+      uint32_t spikes = 0;                  // the counting inputs, carried so the loud can NAME them
+      uint32_t blocks = 0;
+      uint32_t nObjects = 0;                // not an input to the interval: it is the one ingredient a
+                                            // clustering-aware interval will need, so it is printed
+                                            // (a reading, not a criterion -- the gap stays visible)
+    };
+
+    // The judgement, and ONLY the judgement: no logging, no Decision, no file.  `blocks == 0` leaves
+    // `interval.ok` false ("an empty denominator is not a rate of zero"), and that is a REJECT rather
+    // than a pass: a caller that asks before it owns a denominator gets the fail-closed answer instead
+    // of "0 of 0 spikes, how calm".
+    SpikeGateVerdict judgeSpikeRate(uint32_t spikes, uint32_t blocks, uint32_t nObjects) {
+      SpikeGateVerdict v;
+      v.spikes = spikes;
+      v.blocks = blocks;
+      v.nObjects = nObjects;
+      v.interval = TuneStats::rateInterval((long) spikes, (long) blocks, TuneStats::ALPHA);
+      v.reject = !v.interval.ok || v.interval.high > TuneStats::SPIKE_RATE_GATE;
+      return v;
+    }
+
+    // Turn a rejected measurement into the durable verdict.  THE one production writer of the
+    // `gate-reject` state and of its same-spelling reason: R17 counts this assignment site, and R42
+    // counts the marker it sets alongside `finalizeOutcome`'s.
+    //
+    // Four things this function owns, in the order they matter:
+    //   (1) IT CLEARS THE ROW SET.  A gate refusal says "this run's measurement quality cannot support
+    //       ANY durable claim", so rows measured in the same run must not survive it; the verdict is
+    //       about the measurement, not about which candidate happened to look fast.
+    //   (2) IT SETS THE MARKER WITH ITS OWN ORIGIN.  `negativeOrigin` records WHO may take a marker away,
+    //       and the finalizer recomputes only its own (AllReject).  Leaving this one at `None` would be
+    //       the "one field, two writers, no record of who wrote it" sharing that field exists to
+    //       prevent, and would let the finalizer's reset wipe a verdict it never reached.
+    //   (3) IT SETS THE OUTCOME, so the state gate and the file agree by construction rather than by the
+    //       caller remembering to set two fields that must match.
+    //   (4) IT SAYS THE READING OUT LOUD -- interval AND bound AND the counting inputs.  R-28 requires
+    //       the loud to name the measured interval and the bound; `nObjects` rides along because it is
+    //       the missing ingredient of the registered clustering-aware interval.
+    //
+    // NOT SET HERE, deliberately: `allRejectReasonsAreDevice` (the row's condition is `measured-here`;
+    // inventing a second satisfied condition would make the fixture pass for the wrong reason) and
+    // `rowInstalledSeen`/`rowInstalled` (the gate judges the measurement, which is upstream of every
+    // install, so there is no mask to reconcile -- and if a caller ever ran this after an install,
+    // `rowsForWrite`'s size mismatch is the fail-closed, LOUD answer rather than a silent guess).
+    //
+    // ⚠️ WHAT THIS FUNCTION DOES NOT SETTLE (registered for the batch that wires the primitive into
+    // production, R-28 step (5)): the order against the THREE-BRANCH decision is fixed by the ruling --
+    // the gate judges the MEASUREMENT, which is upstream of the install accounting, so it runs FIRST
+    // and a gate-rejected run never reaches the three branches -- but the order against the FINALIZER is
+    // not exercised by anything today, because no production path calls this function yet.  The ⑤
+    // author must say which wins, and what a row that installs AFTER a gate rejection means.  Until
+    // then it is a window obligation, not an implied guarantee.
+    void rejectBySpikeGate(Decision & d, const SpikeGateVerdict & v) {
+      d.rows.clear();
+      d.negative = true;
+      d.negativeReason = "gate-reject";
+      d.negativeScope.clear();
+      d.negativeScope.push_back("mm");
+      d.negativeOrigin = Decision::NegativeOrigin::SpikeGate;
+      d.outcome = "gate-reject";
+      logLine("NOTICE: " + d.deviceName + ": spike-rate gate: the measured i.i.d. spike interval ["
+              + to_string(v.interval.low) + ", " + to_string(v.interval.high)
+              + "] has its UPPER bound above the declared bound "
+              + to_string(TuneStats::SPIKE_RATE_GATE) + " (spikes=" + to_string(v.spikes)
+              + " blocks=" + to_string(v.blocks) + " nObjects=" + to_string(v.nObjects)
+              + "), so NO row set is written for this key; the measurement's quality is a durable "
+                "property of this device+policy, so a NEGATIVE gate-reject entry is written instead -- "
+                "that entry IS the backoff (the next run reads it and does not pay for the measurement "
+                "again).  The interval assumes INDEPENDENT blocks and spikes are clustered, so it is if "
+                "anything too NARROW: the DIRECTION is fail-closed (the upper bound decides), the "
+                "CONSTRUCTION is not conservative");
+    }
 
     // The extra conditions named by a table row (G-D20 + W3-P1).  Fail-closed: EVERY name in the list
     // must hold, and an unknown name is never satisfied, so a typo in the table cannot make something
@@ -1451,10 +1578,13 @@ namespace VulkanTuner {
     //
     // WHY THESE ARE IN THE POLICY AT ALL, and it is the plan's own requirement rather than this batch's
     // idea: tune-gaps.md says "代码 / 谓词 / 规则表 / 枚举器 / 判据 / 门参数 -> b<rev16>; **门参数进
-    // policyFingerprint 才能写 class-(b)**" (tune-gaps.md:208, restated at :288).  "class (b)" is "every
-    // candidate was rejected by the validation gate", i.e. exactly what `gate-reject` is about to become,
-    // and the outcome table's own comment refuses to make it writable "until the gate / tau / soft-gate
-    // parameters enter policyFingerprint".
+    // policyFingerprint 才能写 class-(b)**" (tune-gaps.md:208, restated at :288).  "class (b)" is the
+    // deployed outcome name `gate-reject`, whose carrier is the P12 runtime spike-rate gate (settled by
+    // the ruling row tune-gaps.md A1-A; an older reading of this sentence said "every candidate rejected
+    // by the validation gate", and one meaning per name is the rule here).  THAT is the condition the
+    // outcome table's own comment said it was waiting for, and R-28 step (2) is the batch that both
+    // satisfied it (these rows are in the POLICY string, so a gate change changes the key by
+    // construction) and spent it (the `gate-reject` row is writable as of that step).
     //
     // The names are LOWERCASE on purpose: every KNOBS[] name is uppercase, so the two segments of POLICY
     // are distinguishable at a glance -- and the smoke's default-leg check relies on exactly that (it
@@ -2535,6 +2665,25 @@ namespace VulkanTuner {
         d.negativeScope.clear();
         d.negativeScope.push_back("mm");
       }
+      else if (o.writable && string(o.klass) == "gate") {
+        // The `gate` class's writable shape, MINTED BY THE REAL GATE rather than assembled here.  A
+        // fixture that set `negative` / `negativeReason` by hand would prove the TABLE is self-consistent
+        // while proving nothing about the function that has to produce that state -- and the two would
+        // be free to drift apart, which is the whole failure mode of a fixture.
+        //
+        // `aMeasuredSet` is required and that is the row's own condition doing its job: a gate refusal
+        // concluded from a candidate set this process did not measure is not a device fact (W3-P1).
+        // The numbers carry MARGIN on purpose -- 25 spikes in 100 blocks is a rate whose whole interval
+        // sits ABOVE the bound, so this is not a coin flip at the boundary (the (k) case below points the
+        // same judgement at a calm reading and requires the other answer).
+        // The device name is set because THIS fixture prints (its loud names the device): leaving it
+        // empty produces "NOTICE: : spike-rate gate: ...", which reads as a formatting bug rather than
+        // as a synthetic decision.  No other fixture in this loop prints anything, so none of them has
+        // ever needed this line -- which is exactly why it is easy to forget here.
+        d.deviceName = "self-test";
+        aMeasuredSet(d);
+        rejectBySpikeGate(d, judgeSpikeRate(25u, 100u, 6u));
+      }
       else if (o.writable && string(o.klass) == "completed") {
         // The rows-file shape: one legal row, so the CONTENT gate passes and only the state gate
         // is left to check.  The geometry is the one the smoke's A3 leg proves legal, and the
@@ -2599,8 +2748,10 @@ namespace VulkanTuner {
       if (!o.writable) {
         // The STATE gate itself must refuse, and the error string must name it -- with a
         // write-ALLOWED policy, so the mode cannot be the thing that refused, and with the string
-        // checked so the CONTENT gate (which would also refuse `gate-reject`) cannot be mistaken
-        // for the state gate.
+        // checked so the CONTENT gate cannot be mistaken for the state gate.  🔴 The example used to
+        // be `gate-reject`, and R-28 step (2) is exactly why it moved: this batch flips that row, so a
+        // comment naming it here would have become a false sentence about which gate refused.  The
+        // example is now an outcome that is still unwritable AND has nothing to write.
         const bool wrote = writeCacheIfAllowed(d, policy, err);
         verdict = !wrote && err.find("not in a writable state") != string::npos;
         refused++;
@@ -3054,12 +3205,121 @@ namespace VulkanTuner {
       }
     }
 
+    { // (k) THE SPIKE-RATE GATE (R-28 step (2)): the judgement in BOTH directions, the verdict it
+      // mints, and -- the half that makes it durable rather than decorative -- that entry's WRITE and
+      // READ as ONE pair (the two are indivisible: a reason nothing can emit is prose, and an emitted
+      // line nothing can parse is a cache that can never load).
+      //
+      // BOTH DIRECTIONS, and that is the whole reason this case exists: the ruling's claim is "the UPPER
+      // bound decides", and the only way to execute it is to point the SAME judgement at two readings
+      // that differ only in the rate -- the calm one must NOT reject, the harsh one MUST.  A one-sided
+      // test would pass for a function that always rejects (which would refuse every machine, forever)
+      // and for one that never does (which would ship rows from a machine whose spikes the algorithm
+      // cannot survive).  The numbers carry margin because a self-test that lives at the boundary is a
+      // coin flip, not a test.
+      {
+        const SpikeGateVerdict calm  = judgeSpikeRate(4u, 100u, 6u);
+        const SpikeGateVerdict harsh = judgeSpikeRate(25u, 100u, 6u);
+        // `intervalCovers` is the PAIRED machinery's, so the rate interval's own containment is asserted
+        // here directly: the gate compares a RATE with the bound, and an interval that did not contain
+        // the rate it was built from would be comparing a different quantity (R-3(a)'s "same definition"
+        // discipline, one level down).
+        const bool calmInside  = calm.interval.ok && calm.interval.low <= calm.interval.p
+                              && calm.interval.p <= calm.interval.high;
+        const bool harshInside = harsh.interval.ok && harsh.interval.low <= harsh.interval.p
+                              && harsh.interval.p <= harsh.interval.high;
+        // `blocks == 0`: no denominator is not "a calm machine".  Fail-closed means reject.
+        const SpikeGateVerdict noDenominator = judgeSpikeRate(0u, 0u, 6u);
+        if (!calmInside || !harshInside || calm.reject || !harsh.reject || !noDenominator.reject
+            || calm.interval.high > TuneStats::SPIKE_RATE_GATE
+            || harsh.interval.high <= TuneStats::SPIKE_RATE_GATE) {
+          ok = false;
+          if (firstBad.empty()) {
+            firstBad = string("(k) the spike gate is not the fail-closed comparison the ruling "
+                              "describes: calm(4/100) reject=") + (calm.reject ? "YES (BUG)" : "no")
+                     + " upper=" + to_string(calm.interval.high)
+                     + " inside=" + (calmInside ? "yes" : "NO (BUG)")
+                     + ", harsh(25/100) reject=" + (harsh.reject ? "yes" : "NO (BUG)")
+                     + " upper=" + to_string(harsh.interval.high)
+                     + " inside=" + (harshInside ? "yes" : "NO (BUG)")
+                     + ", 0-blocks reject=" + (noDenominator.reject ? "yes" : "NO (BUG)")
+                     + " (bound " + to_string(TuneStats::SPIKE_RATE_GATE) + ")";
+          }
+        }
+      }
+      // The verdict, built by the REAL gate on a decision that HAS a row set, so the "no row set"
+      // clause is executed rather than asserted: after the call the rows must be GONE.
+      {
+        Decision g;
+        g.deviceName = "self-test";
+        g.cachePath = probePath;
+        g.nnXLen = 19;
+        g.nnYLen = 19;
+        g.maxBatchSize = 8;
+        g.fingerprint = "self-test";
+        g.policyFingerprint = "self-test";
+        g.baselineVersion = "1";
+        g.modelIdentity = "self-test";
+        aMeasuredSet(g);
+        vk_tune_row_spec r {};
+        r.path = VK_TILE_PATH_SCALAR;
+        r.src0_type = 1;
+        r.src1_type = 0;
+        r.geom.BM = 64; r.geom.BN = 64; r.geom.BK = 0;
+        r.geom.WM = 32; r.geom.WN = 32; r.geom.WMITER = 1;
+        r.geom.TM = 4; r.geom.TN = 4; r.geom.BS = 128;
+        r.geom.pad = -1; r.geom.reshape = -1; r.geom.smaller = -1;
+        g.rows.push_back(r);
+        rejectBySpikeGate(g, judgeSpikeRate(25u, 100u, 6u));
+        const bool verdictOk0 = g.outcome == "gate-reject" && g.negative
+                             && g.negativeReason == "gate-reject"
+                             && g.negativeOrigin == Decision::NegativeOrigin::SpikeGate
+                             && g.negativeScope.size() == 1 && g.negativeScope[0] == "mm"
+                             && g.rows.empty();
+        // The entry must be WRITABLE and it must be the only thing the file says (ROWS 0 + the marker,
+        // never both for one kind -- the formatter throws on that, which is a different case's subject).
+        const bool writableOk0 = outcomeWritable(g) && cacheEntryWritable(g);
+        // 🔴 READ THE PRODUCT (section 8 trap 12): "the verdict is right" is not "the file is right".
+        // The formatter is the authority on what would reach the disk, so its OUTPUT is what is read.
+        string emitted0, emitErr;
+        try {
+          emitted0 = formatRowsFileImpl(g);
+        }
+        catch (const std::exception & e) {
+          emitErr = e.what();
+        }
+        const bool emitsOk = emitted0.find("\nROWS 0\n") != string::npos
+                          && emitted0.find("\nNEGATIVE gate-reject mm\n") != string::npos
+                          && emitted0.find("\nROW ") == string::npos;
+        // ... and the READ half of the pair, through the REAL parser: the file this process would write
+        // must be one this process can load.  The wave is synthesized (there is no device here), and it
+        // cannot matter: the fixture carries no ROW line.
+        RowsFile back;
+        string backErr;
+        const bool readOk = parseRowsFile(emitted0, vk_tile_wave_for(32), back, backErr)
+                         && back.negative && back.negativeReason == "gate-reject"
+                         && back.negativeScope.size() == 1 && back.negativeScope[0] == "mm"
+                         && back.rows.empty();
+        if (!verdictOk0 || !writableOk0 || !emitsOk || !readOk) {
+          ok = false;
+          if (firstBad.empty()) {
+            firstBad = string("(k) the gate's durable entry is not the one the format carries: "
+                              "verdict=") + (verdictOk0 ? "ok" : "BAD")
+                     + " writable=" + (writableOk0 ? "ok" : "BAD")
+                     + " emitted=" + (emitsOk ? "ok" : ("BAD (" + emitted0.substr(0, 120) + ")"))
+                     + " read-back=" + (readOk ? "ok" : ("BAD (" + backErr + ")"))
+                     + (emitErr.empty() ? "" : (" formatter refused: " + emitErr));
+          }
+        }
+      }
+    }
+
     const bool absent = !FileUtils::exists(probePath);    logLine("cache write self-test: " + to_string(declared) + " outcome(s) declared, "
             + to_string(refused) + " refused by the state gate, " + to_string(allowed)
             + " state-writable; probe file " + (absent ? "absent" : "PRESENT")
             + "; encoding probe (non-ASCII name) written+read-back+removed ["
             + ((encWrote && encReadBack && encRemoved) ? "ok" : "FAIL") + "]"
-            + "; (a)(b) no marker / (c) from-file retirement / (d) measured control / (e) our-gap / (f) all-reject->measured retracts / (g)(h) fold AND+mismatch / (i) unmeasured marker refused by name / (j) the formatter's throw is contained ["
+            + "; (a)(b) no marker / (c) from-file retirement / (d) measured control / (e) our-gap / (f) all-reject->measured retracts / (g)(h) fold AND+mismatch / (i) unmeasured marker refused by name / (j) the formatter's throw is contained / (k) spike gate: both directions + no-row-set + the durable entry's write/read pair ["
             + (verdictOk ? "ok" : "FAIL: " + verdictBad) + "]"
             + " [" + ((ok && absent && encWrote && encReadBack && encRemoved && verdictOk) ? "ok" : "FAIL") + "]"
             + (ok ? "" : " first problem: " + firstBad));

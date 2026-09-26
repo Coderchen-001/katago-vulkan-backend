@@ -194,7 +194,13 @@ namespace VulkanTuner {
     // The distinction is not cosmetic: one field with two writers and no record of who wrote it is
     // exactly the silent sharing this project refuses, and the two markers are removed for different
     // reasons (a loader's marker is superseded by a measurement; ours is retracted by our own rules).
-    enum class NegativeOrigin { None, FromFile, AllReject };
+    //   SpikeGate -- THIS process's spike-rate gate refused the measurement (R-28 step (2)).  A
+    //                FOURTH value rather than a reuse of AllReject, and the reason is the paragraph
+    //                above: the finalizer recomputes ITS OWN marker from the install accounting on every
+    //                call, so it has to be able to tell "mine" from "not mine" -- sharing one value would
+    //                let its reset wipe a verdict it never reached, and the gate's verdict is not the
+    //                accounting's to retitle (it judges the MEASUREMENT, which is upstream of it).
+    enum class NegativeOrigin { None, FromFile, AllReject, SpikeGate };
     NegativeOrigin negativeOrigin = NegativeOrigin::None;
 
     // G-D20 (t3-shell-plan.md 6.9): "deterministically all-rejected" is a claim about the DEVICE
