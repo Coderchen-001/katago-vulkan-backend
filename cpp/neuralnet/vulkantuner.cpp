@@ -2640,7 +2640,14 @@ namespace VulkanTuner {
     // R-29 Cut 5: the moved `A1_export` POLICY assertion's two readings (see the probe block at
     // the end of this function).  Declared here so the final verdict can include them.
     bool policyRowOk = false;
-    string policyRowText = "FAIL: the POLICY-row probe did not run";
+    // 🔴 `policyRowText` starts EMPTY, and the "did not run" sentence is applied where the
+    // verdict is REPORTED (see the probe block below).  It used to START with that sentence,
+    // while the read-back was guarded by `policyRowText.compare(0, 5, "FAIL:") != 0` -- i.e. by
+    // "has not failed yet".  Sentinel and failure text were the same string, so the guard was
+    // false on every path and the read-back NEVER RAN: the self-test said "the POLICY-row probe
+    // did not run" in every process, and both A33 legs went red on that sentence (measured
+    // 2026-09-26).  Empty is now the only "not decided yet", and each outcome sets its own text.
+    string policyRowText;
     // R0 legs: pin rowSetHash() to the STANDARD FNV-1a 64 parameters AND to the wire protocol
     // (field set, field order, 4-byte little-endian feed).  Both expected values come from an
     // INDEPENDENT implementation (python, logs-t3/1b2b/r0-*), never from this function:
@@ -3542,7 +3549,9 @@ namespace VulkanTuner {
       catch (const std::exception & e) {
         policyRowText = string("FAIL: the formatter threw: ") + e.what();
       }
-      if (policyRowText.compare(0, 5, "FAIL:") != 0) {
+      // "Not decided yet" is EMPTY, not "does not start with FAIL:" -- the sentinel used to
+      // satisfy its own guard, which is the defect this cut removes.
+      if (policyRowText.empty()) {
         const size_t at = emittedPolicy.find("\nPOLICY ");
         if (at == string::npos) {
           policyRowText = "FAIL: the emitted file carries no POLICY row";
@@ -3559,6 +3568,9 @@ namespace VulkanTuner {
     }
     if (!policyRowOk) {
       ok = false;
+      // A probe that neither threw nor produced a row never ran: saying so is the honest
+      // reading, and it is said HERE because this is where the verdict is built.
+      if (policyRowText.empty()) { policyRowText = "FAIL: the POLICY-row probe did not run"; }
       if (firstBad.empty()) { firstBad = string("(m) the POLICY row the formatter emits: ") + policyRowText; }
     }
 
