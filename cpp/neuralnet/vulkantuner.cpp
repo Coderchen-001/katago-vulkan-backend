@@ -766,7 +766,15 @@ namespace VulkanTuner {
     //     (k) case: the finalizer must return Nothing and leave this verdict and its marker alone.
     //   * what still has NO carrier is the protocol side (⑤): a row that installs AFTER a gate rejection.
     //     That half stays a registered window obligation, not an implied guarantee.
-    void rejectBySpikeGate(Decision & d, const SpikeGateVerdict & v) {
+    // 🔴 THE MARKER AND THE LOUD ARE TWO RESPONSIBILITIES (split 2026-09-26, R-29 close-out).
+    // The marker is the STATE a gate rejection leaves; the NOTICE is the EVENT it reports.  They were
+    // one function, and the self-test's POLICY-row probe -- which needs a decision the FORMATTER can
+    // write and therefore installs this marker -- ended up reporting a gate event for a measurement it
+    // never made: `NOTICE: : spike-rate gate: ...` with an EMPTY device name (the synthetic decision has
+    // none), a third copy of the sentence the smoke pins at exactly two, and the last red leg of the
+    // close-out run.  The literal stays in ONE production site (this setter), which is what the census
+    // counts (`WANT_REASON_WRITERS`), so splitting costs no rule anything.
+    void setGateRejectMarker(Decision & d) {
       d.rows.clear();
       d.negative = true;
       d.negativeReason = "gate-reject";
@@ -774,6 +782,9 @@ namespace VulkanTuner {
       d.negativeScope.push_back("mm");
       d.negativeOrigin = Decision::NegativeOrigin::SpikeGate;
       d.outcome = "gate-reject";
+    }
+    void rejectBySpikeGate(Decision & d, const SpikeGateVerdict & v) {
+      setGateRejectMarker(d);
       logLine("NOTICE: " + d.deviceName + ": spike-rate gate: the measured i.i.d. spike interval ["
               + to_string(v.interval.low) + ", " + to_string(v.interval.high)
               + "] has its UPPER bound above the declared bound "
@@ -3540,8 +3551,11 @@ namespace VulkanTuner {
       // The marker is not a shortcut, it is the shape this file can WRITE: the formatter emits the
       // durable per-row set (rowsForWrite), and a synthetic decision installs no row anywhere, so a
       // row-only probe would come out EMPTY and the formatter refuses "neither rows nor a marker".
-      // The (k) case above uses exactly this marker shape and its output is already read back.
-      rejectBySpikeGate(pd, judgeSpikeRate(25u, 100u, 6u));
+      // The (k) case above uses exactly this marker shape and its output is already read back -- but the
+      // probe takes the MARKER only: it is not a gate event (it measured nothing), and calling the
+      // logging wrapper here emitted a third spike-rate NOTICE into the line whose count the smoke pins
+      // at two, with an empty device name, because the synthetic decision has none (measured).
+      setGateRejectMarker(pd);
       string emittedPolicy;
       try {
         emittedPolicy = formatRowsFileImpl(pd);
