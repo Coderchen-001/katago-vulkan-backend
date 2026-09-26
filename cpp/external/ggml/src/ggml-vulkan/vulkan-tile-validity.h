@@ -262,6 +262,13 @@ struct vk_tune_probe_params {
     // a reader could see.
     double spikeBandLo;
     double spikeBandHi;
+    // `tooSlowW`: the `too-slow` drop ratio, handed in for the same one-source reason as the band above.
+    // A CANDIDATE whose median block on a shape is more than `tooSlowW` times that shape's own stock
+    // anchor median leaves the JUDGEABLE set (see `dropped_too_slow` below).  The declared value lives in
+    // cpp/neuralnet/tunestats.h (TOO_SLOW_W, the same number and meaning as the estimate's `W_cand`), and
+    // the probe REFUSES anything <= 1: "not slower than the anchor" would discard nearly every candidate,
+    // and the exclusion rather than the measurement would decide the comparison.
+    double tooSlowW;
 };
 
 // The runtime spike rate is the fraction of blocks the amplitude-band detector marks.  The band is the
@@ -290,6 +297,20 @@ struct vk_tune_probe_result {
     uint32_t pairs_legal;
     uint32_t pairs_illegal;
     uint32_t spikes;         // blocks the amplitude-band detector marked
+    // Pairs the POST-HOC `too-slow` exclusion removed from the judgeable set (w4e-preview.md R-27):
+    // every legal pair ran its full budget FIRST -- the grid is never shortened, which is what separates
+    // this from section 2.6's early-stop form -- and this count is subtracted exactly once:
+    // judgeable = pairs_measured - dropped_too_slow, which is what `pairs_complete` compares against
+    // `pairs_legal`.  Each dropped pair also prints its own line carrying the two medians and their
+    // ratio: a READING, so that the decision can be re-derived from the log, while the decision itself
+    // stays the bare comparison.  It is a THIRD bucket alongside `dropped_build_failed`, and it is
+    // reported instead of being folded into the flag, so "nothing was slow" cannot be confused with
+    // "pairs were excluded and the run therefore cannot claim no-gain".
+    // The dropped pair's cells in the caller's buffer are deliberately NOT re-accounted, and that is
+    // what keeps the pinned grid intact (blocks and samples do not move).  Section 2.6's "the dropped
+    // candidate's measured blocks enter only the log" was written for the early-stop form, where it
+    // means "do not keep the PARTIAL blocks measured before the drop"; post hoc there are no partial
+    // blocks -- the whole grid was paid for and measured -- so what changes is which pairs may be judged.
     uint32_t dropped_too_slow;
     uint32_t dropped_build_failed;
     bool pairs_complete;     // every legal pair of every covered shape has a full budget

@@ -3171,6 +3171,11 @@ namespace VulkanTuner {
     base.seed = TuneStats::PROBE_ROTATION_SEED;
     base.spikeBandLo = TuneStats::SPIKE_BAND_LO;
     base.spikeBandHi = TuneStats::SPIKE_BAND_HI;
+    // The `too-slow` drop ratio, declared in the judgement layer and HANDED IN (the backend holds no copy
+    // of it).  The primary device run below inherits exactly this value, and the control run repeats the
+    // same grid with a W that cannot fire -- one run with one W could not tell a criterion that reads its
+    // input from one that carries the number internally.
+    base.tooSlowW = TuneStats::TOO_SLOW_W;
 
     int refused = 0;
     int refusalCases = 0;
@@ -3217,6 +3222,8 @@ namespace VulkanTuner {
       q = base;
       q.spikeBandLo = 0.0; refusedBy(q, dbuf.size(), "not a usable amplitude band");
       q = base;
+      q.tooSlowW = 1.0;    refusedBy(q, dbuf.size(), "not a usable drop ratio");
+      q = base;
       refusedBy(q, 4, "the sample buffer holds");   // the grid needs 1*2*3 = 6 slots
     }
     if (refused != refusalCases) {
@@ -3237,6 +3244,13 @@ namespace VulkanTuner {
     uint32_t devicePairsLegal = 0;
     double deviceHot = 0.0;
     bool devicePairsComplete = false;
+    uint32_t deviceDroppedTooSlow = 0;
+    // The positive control: the same grid with a W that cannot fire (see the block after R-13).
+    bool controlRan = false;
+    bool controlComplete = false;
+    uint32_t controlDroppedTooSlow = 0;
+    uint32_t controlBlocks = 0;
+    uint32_t controlSamples = 0;
     bool deviceAnchorNaN = false;
     bool deviceSamplesFinite = true;
     {
@@ -3292,6 +3306,7 @@ namespace VulkanTuner {
           devicePairsLegal = r.pairs_legal;
           deviceHot = r.t_block_hot_us;
           devicePairsComplete = r.pairs_complete;
+          deviceDroppedTooSlow = r.dropped_too_slow;
           // The NaN discipline, checked rather than assumed: the anchor's three slots were never
           // written (there is no difference to take against itself), and every other slot IS finite --
           // a NaN among them would poison an interval the caller believes it measured.
@@ -3311,7 +3326,13 @@ namespace VulkanTuner {
         // 1 shape x 4 objects x 3 measured passes, and 3 reps x 3 non-anchor objects.
         want(deviceBlocks == 12, "the probe timed a different number of blocks than the measured grid");
         want(deviceSamples == 9, "the probe wrote a different number of paired samples than 3 x 3");
-        want(devicePairsLegal == 4 && devicePairsComplete, "pairs_complete did not hold for a complete grid");
+        want(devicePairsLegal == 4, "the legal-pair count of the synthetic grid changed");
+        // The declared W must exclude EXACTLY the two candidate entries: objects 1 and 2 are the same row
+        // (the memo twin) and on this fixture both measure several times the anchor's median, while the
+        // third non-anchor object is the stock A/A sentinel -- an arm, never a candidate.
+        want(!devicePairsComplete && deviceDroppedTooSlow == 2,
+             "too-slow: the declared W did not exclude exactly the two candidate pairs, or pairs_complete "
+             "did not follow the exclusion (judgeable = measured - dropped)");
         want(deviceHot > 0.0, "t_block_hot_us is not a positive median over hot blocks");
         want(deviceSpikes <= deviceBlocks, "more spike marks than measured blocks");
         want(deviceAnchorNaN, "an anchor slot was written instead of staying NaN");
@@ -3372,6 +3393,37 @@ namespace VulkanTuner {
                "by its own name (and leave the samples NaN)");
         }
       }
+      // ---- the POSITIVE CONTROL: the SAME grid, only the W changed --------------------------------
+      //
+      // W is an input (the declared copy lives in cpp/neuralnet/tunestats.h), and this pair of runs is
+      // what pins that mechanically: the grid must NOT move (blocks and samples identical) while only the
+      // judgeable set does (dropped 2 -> 0, pairs_complete false -> true).  A criterion that ignores its
+      // input would leave the first run's numbers on the second; one that SHORTENS the grid instead of
+      // excluding after the fact would move the block count.
+      if (deviceRan) {
+        vk_tune_row_spec ctrlCand = rows[workedRow];
+        vk_tune_probe_params qc = q;
+        qc.tooSlowW = 10.0;   // no fixture candidate is 10x the anchor, so nothing may be excluded
+        std::vector<double> csamp((size_t) 1 * nObjects * base.reps, 0.0);
+        vk_tune_probe_result rc {};
+        // NOT named after the standard stream: R10e-shell greps for that NAME across the shell file, and a
+        // local buffer called `cerr` would read as a second write site (the neighbours are `derr`/`rerr`).
+        char qerr[1024];
+        qerr[0] = '\0';
+        controlRan = ::ggml_backend_vk_tune_probe_candidate(backend, &ctrlCand, 1, &qc, csamp.data(),
+                                                           csamp.size(), &rc, qerr, sizeof(qerr))
+                     && rc.st == VK_TUNE_PROBE_OK;
+        controlDroppedTooSlow = rc.dropped_too_slow;
+        controlComplete = rc.pairs_complete;
+        controlBlocks = rc.blocks;
+        controlSamples = rc.samples;
+        want(controlRan, "the too-slow control run (W = 10) did not complete on this device");
+        want(controlRan && controlDroppedTooSlow == 0 && controlComplete && controlBlocks == deviceBlocks
+             && controlSamples == deviceSamples,
+             "the too-slow control: with W = 10 nothing may be excluded, pairs_complete must hold again, "
+             "and the grid must be the one the declared W measured (a criterion that ignores its input, or "
+             "one that shortens the grid, would move one of these numbers)");
+      }
       if (!deviceRan && !note.empty()) {
         firstBad = firstBad.empty() ? ("device run: " + note) : firstBad;
       }
@@ -3394,13 +3446,21 @@ namespace VulkanTuner {
        << " refusals=" << refused << "/" << refusalCases
        << " device[synthetic=1 shapes=1 objects=4 blocks=" << deviceBlocks << " samples=" << deviceSamples
        << " pairs_legal=" << devicePairsLegal << " pairs_complete=" << (devicePairsComplete ? 1 : 0)
+       << " dropped_too_slow=" << deviceDroppedTooSlow << " too_slow_w=" << setprecision(2)
+       << TuneStats::TOO_SLOW_W
        << " spikes=" << deviceSpikes << " t_block_hot_us=" << setprecision(1) << deviceHot
        << setprecision(4) << " nan_anchor=" << (deviceAnchorNaN ? "ok" : "FAIL")
        << " samples_finite=" << (deviceSamplesFinite ? "ok" : "FAIL") << "]"
+       // The control is its own bracketed section rather than extra fields inside `device[...]`: the two
+       // runs are two readings, and a reader must not have to guess which run a `pairs_complete` belongs
+       // to.  `blocks`/`samples` are repeated on purpose -- "only W changed" is the claim being pinned.
+       << " too_slow_control[too_slow_w=" << setprecision(2) << 10.0 << " dropped_too_slow="
+       << controlDroppedTooSlow << " pairs_complete=" << (controlComplete ? 1 : 0) << " blocks="
+       << controlBlocks << " samples=" << controlSamples << "]"
        << " verifies[override_consumed anchor_hits=0 raii_restore samples+pairs detector_identity "
-       << "coverage_complete_echo shots_shape_honoured]"
-       << " not_verified[gate_0.15 vs_tolerance too_slow coverage_complete number_quality "
-       << "r13_without_coopmat2 shots_shape_multi]"
+       << "coverage_complete_echo shots_shape_honoured too_slow_drop]"
+       << " not_verified[gate_0.15 vs_tolerance coverage_complete number_quality "
+       << "r13_without_coopmat2 shots_shape_multi too_slow_magnitude]"
        << " checks=" << checks << " [" << (ok ? "ok" : "FAIL") << "]"
        << (ok ? "" : " first problem: " + firstBad);
     logLine(os.str());

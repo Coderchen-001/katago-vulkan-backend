@@ -77,6 +77,21 @@ namespace TuneStats {
   // checked rather than promised.
   constexpr double SPIKE_BAND_LO = 0.40;
   constexpr double SPIKE_BAND_HI = 1.00;
+  // THE `too-slow` DROP RATIO (W4e item (5)), declared here so the probe holds no copy of it.  A
+  // CANDIDATE pair (shape, object) is dropped when its median block on that shape exceeds TOO_SLOW_W
+  // times THAT SHAPE's own stock anchor median, taken from the same reps.  This is the estimate's
+  // `W_cand` with the same value and the same meaning -- "how much slower than stock a candidate is
+  // still allowed to be" (tune-measurement.md section 2.6) -- and the probe receives it as a parameter
+  // for the reason section 2.3.1 gives for every declared constant: ONE source, so the number the
+  // criterion applies cannot drift away from the number the budget was priced with.
+  // The criterion is a READING plus a BOOLEAN: the two medians and their ratio are printed, because a
+  // reader has to be able to re-derive the drop from the log; the decision itself is the comparison.
+  // The check is POST HOC (w4e-preview.md R-27's terminal ruling): every legal pair runs its full R
+  // blocks first, and the exclusion is applied to the completed matrix as one subtraction on the pair
+  // count.  That is what removes the sequential bias an early stop carries -- it does NOT add power, and
+  // it must not be read as doing so: at R = 2 a median IS the mean, so the criterion runs (the parameter
+  // checks allow R >= 2) but is weak there.  The declared power floor is R >= 4 (section 2.5).
+  constexpr double TOO_SLOW_W = 2.0;
   // THE ROTATION SEED: the block sequence rotates with a randomized Latin square (tune-measurement.md
   // section 2.2, one block per (shape, object) slot), and "fixed seed, reproducible" is only true if
   // the seed is declared.  It is the same value the statistics self-test uses as its default base seed
