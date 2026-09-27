@@ -231,10 +231,30 @@ namespace VulkanTuner {
     // synthesized it), "cache" (a FILE produced the candidates), "measured" (THIS process's
     // own enumeration produced them).  The value is what `negativeProvable` tests, so the initial
     // value is the fail-closed one: a decision nobody marked can never mint a durable verdict.
-    // 🔴 Production has NO setter of "measured" today -- the enumerator is step 5 -- which is exactly
-    // why the key-scoped NEGATIVE entry is unreachable until then.  R42 counts the setters rather
-    // than trusting this sentence: production 0, the self-test's one named fixture 1.
+    // 🔴 (7a): the third state IS reachable now.  The enumerator left the probe block and became part of
+    // the decision point, so `runCandidateCatalog` mints "measured" on every run; and the three loader
+    // branches below that leave this key with no row set write it too -- there is no file-supplied set,
+    // so the FINAL source of the candidate set is this process's own enumeration.  R42(d) counts the
+    // setters rather than trusting this sentence: production 1 (the enumerator) + the loader's 3
+    // recording sites, self-test 1.
+    //
+    // 🔴 THE SEMANTIC, and it is the one thing a reader gets wrong here: this field is the FINAL source
+    // ("where the set this decision used came from"), NOT "where it ever came from".  The loader
+    // overwriting it is therefore CORRECT -- and that is exactly why "this process searched" needs its
+    // own field: on a cache hit the set came from a file, but this process still searched.
     std::string rowSource = "none";   // "none" / "cache" / "measured"
+    // (7a) / W4b Stage 1: "THIS PROCESS RAN THE CANDIDATE SEARCH FOR THIS KEY" -- the second, INDEPENDENT
+    // fact about the same search, and the one the loader may not answer.  Why it cannot be folded into
+    // `rowSource`: that field is the final SOURCE and is overwritten by the load (on a hit it reads
+    // "cache" although this process searched exactly as it did on a miss), so it cannot say "we searched".
+    // The two are deliberately NOT derivable from one another -- neither is a function of the other.
+    //   * EXACTLY ONE SETTER: `runCandidateCatalog`, at the moment it is entered.  The fact is "the search
+    //     ran"; whether it then produced a candidate is `rowSource`'s business, and how much it covered is
+    //     `candidateCoverage`'s.  R45 censuses the setters (and the loader's silence).
+    //   * 🔴 THE LOADER MUST NOT TOUCH IT.  A loader write here would relabel a file-sourced decision as
+    //     "this process searched" -- the exact mislabelling the A34/A36 provenance rule exists to prevent.
+    //   * The initial value is the fail-closed one: a decision nobody marked cannot claim to have searched.
+    bool candidateSearched = false;
     // W4b (⑤ first cut): WHICH SUBSET of the declared domain this process actually looked at, as THREE
     // states rather than a bool.  "who measured it" (rowSource above) and "how much of the domain was
     // covered" are ORTHOGONAL questions -- both must be answered before a NEGATIVE entry may be
@@ -319,6 +339,23 @@ namespace VulkanTuner {
     // and decides whether a whole-slot row is admissible, while this one decides whether the NEGATIVE
     // claim is.
     bool pairsComplete = false;
+    // (7a) / R-25: THE CALLER'S STATEMENT ABOUT THE SHAPE SET -- an INPUT to the measurement primitive
+    // (the primitive ECHOES it; it may not derive it, because "looks complete" is the false green the flag
+    // exists to prevent).  Here the caller IS the enumerator, since only it knows what set it handed over,
+    // so the enumerator is this field's ONE setter and its value is a statement of fact about that set.
+    // 🔴 THREE NAMES, THREE QUESTIONS -- deliberately not one flag (tune-measurement.md section 2.6,
+    // "两个旗标别混进一个名字"):
+    //    coverageComplete  -- is the set I handed over the COMPLETE shape set of this slot?
+    //                         (an INPUT, R-25; decides whether a whole-slot row is admissible)
+    //    candidateCoverage -- HOW MUCH of the DECLARED DOMAIN the search walked
+    //                         ("unknown"/"sampled"/"swept"; decides whether a NEGATIVE entry may be minted)
+    //    pairsComplete     -- did the MEASUREMENT conclude every legal pair?
+    //                         (decides whether a "nothing was better" claim may be written)
+    // None of the three may be derived from another: different components answer them, at different
+    // moments, about different sets.  A future caller that walks the WHOLE shape set states `true` in the
+    // enumerator -- that is a different batch, and it is a different question from `candidateCoverage`.
+    // 🔴 DEFAULT FALSE is the fail-closed direction, for the same reason as the line above.
+    bool coverageComplete = false;
     // The DECLARED drop accounting (R-28 step (3)): the reasons a candidate LEFT the judgeable set,
     // counted separately per reason.  `CANDIDATE_DROPS[]` in vulkantuner.cpp is the ONE place the names
     // and these fields are paired, and it is READ (the suppression loud is built from it), so a new
@@ -327,9 +364,13 @@ namespace VulkanTuner {
     uint32_t droppedBuildFailed = 0;
     // The decision line's TWO denominators, named so they cannot be confused (section 2.6 requires
     // different names because they have different denominators): `cands=` = candidates MEASURED over
-    // candidates ENUMERATED; `pairs=` = legal pairs over shapes.  ⚠️ 0/0 is the honest reading while no
-    // measurement has been accounted for (the primitive has no production caller yet) -- it must NOT be
-    // read as "a complete measurement of nothing".
+    // candidates ENUMERATED; `pairs=` = legal pairs over shapes.  ⚠️ `cands=0/N` is the honest reading
+    // while no measurement has been accounted for (the primitive's production caller is (7b)) -- it must
+    // NOT be read as "a complete measurement of nothing".  🔴 (7a) gave the DENOMINATOR a home: the
+    // enumerator fills `candidatesEnumerated` from the set it actually returned, so the number on the
+    // decision line is the SEARCH's own count rather than a second derivation of it (the numerator stays
+    // 0 until (7b), and the two are printed as a pair precisely so that a numerator above its denominator
+    // is a wiring bug a reader can SEE).
     uint32_t candidatesMeasured = 0;
     uint32_t candidatesEnumerated = 0;
     uint32_t pairsLegal = 0;

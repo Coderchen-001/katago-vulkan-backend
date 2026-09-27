@@ -1382,6 +1382,14 @@ namespace VulkanTuner {
     // `pruneExcluded` (which PRUNE rules really bit).  Both are set HERE and nowhere else, which is what
     // makes them a property of the enumeration rather than of whoever calls it.
     vector<Candidate> runCandidateCatalog(Decision* d) {
+      if (d != nullptr) {
+        // 🔴 THE ONE SETTER of `candidateSearched` ((7a)).  At ENTRY, because the fact it records is "this
+        // process ran the search for this key" -- whether the walk then produced a candidate is a second
+        // fact (`rowSource`) and how much it covered is a third (`candidateCoverage`).  It is NOT derived
+        // from either, and the loader never writes it: on a cache hit the load overwrites `rowSource`, and
+        // that is exactly the case in which one field would become a lie about the other (R45).
+        d->candidateSearched = true;
+      }
       vector<Candidate> out;
       const int path = VK_TILE_PATH_CM2;
       for (size_t f = 0; f < GEOMETRY_FAMILY_COUNT; f++) {
@@ -1467,8 +1475,16 @@ namespace VulkanTuner {
           // this process's own measurement", and until this cut nothing did (R42 counted 0 production
           // setters and the self-test's named helper was the only way to mint the state).  Set here, in the
           // same breath as the coverage, because the two are one claim: THIS process produced THIS set.
+          // 🔴 (7a): this site is on the PRODUCTION path now (the catalogue is a persistent line rather
+          // than a bit-8 diagnostic), so "only the enumerator may say it" is REACHABLE rather than merely
+          // counted.  R42(d)'s census is unchanged (production 1 / self-test 1); its MEANING changed.
           d->rowSource = "measured";
           d->candidateCoverage = "sampled";
+          // R-25's input flag, stated by the component that knows: this walk is the declared STOCK VECTOR
+          // SURFACE, a proper subset of the slot's shape set -- so the set handed over is NOT complete, and
+          // writing `false` here is a measurement of that fact rather than a default nobody filled in.
+          // (vulkantuner.h: it is NOT `candidateCoverage` and NOT `pairsComplete`.)
+          d->coverageComplete = false;
           if (d->negativeScope.empty()) {
             d->negativeScope = scopeHere;
           }
@@ -2437,6 +2453,12 @@ namespace VulkanTuner {
          << " baseline=" << d.baselineVersion
          << " rows=" << d.rowCount
          << " source=" << d.rowSource
+         // (7a): the SECOND provenance fact, printed next to the first ON PURPOSE.  `source=` is the final
+         // source of the candidate set (the loader may have overwritten it); `searched=` is "this process
+         // ran the candidate search".  Stored is not enough here: the cache-hit leg is precisely where the
+         // pair has to be readable, because `source=cache searched=1` is the only end-to-end witness that
+         // the loader moved one field and left the other alone.
+         << " searched=" << (d.candidateSearched ? 1 : 0)
          // R-28 step (3) / section 2.6: the TWO denominators, with names that cannot be confused.
          // `cands=` is candidates MEASURED over candidates ENUMERATED (a numerator above the denominator
          // is a wiring bug a reader can SEE, which is why they are printed as a pair), and `pairs=` is
@@ -4103,7 +4125,11 @@ namespace VulkanTuner {
     // chain: from this point on, d->modeString is the only spelling of the mode in this process.
     d->modeString = modeString(useFP16Mode);
     d->baselineVersion = std::to_string(TUNER_POLICY_VERSION);
-    d->rowSource = "none";   // stays "none" unless a load actually produced rows
+    // The fail-closed default, and deliberately NOT the answer: two later writers speak about this same
+    // fact -- the catalogue ("measured", when no file supplies a set) and the loader below ("cache" when
+    // one does, and "measured" again in the three branches that leave this key with no row set).  This
+    // line exists so that a decision which reaches NEITHER writer can never claim a source (W3-P1).
+    d->rowSource = "none";
     d->tuneModeText = policy.modeText;
     // W2: the resolved policy travels WITH the decision so the once hook can capture it BY VALUE.
     // The hook is assembled on the INSTALL path (that is what makes "callback is empty" mean "this
@@ -4192,17 +4218,29 @@ namespace VulkanTuner {
           // because "anti-jitter + accurate" has to be MEASURED rather than claimed.  Its own line, so
           // the three self-tests stay distinguishable in the evidence, and it writes nothing.
           logLine("tune stats self-test: " + TuneStats::selfTestSummary());
-          // W4b (⑤ first cut): the count-only enumeration probe.  It shares the bit because it is the same
-          // subject (the tuned-row surface) and it is the same "once per process, under a probe" shape; it
-          // gets its OWN line so the two self-tests stay distinguishable in the evidence.  It writes
-          // nothing, so it cannot be mistaken for a decision.
-          logLine("candidate enumeration: " + enumerateCandidateCounts(d->deviceSubgroupSize));
-          // W4b commit 2: the SEARCH itself, on a second line -- the probe above says how big the declared
-          // domain is, this says what was actually looked at and which rules narrowed it.  Kept separate on
-          // purpose: one line, one question (the probe is the declaration's business, the catalogue is the
-          // search's), and the smoke asserts the grammar of each independently.
-          logLine(formatCandidateCatalog(*d, runCandidateCatalog(d.get())));
         }
+      }
+
+      // 🔴 (7a) / W4b Stage 1: THE CANDIDATE CATALOGUE IS A PERSISTENT LINE NOW.  It used to be the third
+      // thing inside the bit-8 block above -- a once-per-process diagnostic.  It runs on EVERY decision
+      // instead, outside the probe gate, and BEFORE the load chain, because it is not a self-test: it is
+      // the step of the decision that establishes WHAT WAS SEARCHED (and the loader's no-row-set branches
+      // below record the source it establishes -- see the `rowSource` contract in vulkantuner.h).
+      //   * It is the ONE setter of `candidateSearched`, `rowSource = "measured"`, `candidateCoverage`
+      //     and `coverageComplete` (R42(d) and R45 census exactly that).
+      //   * It writes nothing, builds no pipeline and selects no candidate: it counts and it fills the
+      //     decision's fields.  That is why making it persistent cannot change what lands on disk -- the
+      //     only outcome (7a) makes reachable is `gate-reject`, whose producer has no production caller yet.
+      //   * The two lines stay two lines and keep their order: the probe reports the DECLARED domain, the
+      //     catalogue reports the SEARCH, and one line answers one question.
+      //   * ⚠️ THE DECISION LINE'S DENOMINATOR: `candidatesEnumerated` is filled from the set the
+      //     catalogue actually returned, so `cands=` reports the search's own number.  0/0 would read as
+      //     "a complete measurement of nothing" -- the reading this pair of fields exists to prevent.
+      {
+        logLine("candidate enumeration: " + enumerateCandidateCounts(d->deviceSubgroupSize));
+        const vector<Candidate> cands = runCandidateCatalog(d.get());
+        d->candidatesEnumerated = (uint32_t) cands.size();
+        logLine(formatCandidateCatalog(*d, cands));
       }
 
       // W4e 2c-c: the measurement primitive's own leg, on its OWN bit (R-14).  It cannot share bit 8
@@ -4230,14 +4268,21 @@ namespace VulkanTuner {
 
       if (loadPath == nullptr) {
         d->cacheState = "absent";
-        d->rowSource = "none";
+        // 🔴 (7a): "measured", not "none".  `rowSource` is the FINAL source, and the catalogue has already
+        // run -- it is persistent and it is placed above this chain on purpose -- so with no file supplying
+        // a set, the set this decision uses IS this process's own enumeration.  Writing "none" here would be
+        // a second and later claim about the same fact, and the false one.  (Note the asymmetry: this
+        // branch may write `rowSource`, and must not write `candidateSearched` -- see vulkantuner.h.)
+        d->rowSource = "measured";
         d->note = "no cache file for this (device, model, S, mb)";
       }
       else if (retune) {
         // Loudly, because "I set RETUNE and nothing happened" must never be the outcome, and
         // because the reader has to be able to tell this leg apart from a normal load.
         d->cacheState = "retune-ignored";
-        d->rowSource = "none";
+        // (7a): the file is ignored ENTIRELY, so the decision's set is the one this process enumerated --
+        // hence `source=measured`, and the RETUNE leg's reading flips with it in the same batch (A19).
+        d->rowSource = "measured";
         d->note = string("KATAGO_VK_TUNE_RETUNE is set: ") + loadKind
                 + " ignored entirely (rows and negative entry), deciding again";
         logLine("WARNING: " + string("KATAGO_VK_TUNE_RETUNE is set, so ") + loadKind + " ("
@@ -4405,7 +4450,10 @@ namespace VulkanTuner {
                 d->negative = false;
                 d->negativeScope.clear();
                 d->negativeReason.clear();
-                d->rowSource = "none";
+                // (7a): the file's marker is dropped together with its rows, and what is left is this
+                // process's own enumeration -- the same rule as the two branches above (the catalogue ran,
+                // and it ran first).
+                d->rowSource = "measured";
               }
             }
             if (d->cacheState != "rejected") {
