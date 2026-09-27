@@ -21336,10 +21336,18 @@ static bool ggml_vk_tuned_row_build(vk_device & device, const vk_tune_row_spec &
 // to the judgement layer (cpp/neuralnet/tunestats.h).  It decides nothing -- the non-inferiority
 // interval, the A/A equivalence test, the stability boundary and the budget all live there.
 //
-// 🔴 THIS CUT IS THE INTERFERENCE GATE ONLY, and that is stated rather than implied: it establishes
-// that the process is in the one window where a measurement means anything (tune-measurement.md
-// section 2.4) and then REFUSES, because the block loop is not written yet.  A caller therefore always
-// gets `false` plus a reason it can print; there is no path that returns numbers this build never took.
+// 🔴 THIS CUT IS THE INTERFERENCE GATE, and the gate is only the FIRST thing it does.  A stale version
+// of this paragraph claimed the cut was ONLY the gate and that a caller therefore always gets `false`,
+// on the grounds that the block loop had not been written yet -- true when written, false now: the loop
+// below IS written and the function ends at `VK_TUNE_PROBE_OK` (line 22349 in this file).  Corrected
+// here rather than deleted because the next reader is the one wiring its production caller, and a
+// comment that promises "always false" is the worst possible guide for that job.
+// The rule is unchanged and still stated rather than implied: it establishes that the process is in the
+// one window where a measurement means anything (tune-measurement.md section 2.4) and REFUSES there --
+// naming the item -- instead of measuring alongside a running eval.  When the window and every other
+// precondition hold, it TAKES the measurement and reports `VK_TUNE_PROBE_OK` with its numbers in
+// `result`.  A `false` return still always carries the one item that failed, and that is the whole
+// guarantee: no path returns numbers this build never took.
 //
 // 🔴 THE WINDOW, and why `pr_evals` is the thing to read: `pr_recording` is set once `pr_evals >= 2`
 // (this file, below), and from then on graph_compute takes the replay branch and returns early -- a
