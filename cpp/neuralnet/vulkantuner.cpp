@@ -798,6 +798,151 @@ namespace VulkanTuner {
                 "CONSTRUCTION is not conservative");
     }
 
+    // ── (7c) THE JUDGEMENT LAYER ────────────────────────────────────────────────────────────────────
+    // WHAT IT IS: the step that turns the measurement's paired differences into the two answers the
+    // decision needs -- "is this comparison trustworthy at all" and "which candidate is not worse than
+    // stock on EVERY covered shape" (tune-measurement.md section 2.3.1's live criteria).  It DECIDES
+    // NOTHING about what is written: the three branches and the write are (7d)'s, which is why this
+    // function neither calls the write path nor assigns an outcome -- the spike gate's marker is minted
+    // by `rejectBySpikeGate`, the ONE setter that owns it.
+    //
+    // WHERE EVERY CRITERION COMES FROM (no new statistics and no second spelling of any of them):
+    //   * the interval family IS `TuneStats::pairedSignedRank` (the ONE interval: median +/- t * 1.2533 *
+    //     MAD / sqrt(n)).  The shell must not assemble that formula: its two constants appear only inside
+    //     tunestats.cpp, and R48 pins that (a literal here would be a second answer to "what is an
+    //     interval");
+    //   * non-inferiority is `TuneStats::notWorseThan(r, TOLERANCE)`, and the SHAPE dimension is a
+    //     CONJUNCTION (intersection-union) -- so "the winner" is a candidate that passes on EVERY covered
+    //     shape, and no multiplicity correction is applied on that dimension;
+    //   * the sentinel is `TuneStats::equivalentWithin(r, TOLERANCE)`: the whole interval INSIDE
+    //     +-tolerance.  "The sentinel did not win" was DELETED as a criterion (failing to reject equality
+    //     is not evidence of equality), and the sentinel measures NOISE, not bias -- its job is to say
+    //     whether this comparison is comparable at all;
+    //   * the stability boundary is `TuneStats::decisionUnstable(r, TOLERANCE, ALPHA)`, and by the ruling
+    //     it applies ONLY to the claim that would be written -- never to the gate or the sentinel, whose
+    //     flip costs machine time rather than a wrong durable claim;
+    //   * the gate is `judgeSpikeRate` + `rejectBySpikeGate` (landed with R-28), now fed THIS run's own
+    //     counts instead of a fixture's.
+    //
+    // THE RULING'S PRIORITY, and it is visible in the shape of this function: the gate judges the
+    // MEASUREMENT and therefore runs FIRST (a gate-rejected run never reaches the branches); an incomplete
+    // pair set is the branches' business (`pairsComplete`), and the boundary is not consulted for a pair
+    // whose interval does not exist (`ciMissing` is counted apart from `winnerUnstable`, because "no
+    // data" and "too close to the line" are different answers -- the ruling says so in as many words).
+    void judgeMeasurement(Decision & d) {
+      Decision::Judgement & j = d.judgement;
+      j.attempted = true;
+      const Decision::Measurement & m = d.measurement;
+      // (a) THE GATE FIRST.
+      const SpikeGateVerdict gate = judgeSpikeRate(m.spikes, m.blocks, m.objects);
+      j.gateSpikes = gate.spikes;
+      j.gateBlocks = gate.blocks;
+      j.gateObjects = gate.nObjects;
+      j.gateLow = gate.interval.low;
+      j.gateHigh = gate.interval.high;
+      j.gateRejected = gate.reject;
+      if (gate.reject) {
+        rejectBySpikeGate(d, gate);
+        return;
+      }
+      // 🔴 THE BLOCK-RELATIVE NORMALISER IS MISSING, SO THE INTERVAL VERDICTS ARE PARKED ON IT -- MEASURED
+      // 2026-09-28, the first run of this layer.  `d_out` carries `t_stock - t_object` in MICROSECONDS
+      // (the primitive's own write), while the tolerance this layer decides against is RELATIVE
+      // (`TOLERANCE` = 1% of the stock block).  The plan is explicit about which of the two the judgement
+      // uses -- "判定要用的量是「块相对」噪声（`d = t_stock块 − t_cand块`，看的是块时间的相对差）" -- and the
+      // mismatch is not theoretical: the run came back `sentinel_ok=0 not_worse=0 ci_missing=14`, because
+      // a +-0.01 us interval is compared against a ~1 us scatter.  That is a units artefact, and reporting
+      // it as a verdict is exactly the false green this layer must not produce.
+      //   * The divisor that fixes it is THAT SHAPE's own stock block median.  The primitive has it (it is
+      //     what the `too-slow` rule divides by) and does NOT export it; `t_block_hot_us` is the HEAVIEST
+      //     shape's, and the primitive's own comment rejects it as a divisor ("far too large on a light
+      //     shape") -- in the OPTIMISTIC direction, where light shapes would pass too easily.
+      //   * Two candidate fixes, both INTERFACE acts and both needing a ruling: (i) the primitive writes
+      //     `d_out` BLOCK-RELATIVE (`(t_stock - t_object)/t_stock`), or (ii) it exports each shape's own
+      //     stock block median next to the samples.
+      // ⇒ PARKED: the call is skipped, the derivation below stays compiled and reviewed (the (7b)
+      //   precedent: "what is parked is the CALL, not the derivation"), and `units_missing=1` on this
+      //   layer's line is what says so.  R48 pins this declared state so the flag cannot be flipped
+      //   without visiting the criterion that names it.
+      const bool blockRelativeNormaliserAvailable = false;
+      if (!blockRelativeNormaliserAvailable) {
+        j.unitsMissing = true;
+        return;
+      }
+      // (b) THE INTERVALS.  The samples are the primitive's dense layout with NaN for "never measured",
+      //     and the differences are ALREADY paired (t_stock - t_object inside one rep).  Object 0 is the
+      //     anchor (NaN by design), object 1 is the A/A sentinel, and candidate `c` on covered shape `s`
+      //     sits at `2 + c*nShapes + s` -- the mapping the measurement built, read back here.
+      const uint32_t nShapes = (uint32_t) m.shapes.size();
+      const uint32_t nCands = (uint32_t) d.candidateGeoms.size();
+      if (nShapes == 0 || m.objects < 2 || m.reps == 0 || m.samples.empty()) {
+        return;   // nothing to judge: no pair is counted and `winner` stays -1 (the branches answer)
+      }
+      j.verdictsComputed = true;
+      const auto intervalFor = [&](uint32_t objectIndex, uint32_t shapeIndex, TuneStats::PairedResult & out) {
+        std::vector<double> series;
+        const size_t base = ((size_t) shapeIndex * (size_t) m.objects + (size_t) objectIndex) * (size_t) m.reps;
+        for (uint32_t r = 0; r < m.reps; r++) {
+          const double v = m.samples[base + (size_t) r];
+          if (std::isfinite(v)) {
+            series.push_back(v);
+          }
+        }
+        out = TuneStats::pairedSignedRank(series, TuneStats::ALPHA);
+      };
+      // (c) THE SENTINEL, one interval per covered shape, and EVERY one of them has to pass: "this
+      //     comparison is comparable" is a statement about the whole run, not about its best shape.
+      bool sentinelOk = true;
+      for (uint32_t s = 0; s < nShapes; s++) {
+        TuneStats::PairedResult r {};
+        intervalFor(1u, s, r);
+        j.sentinelPairs++;
+        if (!r.ciOk || !TuneStats::equivalentWithin(r, TuneStats::TOLERANCE)) {
+          sentinelOk = false;
+        }
+      }
+      j.sentinelEquivalent = sentinelOk;
+      // (d) THE CANDIDATES, shape by shape; the first candidate that passes on EVERY covered shape wins.
+      bool winnerFound = false;
+      for (uint32_t c = 0; c < nCands; c++) {
+        bool allShapes = true;
+        bool anyUnstable = false;
+        bool haveMargin = false;
+        double worstMargin = 0.0;
+        for (uint32_t s = 0; s < nShapes; s++) {
+          TuneStats::PairedResult r {};
+          intervalFor(2u + c * nShapes + s, s, r);
+          j.candidatePairs++;
+          if (!r.ciOk) {
+            // NO INTERVAL IS NOT "UNSTABLE": it is missing data, and the branches answer for it.
+            j.ciMissing++;
+            allShapes = false;
+            continue;
+          }
+          if (TuneStats::notWorseThan(r, TuneStats::TOLERANCE)) {
+            j.notWorsePairs++;
+            const double margin = r.ciLow + TuneStats::TOLERANCE;
+            if (!haveMargin || margin < worstMargin) {
+              worstMargin = margin;
+              haveMargin = true;
+            }
+          }
+          else {
+            allShapes = false;
+          }
+          if (TuneStats::decisionUnstable(r, TuneStats::TOLERANCE, TuneStats::ALPHA)) {
+            anyUnstable = true;
+          }
+        }
+        if (allShapes && !winnerFound) {
+          winnerFound = true;
+          j.winner = (int) c;
+          j.winnerUnstable = anyUnstable;
+          j.winnerMargin = worstMargin;
+        }
+      }
+    }
+
     // ── R-28 step (3): THE CANDIDATE-DROP ACCOUNTING AND THE THIRD BRANCH ─────────────────────────
     //
     // WHAT A DROP IS, and why only TWO of the three buckets are in the table (tune-measurement.md
@@ -5180,6 +5325,38 @@ namespace VulkanTuner {
           // intervals from this very buffer, and re-measuring for it would pay section 2.6's cost twice.
           decision->measurement.samples = std::move(mSamples);
         }
+      }
+      // (7c) THE JUDGEMENT, and it runs HERE for a reason the gate itself states: the gate judges the
+      // MEASUREMENT (upstream of every count the branches read), so it must see THIS run's counts, and
+      // the intervals must see THIS run's samples.  `judgement.attempted` is the once flag, like the
+      // pre-check's and the measurement's.
+      if (decision->measurement.ok && !decision->judgement.attempted) {
+        judgeMeasurement(*decision);
+      }
+      // (7c): THE JUDGEMENT'S OWN LINE.  Same two reasons as the pre-check's and the measurement's: a
+      // reading nobody prints is a reading nobody can falsify, and the decision line (printed before
+      // the install) cannot carry a verdict that only exists after the measurement.  `winner=-1` means
+      // "no candidate passed on every covered shape", which is a READING -- whether that becomes
+      // `no-gain` or `no-winner` is the branches' question, decided from `pairsComplete`.
+      {
+        std::ostringstream jOs;
+        jOs << "judge: attempted=" << (decision->judgement.attempted ? 1 : 0)
+            << " gate_reject=" << (decision->judgement.gateRejected ? 1 : 0)
+            << " gate_high=" << decision->judgement.gateHigh
+            << " units_missing=" << (decision->judgement.unitsMissing ? 1 : 0)
+            << " verdicts=" << (decision->judgement.verdictsComputed ? 1 : 0)
+            << " sentinel_ok=" << (decision->judgement.sentinelEquivalent ? 1 : 0)
+            << " sentinel_pairs=" << decision->judgement.sentinelPairs
+            << " cand_pairs=" << decision->judgement.candidatePairs
+            << " not_worse=" << decision->judgement.notWorsePairs
+            << " ci_missing=" << decision->judgement.ciMissing
+            << " winner=" << decision->judgement.winner
+            << " winner_unstable=" << (decision->judgement.winnerUnstable ? 1 : 0)
+            << " winner_margin=" << decision->judgement.winnerMargin
+            << " spikes=" << decision->judgement.gateSpikes
+            << " blocks=" << decision->judgement.gateBlocks
+            << " objects=" << decision->judgement.gateObjects;
+        logLine(jOs.str());
       }
       // (7b) step 5: THE MEASUREMENT'S OWN LINE, for the same reason the pre-check has one: the decision
       // line is printed BEFORE the install (`makeDecision` returns, then the caller installs), so the

@@ -459,6 +459,45 @@ namespace VulkanTuner {
       std::vector<double> samples;
     };
     Measurement measurement;
+    // (7c) THE JUDGEMENT LAYER'S RESULT.  It answers the two questions the decision needs -- "is this
+    // comparison trustworthy at all" (the A/A sentinel's EQUIVALENCE test + the spike-rate gate) and
+    // "which candidate is not worse than stock on EVERY covered shape" -- and it DECIDES NOTHING about
+    // what is written: the three branches and the write are (7d)'s.  `gateRejected` is the one place a
+    // judgement may already have changed the decision, and it does so through the landed setter
+    // (`rejectBySpikeGate`), never by writing a field from here.
+    struct Judgement {
+      bool attempted = false;
+      bool gateRejected = false;
+      // The gate's reading: the i.i.d. Wilson interval it actually read, and the counts it read it
+      // from (`objects` is not an input to the interval -- it is the one ingredient a clustering-aware
+      // interval will need, so it is printed and the registered gap stays visible).
+      double gateLow = 0.0;
+      double gateHigh = 0.0;
+      uint32_t gateSpikes = 0;
+      uint32_t gateBlocks = 0;
+      uint32_t gateObjects = 0;
+      // The interval work, in pairs: one interval per (covered shape, candidate), and one per covered
+      // shape for the sentinel.  `ciMissing` counts pairs whose interval could not be formed at all
+      // (`!ciOk`: too few usable pairs) -- that is NO DATA, which the branches answer, and it is
+      // deliberately NOT the same field as `winnerUnstable` (the ruling: "a missing interval is not
+      // `unstable`").
+      uint32_t candidatePairs = 0;
+      uint32_t sentinelPairs = 0;
+      uint32_t ciMissing = 0;
+      uint32_t notWorsePairs = 0;
+      bool sentinelEquivalent = false;   // EVERY covered shape's sentinel interval inside +-tolerance
+      // 🔴 TRUE while the interval verdicts are PARKED: the primitive hands over MICROSECOND differences
+      // and the tolerance is RELATIVE, and the per-shape block time that would bridge them is not
+      // exported (see the parked block in the shell).  `unitsMissing=1` on the judgement line is the
+      // reading; it keeps "not evaluated" distinguishable from "no candidate passed".
+      bool unitsMissing = false;
+      // Did the interval verdicts actually run?  false today, and it must not be read as a verdict.
+      bool verdictsComputed = false;
+      int winner = -1;                   // the first candidate not-worse on every shape (-1 = none)
+      bool winnerUnstable = false;       // the stability boundary, read on that candidate's intervals
+      double winnerMargin = 0.0;         // report: the winner's tightest `ciLow + tolerance`
+    };
+    Judgement judgement;
     // W2 (decision C): the PER-ROW truth, the same order as `rows` (index i describes rows[i]),
     // folded with AND across this device's contexts -- a row is durable only if EVERY context
     // installed it.  🔴 The aggregate fields above can only BOUND this set (min/max), so the WRITE
