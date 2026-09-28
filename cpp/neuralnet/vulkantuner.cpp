@@ -869,30 +869,13 @@ namespace VulkanTuner {
         rejectBySpikeGate(d, gate);
         return;
       }
-      // 🔴 THE BLOCK-RELATIVE NORMALISER IS MISSING, SO THE INTERVAL VERDICTS ARE PARKED ON IT -- MEASURED
-      // 2026-09-28, the first run of this layer.  `d_out` carries `t_stock - t_object` in MICROSECONDS
-      // (the primitive's own write), while the tolerance this layer decides against is RELATIVE
-      // (`TOLERANCE` = 1% of the stock block).  The plan is explicit about which of the two the judgement
-      // uses -- "判定要用的量是「块相对」噪声（`d = t_stock块 − t_cand块`，看的是块时间的相对差）" -- and the
-      // mismatch is not theoretical: the run came back `sentinel_ok=0 not_worse=0 ci_missing=14`, because
-      // a +-0.01 us interval is compared against a ~1 us scatter.  That is a units artefact, and reporting
-      // it as a verdict is exactly the false green this layer must not produce.
-      //   * The divisor that fixes it is THAT SHAPE's own stock block median.  The primitive has it (it is
-      //     what the `too-slow` rule divides by) and does NOT export it; `t_block_hot_us` is the HEAVIEST
-      //     shape's, and the primitive's own comment rejects it as a divisor ("far too large on a light
-      //     shape") -- in the OPTIMISTIC direction, where light shapes would pass too easily.
-      //   * Two candidate fixes, both INTERFACE acts and both needing a ruling: (i) the primitive writes
-      //     `d_out` BLOCK-RELATIVE (`(t_stock - t_object)/t_stock`), or (ii) it exports each shape's own
-      //     stock block median next to the samples.
-      // ⇒ PARKED: the call is skipped, the derivation below stays compiled and reviewed (the (7b)
-      //   precedent: "what is parked is the CALL, not the derivation"), and `units_missing=1` on this
-      //   layer's line is what says so.  R48 pins this declared state so the flag cannot be flipped
-      //   without visiting the criterion that names it.
-      const bool blockRelativeNormaliserAvailable = false;
-      if (!blockRelativeNormaliserAvailable) {
-        j.unitsMissing = true;
-        return;
-      }
+      // (7e-1) THE NORMALISER EXISTS NOW, so nothing is parked here any more.  The ruling was option (i):
+      // the primitive writes `d_out` block-relative (that shape own anchor median as the divisor, with the
+      // `too-slow` guard), which is the unit `TOLERANCE` lives in -- so the interval verdicts below run
+      // unconditionally and `units_missing` is gone from this layer line.  The third path (derive the scale
+      // from the measured differences) was REJECTED and is registered, because it degenerates exactly on the
+      // two cases this layer judges: `median(d)` is ~0 for the A/A sentinel (the divisor blows up) and
+      // NEGATIVE for a slower candidate (the sign of the criterion flips).
       // (b) THE INTERVALS.  The samples are the primitive's dense layout with NaN for "never measured",
       //     and the differences are ALREADY paired (t_stock - t_object inside one rep).  Object 0 is the
       //     anchor (NaN by design), object 1 is the A/A sentinel, and candidate `c` on covered shape `s`
@@ -1125,6 +1108,24 @@ namespace VulkanTuner {
       }
       if (!d.pairsComplete) {
         noGainSuppressedOnIncompleteSet(d);   // ③, owned there (sentence + loud)
+        return;
+      }
+      if (j.ciMissing > 0) {
+        // 🔴 MEASURED (7e-1, the first run after the normaliser landed): `pairsComplete` is the
+        // PRIMITIVE's flag about MEASURED pairs, and it says nothing about whether the intervals could be
+        // FORMED.  A pair whose 98 paired differences are all exactly zero at the microsecond resolution
+        // yields no interval at all, and reading that as "nothing won" is reading NO DATA as a verdict --
+        // A2 forbids a sticky negative entry from it in as many words ("a confirmation that did not happen
+        // is not evidence").  So branch (2) requires BOTH: every legal pair measured AND every judged pair
+        // evaluable.  The run that produced this line read `cand_pairs=18 ci_missing=14` and minted
+        // `no-gain` anyway; the count is now the reason it does not.
+        if (d.outcome == "running") {
+          d.outcome = "no-winner";
+        }
+        logLine("NOTICE: " + d.deviceName + ": no-gain suppressed: " + to_string(j.ciMissing) + " of "
+                + to_string(j.candidatePairs) + " candidate pair(s) produced no interval at all (their "
+                  "paired differences are below the measurement resolution), so this run cannot claim that "
+                  "nothing won and no durable verdict is written (A2: missing evidence is not evidence)");
         return;
       }
       // ② THE HARD NEGATIVE CONCLUSION: every covered shape had every legal pair measured and no
@@ -5244,16 +5245,19 @@ namespace VulkanTuner {
           const double wantBlocks = perDispatch > 0.0
             ? (TuneStats::MIN_BLOCK_TIME_MS * 1000.0) / perDispatch : 0.0;
           decision->precheckShots = (uint32_t) (wantBlocks < 1.0 ? 1.0 : (double) (long) (wantBlocks + 0.999));
-          // The block-relative paired scale, from the sentinel's own pairs: d = t(object 0) - t(object 1)
-          // in the same rep, scale = 1.4826 x MAD(d) / median(block time of those same blocks).
-          // THE PAIRED DIFFERENCE IS ALREADY TAKEN BY THE PRIMITIVE, and the ANCHOR's slots are NaN
-          // BY DESIGN: `ggml-vulkan.cpp:21537` seeds every slot with NaN, `:22168` names the anchor
-          // ("the FIRST stock object.  Every difference is taken against it") and `:22357` shows the
-          // anchor's own slot carrying its MEDIAN rather than a difference.  So the differences live at
-          // the NON-anchor object's slots -- object 1 here -- and the block-relative scale divides by
-          // the anchor's own block time, which is this pre-check's `t_block_hot_us`.
-          // (Measured: the first version differenced the two slots itself, so every pair was NaN and
-          // `reps` read 0 -- handoff section 7.11's open item, closed here.)
+          // The block-relative paired scale, from the sentinel's own pairs: 1.4826 x MAD(d).  `d` NOW
+          // ARRIVES BLOCK-RELATIVE -- the primitive divides by THAT SHAPE own anchor median (its `d_out`
+          // write says so, and names why) -- which is the very unit `TOLERANCE` lives in, so this line is
+          // the whole conversion and there is no second division here.
+          // Before (7e-1) this divided by `t_block_hot_us`: that is the HEAVIEST shape's anchor median, so
+          // on the heaviest shape the two agreed and on a light shape they did not.  The measured
+          // correction removed the coincidence instead of depending on it.
+          // THE PAIRED DIFFERENCE IS TAKEN BY THE PRIMITIVE, and the ANCHOR's slots are NaN BY DESIGN
+          // (`ggml-vulkan.cpp` seeds every slot with NaN, names the anchor as the FIRST stock object, and
+          // leaves the anchor's own slot carrying its MEDIAN rather than a difference).  So the differences
+          // live at the NON-anchor object's slots -- object 1 here.  (Measured: the first version
+          // differenced the two slots itself, so every pair was NaN and `reps` read 0 -- handoff 7.11,
+          // closed in 7.12.)
           std::vector<double> preDiffs;
           for (uint32_t r = 0; r < preReps; r++) {
             const double dv = preD[(size_t) (preReps + r)];
@@ -5262,9 +5266,8 @@ namespace VulkanTuner {
             }
           }
           if (!preDiffs.empty()) {
-            const double medBlock = preRes.t_block_hot_us;
             const double mad = TuneStats::madScale(preDiffs);
-            const double sigmaRel = medBlock > 0.0 ? mad / medBlock : 0.0;
+            const double sigmaRel = mad;   // already block-relative: the primitive normalises
             decision->precheckSigmaRel = sigmaRel;
             const TuneStats::Budget preBudget =
               TuneStats::allocateReps(std::vector<double>(1, sigmaRel), TuneStats::TOLERANCE,
@@ -5505,7 +5508,6 @@ namespace VulkanTuner {
             << " gate_reject=" << (decision->judgement.gateRejected ? 1 : 0)
             << " gate_high=" << decision->judgement.gateHigh
             << " gate_low=" << decision->judgement.gateLow
-            << " units_missing=" << (decision->judgement.unitsMissing ? 1 : 0)
             << " verdicts=" << (decision->judgement.verdictsComputed ? 1 : 0)
             << " sentinel_ok=" << (decision->judgement.sentinelEquivalent ? 1 : 0)
             << " sentinel_pairs=" << decision->judgement.sentinelPairs

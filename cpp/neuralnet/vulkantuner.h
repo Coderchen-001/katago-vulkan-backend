@@ -491,12 +491,10 @@ namespace VulkanTuner {
       uint32_t ciMissing = 0;
       uint32_t notWorsePairs = 0;
       bool sentinelEquivalent = false;   // EVERY covered shape's sentinel interval inside +-tolerance
-      // 🔴 TRUE while the interval verdicts are PARKED: the primitive hands over MICROSECOND differences
-      // and the tolerance is RELATIVE, and the per-shape block time that would bridge them is not
-      // exported (see the parked block in the shell).  `unitsMissing=1` on the judgement line is the
-      // reading; it keeps "not evaluated" distinguishable from "no candidate passed".
-      bool unitsMissing = false;
-      // Did the interval verdicts actually run?  false today, and it must not be read as a verdict.
+      // Did the interval verdicts actually run?  They do now that the primitive hands over the
+      // BLOCK-RELATIVE difference (7e-1); the flag stays because a layer that is parked again must never be
+      // readable as a verdict -- `verdicts=0` with zero counts is what distinguishes "not evaluated" from
+      // "no candidate passed", and the smoke pins both directions.
       bool verdictsComputed = false;
       int winner = -1;                   // the first candidate not-worse on every shape (-1 = none)
       bool winnerUnstable = false;       // the stability boundary, read on that candidate's intervals

@@ -22447,11 +22447,48 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
     // (shape * nObjects + object) * reps + rep.  A slot whose object IS the anchor stays NaN (there is
     // no difference to take), and so does a slot that was never measured -- deliberately, so that a
     // consumer which ignores the NaN gets a poisoned interval rather than a tie of zero.
+    //
+    // 🔴 THE UNIT IS BLOCK-RELATIVE, and that is a MEASURED correction rather than a preference.  The
+    // judgement layer decides `median(d)` against a RELATIVE tolerance (tunestats.h: TOLERANCE = 1% of the
+    // stock block), and tune-measurement.md is explicit about the quantity it consumes: "判定要用的量是
+    // 「块相对」噪声 ... 看的是块时间的相对差".  Handing over microseconds made every verdict an artefact --
+    // the judgement layer first run came back `sentinel_ok=0 not_worse=0 ci_missing=14`, because a +-0.01
+    // interval was being compared against a ~1 us scatter -- and the layer was therefore PARKED rather
+    // than allowed to report that as a verdict.  This write is what unparking it waits for.
+    //
+    // THE DIVISOR is that shape OWN anchor median: the same quantity, and the same `> 0` plus `>= 2
+    // measured blocks` guard, that the `too-slow` rule above already divides by -- one scale for both
+    // rules.  The alternative (hand over microseconds and let the caller convert) was rejected on
+    // evidence: the per-shape anchor median has no other outlet (`t_block_hot_us` is the HEAVIEST shape,
+    // and the `too-slow` comment above rejects it as a divisor because it is far too large on a light
+    // shape -- the OPTIMISTIC direction), and a caller dividing by a quantity of its own choosing would be
+    // a second spelling of the scale.
     for (uint32_t s = 0; s < params->nShapes; s++) {
         const size_t anchor_slot = (size_t) s * params->nObjects + anchor_index;
         if (block_measured[anchor_slot * (size_t) params->reps] == 0) {
             continue;   // cannot happen (the anchor is legal and needs no pipeline), and skipping is
                         // safer than reading uninitialised block times if it ever does
+        }
+        // The guard is re-stated here rather than shared with the `too-slow` loop above because the two
+        // ask different questions of it: that one asks "may this pair be compared at all", this one asks
+        // "may this shape's difference be EXPRESSED in units of its own stock block".  What they must not
+        // do is disagree about when a scale exists -- so the predicate is the same two conditions, and an
+        // anchor without one leaves the shape's slots at NaN (the caller's `ci_missing` counts it) with a
+        // loud saying why: a zero denominator or a single block is not a scale.
+        const double scale = slot_median[anchor_slot];
+        uint32_t anchor_blocks = 0;
+        for (uint32_t r = 0; r < params->reps; r++) {
+            if (block_measured[anchor_slot * (size_t) params->reps + r] != 0) {
+                anchor_blocks++;
+            }
+        }
+        if (!(scale > 0.0) || anchor_blocks < 2) {
+            ggml_vk_t3_line("probe: shape " + std::to_string(s) + " (median anchor block "
+                            + std::to_string(scale) + " us over " + std::to_string(anchor_blocks)
+                            + " measured block(s)) has no block-relative scale, so its paired differences "
+                              "are NOT written: the caller sees no interval for this shape instead of a "
+                              "difference divided by nothing");
+            continue;
         }
         for (uint32_t o = 0; o < params->nObjects; o++) {
             if (o == anchor_index) {
@@ -22464,7 +22501,7 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
             for (uint32_t r = 0; r < params->reps; r++) {
                 const double t_stock = (double) block_us[anchor_slot * (size_t) params->reps + r];
                 const double t_obj   = (double) block_us[slot * (size_t) params->reps + r];
-                d_out[slot * (size_t) params->reps + r] = t_stock - t_obj;
+                d_out[slot * (size_t) params->reps + r] = (t_stock - t_obj) / scale;
                 samples_written++;
             }
         }
