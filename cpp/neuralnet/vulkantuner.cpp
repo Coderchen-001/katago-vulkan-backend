@@ -1185,6 +1185,32 @@ namespace VulkanTuner {
         return;   // nothing was compared: the outcome stays `running`, and `writeCacheIfAllowed` refuses
                   // it with its own sentence (which is why no second loud is minted here)
       }
+      if (j.winnerUnstable) {
+        // 🔴 A3 ②, AS A GATE (plan tune-measurement.md:105/109-111).  The winning claim sits within
+        // `STABILITY_BOUNDARY_SE` standard errors of the tolerance line, so the outcome is the DECLARED,
+        // NON-WRITABLE `unstable` plus this loud -- and NO row set.  MEASURED before this branch existed
+        // (the first live winner): `winner=2`, `winner_unstable=1`, `winner_margin=0.0018`, and the run was
+        // stopped by the CONFIRMATION step instead, i.e. the boundary criterion fired and had no power while
+        // the layer claimed a winner the priority order says it may not claim.  The plan's line 121 is the
+        // sharper half: `unstable` may sit in the outcome table only because its PRODUCER lands in this
+        // batch, and until now there was no producer at all.
+        // WHY IT IS REGRESSION TO THE MEAN AND NOT THE WINNER'S CURSE (operator's closure on that run, and
+        // why the two are not the same guard): with t = 1.9646 at 512 pairs and the tolerance line as the
+        // reference, `SE = (ciHigh - ciLow)/(2t) = 0.0036 = 2 x 0.0018`, so the margin sat EXACTLY at one SE
+        // -- "a barely-crossing candidate returns to centre when re-measured", rather than "the maximum of
+        // noise was selected".  Both send you back to fresh blocks; only this one explains a margin that was
+        // already at the boundary when it was selected.
+        if (d.outcome == "running") {
+          d.outcome = "unstable";
+        }
+        logLine("NOTICE: " + d.deviceName + ": candidate " + to_string(j.winner) + " is not worse than stock "
+                "on every covered shape, but its claim sits at the stability boundary (margin "
+                + to_string(j.winnerMargin) + " against STABILITY_BOUNDARY_SE="
+                + to_string(TuneStats::STABILITY_BOUNDARY_SE) + " standard errors), so the outcome is the "
+                  "declared non-writable `unstable` and NO row set is written: a claim that would not survive "
+                  "its own re-measurement is not a claim this layer is allowed to remember");
+        return;
+      }
       if (j.winner >= 0) {
         // ① THE WINNER, WITH ITS CONFIRMATION STEP IN FRONT OF IT (section 2.3 (4)): the same paired test,
         // the same alpha, and blocks the SELECTION never saw.  The budget is `TuneStats::PAIRS_FLOOR` --
