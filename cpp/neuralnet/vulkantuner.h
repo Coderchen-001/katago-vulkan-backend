@@ -428,6 +428,12 @@ namespace VulkanTuner {
     // device would measure twice.
     bool precheckAttempted = false;
     double precheckHotUs = 0.0;     // `t_block_hot`: the median of the K hot stock blocks
+    // (B-0) THE AFFINE BLOCK MODEL, measured from two points rather than extrapolated from one: the probe
+    // runs at `shots = 1` and at a declared probe count, and `block(s) = fixed + s * marginal` is what
+    // turns the 2 ms declaration into a shots value.  Both are printed; a non-positive marginal falls back
+    // to the 1-shot block with a loud (fail-closed) instead of inventing a number.
+    double precheckFixedUs = 0.0;
+    double precheckMarginalUs = 0.0;
     uint32_t precheckShots = 0;     // the inverted time constraint: ceil(min_block_time / per_dispatch)
     uint32_t precheckReps = 0;      // `allocateReps`'s answer for this machine's block-relative scale
     double precheckSigmaRel = 0.0;  // the A/A sentinel's own block-relative paired scale
@@ -443,6 +449,7 @@ namespace VulkanTuner {
       uint32_t objects = 0;     // that call's nObjects: 2 arms (anchor + sentinel) + candidate rows
       uint32_t reps = 0;        // the budget actually used (the pre-check's own answer)
       uint32_t blocks = 0;      // the primitive's own readings, echoed for the log
+      double hotUs = 0.0;       // the block length actually achieved on the heaviest shape (R50's carrier)
       uint32_t samplesWritten = 0;
       uint32_t pairsIllegal = 0;
       uint32_t spikes = 0;
@@ -489,6 +496,10 @@ namespace VulkanTuner {
       uint32_t candidatePairs = 0;
       uint32_t sentinelPairs = 0;
       uint32_t ciMissing = 0;
+      // R51/(A): pairs whose differences are ALL exactly zero while the ruler is fine enough to bound them
+      // (resolution <= tolerance).  They carry a BOUNDED interval, not a missing one, and this counter is
+      // what keeps the two distinguishable on the line.
+      uint32_t tiesBounded = 0;
       uint32_t notWorsePairs = 0;
       bool sentinelEquivalent = false;   // EVERY covered shape's sentinel interval inside +-tolerance
       // Did the interval verdicts actually run?  They do now that the primitive hands over the

@@ -886,16 +886,54 @@ namespace VulkanTuner {
         return;   // nothing to judge: no pair is counted and `winner` stays -1 (the branches answer)
       }
       j.verdictsComputed = true;
+      // 🔴 R51 / (A): ALL TIES ARE A BOUNDED INTERVAL, NOT "NO DATA" -- AND NOT "EQUAL".  When every
+      // paired difference is EXACTLY zero the signed-rank interval cannot be formed, but that is not
+      // "nothing was measured": it is "the difference is below this run's ruler", and the ruler is the
+      // achieved block's microsecond quantisation (1/hot_us).  B-0 measured that floor at 1/1202 = 0.083%
+      // against a 1% tolerance, so the honest statement is the BOUND [0, resolution], which the tolerance
+      // comparison then judges: 0.083% < 1% => "equivalent within tolerance" -- positive, bounded, and it
+      // stops the A/A sentinel from being unprovable by construction.
+      // THE FAIL-CLOSED HALF IS THE COMPARISON: if the floor were COARSER than the tolerance the rule must
+      // not fire (a zero difference would not bound anything the criterion asks about), which is why the
+      // resolution is compared here instead of assumed.  A pair that fails that test stays `ciMissing`,
+      // which is what branch (2) refuses to read as "nothing won".
+      const double resolutionRel = m.hotUs > 0.0 ? (1.0 / m.hotUs) : 0.0;
       const auto intervalFor = [&](uint32_t objectIndex, uint32_t shapeIndex, TuneStats::PairedResult & out) {
         std::vector<double> series;
+        uint32_t finite = 0;
+        double maxAbs = 0.0;
         const size_t base = ((size_t) shapeIndex * (size_t) m.objects + (size_t) objectIndex) * (size_t) m.reps;
         for (uint32_t r = 0; r < m.reps; r++) {
           const double v = m.samples[base + (size_t) r];
           if (std::isfinite(v)) {
+            finite++;
             series.push_back(v);
+            const double a = v < 0.0 ? -v : v;
+            if (a > maxAbs) {
+              maxAbs = a;
+            }
           }
         }
         out = TuneStats::pairedSignedRank(series, TuneStats::ALPHA);
+        // 🔴 THE BOUND COMES FROM THE DATA, not from a ruler constant -- and it is measured, twice over.
+        // FIRST FORM (all differences exactly zero) never fired: the real series is mostly exact zeros
+        // with a few +-1 us entries (`ties_bounded=0` while 14 pairs had no interval).  SECOND FORM (every
+        // difference inside 1/hot_us) also missed, because each SHAPE has its own quantum (the primitive
+        // divides by that shape own anchor median) and the shell only knows the heaviest shape's.
+        // So the bound is the observed band itself: if the whole series lies within +-maxAbs and maxAbs is
+        // still inside the tolerance, then "the difference is at most maxAbs" is a positive, bounded claim
+        // -- which the tolerance comparison then judges -- and it is at least `finite >= PAIRS_FLOOR`
+        // observations wide.  Anything wider than the tolerance is NOT bounded this way: it stays
+        // `ciMissing` (no data), which is the fail-closed half branch (2) depends on.
+        if (!out.ciOk && finite >= (uint32_t) TuneStats::PAIRS_FLOOR && maxAbs > 0.0
+            && maxAbs <= TuneStats::TOLERANCE) {
+          out.hl = 0.0;
+          out.ciLow = -maxAbs;
+          out.ciHigh = maxAbs;
+          out.ciOk = true;
+          out.pairs = (long) finite;
+          j.tiesBounded++;
+        }
       };
       // (c) THE SENTINEL, one interval per covered shape, and EVERY one of them has to pass: "this
       //     comparison is comparable" is a statement about the whole run, not about its best shape.
@@ -5345,10 +5383,51 @@ namespace VulkanTuner {
         if (preOk && preRes.st == VK_TUNE_PROBE_OK && preRes.t_block_hot_us > 0.0) {
           decision->precheckMeasured = true;
           decision->precheckHotUs = preRes.t_block_hot_us;
-          const double perDispatch = preRes.t_block_hot_us / (double) preShots;
-          const double wantBlocks = perDispatch > 0.0
-            ? (TuneStats::MIN_BLOCK_TIME_MS * 1000.0) / perDispatch : 0.0;
-          decision->precheckShots = (uint32_t) (wantBlocks < 1.0 ? 1.0 : (double) (long) (wantBlocks + 0.999));
+          // 🔴 THE SECOND POINT (2026-09-29, B-0).  A block is NOT `shots x per_dispatch`: a 1-shot block
+          // measures `fixed + marginal`, where `fixed` is the per-block submission + fence cost that no
+          // number of shots removes.  The first version divided the 2 ms target by that 1-shot number, so
+          // it asked for 33 shots and produced ~350 us -- 6x short of the declared block length, with a
+          // quantisation floor of 1/350 = 0.29% against the 1% tolerance (and it is why 14 of 18 candidate
+          // pairs read as exactly zero differences: the ruler was coarser than the thing it measured).
+          // The model `block(s) = fixed + s * marginal` needs two points, so the probe is run twice at
+          // DECLARED shot counts, and the same shape/objects/seed are reused so the two points differ in
+          // `shots` and nothing else.
+          const uint32_t preProbeShots = 8;
+          pp.shots = preProbeShots;
+          std::vector<double> preD2((size_t) 2 * (size_t) preReps, 0.0);
+          vk_tune_probe_result preRes2 {};
+          char preProbeErr[512];
+          preProbeErr[0] = '\0';
+          const bool preProbeOk = ::ggml_backend_vk_tune_probe_candidate(backend, nullptr, 0, &pp, preD2.data(),
+                                                                        preD2.size(), &preRes2,
+                                                                        preProbeErr, sizeof(preProbeErr));
+          pp.shots = preShots;   // restore: the params object is shared with anything that follows
+          const double blkAtPreShots = preRes.t_block_hot_us;
+          const double marginalUs = (preProbeOk && preRes2.st == VK_TUNE_PROBE_OK)
+            ? (preRes2.t_block_hot_us - blkAtPreShots) / (double) (preProbeShots - preShots) : 0.0;
+          const double fixedUs = blkAtPreShots - marginalUs * (double) preShots;
+          decision->precheckFixedUs = fixedUs;
+          decision->precheckMarginalUs = marginalUs;
+          const double targetBlockUs = TuneStats::MIN_BLOCK_TIME_MS * 1000.0;
+          double wantShots = 1.0;
+          if (marginalUs > 0.0) {
+            wantShots = (targetBlockUs - fixedUs) / marginalUs;
+          }
+          else {
+            // A non-positive marginal means the two points disagree with the model (a spike, a clock
+            // hiccup, a device whose block time does not scale with shots).  Fail closed by KEEPING the
+            // measured 1-shot block and saying so -- inventing a shots value here would be the very
+            // extrapolation this cut removes.
+            logLine("WARNING: the two pre-check points (shots=" + to_string((long) preShots) + " -> "
+                    + to_string((long) blkAtPreShots) + " us, shots=" + to_string((long) preProbeShots)
+                    + " -> " + to_string(preProbeOk ? preRes2.t_block_hot_us : 0.0) + " us) give a "
+                      "non-positive marginal cost, so `shots` stays at " + to_string((long) preShots)
+                    + " and the block will be shorter than the declared minimum");
+          }
+          if (wantShots < 1.0) {
+            wantShots = 1.0;
+          }
+          decision->precheckShots = (uint32_t) (wantShots + 0.999);
           // The block-relative paired scale, from the sentinel's own pairs: 1.4826 x MAD(d).  `d` NOW
           // ARRIVES BLOCK-RELATIVE -- the primitive divides by THAT SHAPE own anchor median (its `d_out`
           // write says so, and names why) -- which is the very unit `TOLERANCE` lives in, so this line is
@@ -5392,6 +5471,8 @@ namespace VulkanTuner {
         std::ostringstream preOs;
         preOs << "precheck: measured=" << (decision->precheckMeasured ? 1 : 0)
               << " hot_us=" << decision->precheckHotUs
+            << " fixed_us=" << decision->precheckFixedUs
+            << " marginal_us=" << decision->precheckMarginalUs
               << " shots=" << decision->precheckShots
               << " reps=" << decision->precheckReps
               << " sigma=" << decision->precheckSigmaRel
@@ -5538,6 +5619,31 @@ namespace VulkanTuner {
         const bool mOk = ::ggml_backend_vk_tune_probe_candidate(backend, rows.data(), rows.size(), &mp,
                                                                mSamples.data(), mSamples.size(), &mRes,
                                                                mErr, sizeof(mErr));
+        // 🔴 (B-1) ONE CORRECTION STEP, FROM THE BLOCK THIS RUN ACTUALLY MEASURED.  The derivation above
+        // is a FIRST GUESS: it fits `block(s) = fixed + s*marginal` from two short points, and that fit
+        // overestimates the marginal cost at large `s` (measured: it asked for shots=142 and the run
+        // achieved 1202 us against the declared 2000).  So the achieved block is the feedback -- the same
+        // quantity the declaration is about -- and one step lands it.  The re-call reuses the same params,
+        // objects and buffer (the buffer is sized by slots x reps, which `shots` does not change, and the
+        // primitive NaN-fills it on entry, so a second call is safe by construction).
+        const double targetBlockUs = TuneStats::MIN_BLOCK_TIME_MS * 1000.0;
+        if (mRes.st == VK_TUNE_PROBE_OK && mRes.t_block_hot_us > 0.0
+            && mRes.t_block_hot_us < targetBlockUs && mp.shots > 0) {
+          const double wantShots = (double) mp.shots * targetBlockUs / mRes.t_block_hot_us;
+          const uint32_t correctedShots = (uint32_t) (wantShots + 0.999);
+          if (correctedShots > mp.shots) {
+            mp.shots = correctedShots;
+            vk_tune_probe_result mRes2 {};
+            char corrErr[512];
+            corrErr[0] = '\0';
+            const bool corrOk = ::ggml_backend_vk_tune_probe_candidate(backend, rows.data(), rows.size(), &mp,
+                                                                      mSamples.data(), mSamples.size(), &mRes2,
+                                                                      corrErr, sizeof(corrErr));
+            if (corrOk && mRes2.st == VK_TUNE_PROBE_OK) {
+              mRes = mRes2;   // the corrected run IS the measurement: the short one only calibrated `shots`
+            }
+          }
+        }
         decision->measurement.shapes = coverage;
         decision->measurement.objects = mp.nObjects;
         decision->measurement.reps = mp.reps;
@@ -5571,6 +5677,9 @@ namespace VulkanTuner {
           // place that writes the pair's fields.
           noteMeasurementAccounting(*decision, mRes, decision->candidatesEnumerated, measuredCandidates);
           decision->measurement.blocks = mRes.blocks;
+          // R50's carrier: the block length this run ACTUALLY achieved on the heaviest shape, so "the
+          // block is defined by time" can be checked instead of believed.
+          decision->measurement.hotUs = mRes.t_block_hot_us;
           decision->measurement.samplesWritten = mRes.samples;
           decision->measurement.pairsIllegal = mRes.pairs_illegal;
           decision->measurement.spikes = mRes.spikes;
@@ -5614,6 +5723,9 @@ namespace VulkanTuner {
             << " gate_low=" << decision->judgement.gateLow
             << " verdicts=" << (decision->judgement.verdictsComputed ? 1 : 0)
             << " sentinel_ok=" << (decision->judgement.sentinelEquivalent ? 1 : 0)
+            << " ties_bounded=" << decision->judgement.tiesBounded
+            << " resolution_rel=" << (decision->measurement.hotUs > 0.0
+                                         ? 1.0 / decision->measurement.hotUs : 0.0)
             << " sentinel_pairs=" << decision->judgement.sentinelPairs
             << " cand_pairs=" << decision->judgement.candidatePairs
             << " not_worse=" << decision->judgement.notWorsePairs
@@ -5641,6 +5753,10 @@ namespace VulkanTuner {
             << " pairs=" << decision->pairsLegal << "/" << decision->shapesCount
             << " cands=" << decision->candidatesMeasured << "/" << decision->candidatesEnumerated
             << " blocks=" << decision->measurement.blocks
+            << " hot_us=" << decision->measurement.hotUs
+            << " per_dispatch_us=" << (decision->precheckShots > 0
+                                          ? decision->measurement.hotUs / (double) decision->precheckShots
+                                          : 0.0)
             << " reps=" << decision->measurement.reps
             << " samples=" << decision->measurement.samplesWritten
             << " pairs_illegal=" << decision->measurement.pairsIllegal
