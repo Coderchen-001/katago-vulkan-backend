@@ -5688,21 +5688,38 @@ namespace VulkanTuner {
         // objects and buffer (the buffer is sized by slots x reps, which `shots` does not change, and the
         // primitive NaN-fills it on entry, so a second call is safe by construction).
         const double targetBlockUs = TuneStats::MIN_BLOCK_TIME_MS * 1000.0;
-        if (mRes.st == VK_TUNE_PROBE_OK && mRes.t_block_hot_us > 0.0
-            && mRes.t_block_hot_us < targetBlockUs && mp.shots > 0) {
-          const double wantShots = (double) mp.shots * targetBlockUs / mRes.t_block_hot_us;
-          const uint32_t correctedShots = (uint32_t) (wantShots + 0.999);
-          if (correctedShots > mp.shots) {
-            mp.shots = correctedShots;
-            vk_tune_probe_result mRes2 {};
-            char corrErr[512];
-            corrErr[0] = '\0';
-            const bool corrOk = ::ggml_backend_vk_tune_probe_candidate(backend, rows.data(), rows.size(), &mp,
-                                                                      mSamples.data(), mSamples.size(), &mRes2,
-                                                                      corrErr, sizeof(corrErr));
-            if (corrOk && mRes2.st == VK_TUNE_PROBE_OK) {
-              mRes = mRes2;   // the corrected run IS the measurement: the short one only calibrated `shots`
+        // 🔴 (B-2) THE CORRECTION IS PER SHAPE, BECAUSE THE BLOCK LENGTH IS.  One shared `shots` gave
+        // the heaviest shape ~2000 us and left the light ones at 1582-1999 (measured), while the floor is a
+        // per-shape criterion -- so each shape gets ITS OWN ratio, computed from ITS OWN achieved block
+        // (`shape_anchor_us[s]`, the same median the primitive divides by).  Handing the heaviest shape's
+        // cost to the light ones would repeat the "one ruler for six shapes" mistake one layer down.
+        std::vector<uint32_t> shotsPerShape(coverage.size(), mp.shots);
+        bool anyShapeShort = false;
+        for (size_t sIdx = 0; sIdx < coverage.size() && sIdx < (size_t) mRes.n_shape_anchor_us; sIdx++) {
+          const double aUs = mRes.shape_anchor_us[sIdx];
+          if (aUs > 0.0 && aUs < targetBlockUs) {
+            anyShapeShort = true;
+            const double want = (double) mp.shots * targetBlockUs / aUs;
+            const uint32_t wantShots = (uint32_t) (want + 0.999);
+            if (wantShots > shotsPerShape[sIdx]) {
+              shotsPerShape[sIdx] = wantShots;
             }
+          }
+        }
+        if (anyShapeShort && mRes.st == VK_TUNE_PROBE_OK && mp.shots > 0) {
+          mp.shotsPerShape = shotsPerShape.data();
+          mp.nShotsPerShape = (uint32_t) shotsPerShape.size();
+          vk_tune_probe_result mRes2 {};
+          char corrErr[512];
+          corrErr[0] = '\0';
+          const bool corrOk = ::ggml_backend_vk_tune_probe_candidate(backend, rows.data(), rows.size(), &mp,
+                                                                    mSamples.data(), mSamples.size(), &mRes2,
+                                                                    corrErr, sizeof(corrErr));
+          // The params object is shared with whatever follows: leave it exactly as the caller found it.
+          mp.shotsPerShape = nullptr;
+          mp.nShotsPerShape = 0;
+          if (corrOk && mRes2.st == VK_TUNE_PROBE_OK) {
+            mRes = mRes2;   // the corrected run IS the measurement: the short one only calibrated the shots
           }
         }
         decision->measurement.shapes = coverage;
