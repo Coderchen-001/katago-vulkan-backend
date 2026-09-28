@@ -4256,7 +4256,7 @@ namespace VulkanTuner {
        << " verifies[override_consumed anchor_hits=0 raii_restore samples+pairs detector_identity "
        << "coverage_complete_echo shots_shape_honoured too_slow_drop]"
        << " not_verified[gate_0.15 vs_tolerance coverage_complete number_quality "
-       << "r13_without_coopmat2 shots_shape_multi too_slow_magnitude]"
+       << "r13_without_coopmat2 shots_shape_multi too_slow_magnitude probe_call_window]"
        << " checks=" << checks << " [" << (ok ? "ok" : "FAIL") << "]"
        << (ok ? "" : " first problem: " + firstBad);
     logLine(os.str());
@@ -5343,6 +5343,7 @@ namespace VulkanTuner {
         jOs << "judge: attempted=" << (decision->judgement.attempted ? 1 : 0)
             << " gate_reject=" << (decision->judgement.gateRejected ? 1 : 0)
             << " gate_high=" << decision->judgement.gateHigh
+            << " gate_low=" << decision->judgement.gateLow
             << " units_missing=" << (decision->judgement.unitsMissing ? 1 : 0)
             << " verdicts=" << (decision->judgement.verdictsComputed ? 1 : 0)
             << " sentinel_ok=" << (decision->judgement.sentinelEquivalent ? 1 : 0)
@@ -5373,7 +5374,9 @@ namespace VulkanTuner {
             << " pairs=" << decision->pairsLegal << "/" << decision->shapesCount
             << " cands=" << decision->candidatesMeasured << "/" << decision->candidatesEnumerated
             << " blocks=" << decision->measurement.blocks
+            << " reps=" << decision->measurement.reps
             << " samples=" << decision->measurement.samplesWritten
+            << " pairs_illegal=" << decision->measurement.pairsIllegal
             << " spikes=" << decision->measurement.spikes
             << " pairs_complete=" << (decision->measurement.pairsComplete ? 1 : 0)
             << " coverage=" << (decision->measurement.coverageEcho ? 1 : 0)
