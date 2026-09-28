@@ -841,12 +841,19 @@ namespace VulkanTuner {
     // produced for this key is a fact about the caller's set, and only the caller knows it.  The two
     // definitions are written HERE, with the first producer, rather than left to the reader -- the plan
     // fixes the fields' SHAPE (`cands=<measured>/<enumerated>`), not their sources.
+    // `r.objects` is deliberately NOT the numerator.  It is the number of OBJECTS the primitive timed,
+    // and that array carries arms which are not candidates at all (the stock anchor and the A/A
+    // sentinel -- see the measurement's own comment).  Feeding it in would print a numerator ABOVE its
+    // denominator, which section 2.6 calls the wiring bug this pair of fields exists to expose.  So the
+    // caller states how many of the ENUMERATED candidates were really measured, and the two numbers are
+    // then ONE quantity ("of N enumerated candidates, M were measured") instead of two units side by
+    // side.
     void noteMeasurementAccounting(Decision & d, const vk_tune_probe_result & r,
-                                   uint32_t enumeratedCandidates) {
+                                   uint32_t enumeratedCandidates, uint32_t measuredCandidates) {
       d.pairsComplete = r.pairs_complete;
       d.droppedTooSlow = r.dropped_too_slow;
       d.droppedBuildFailed = r.dropped_build_failed;
-      d.candidatesMeasured = r.objects;
+      d.candidatesMeasured = measuredCandidates;
       d.candidatesEnumerated = enumeratedCandidates;
       d.pairsLegal = r.pairs_legal;
       d.shapesCount = r.shapes;
@@ -1480,6 +1487,17 @@ namespace VulkanTuner {
           // counted.  R42(d)'s census is unchanged (production 1 / self-test 1); its MEANING changed.
           d->rowSource = "measured";
           d->candidateCoverage = "sampled";
+          // (7b) step 5: WHICH PATH these geometries belong to, recorded by the one function that knows
+          // it (the path is spelled once, at the top of this catalogue).  The measurement builds its
+          // candidate rows from that path and must not pick a second one.
+          d->candidatePath = path;
+          // ... and the PAIR such a row may declare, which is this path's own family and not the
+          // shape's: the cm2 tuned-row modules cover f16 x f16 only, while a KataGo shape's declared
+          // pair is normally f16 x f32.  Declared here, next to the path, because both are "what the
+          // catalogue proposes", and a wrong value is refused loudly by the primitive (R-13 and the
+          // shader lookup), never silently measured.
+          d->candidateRowSrc0 = (int) VK_TUNE_SRC_F16;
+          d->candidateRowSrc1 = (int) VK_TUNE_SRC_F16;
           // R-25's input flag, stated by the component that knows: this walk is the declared STOCK VECTOR
           // SURFACE, a proper subset of the slot's shape set -- so the set handed over is NOT complete, and
           // writing `false` here is a measurement of that fact rather than a default nobody filled in.
@@ -1731,6 +1749,14 @@ namespace VulkanTuner {
       { "tolerance",       std::to_string(TuneStats::TOLERANCE)       },
       { "min_block_ms",    std::to_string(TuneStats::MIN_BLOCK_TIME_MS) },
       { "pairs_floor",     std::to_string(TuneStats::PAIRS_FLOOR)     },
+      // (7b) / N4: the pre-check's own three numbers.  They belong in this string for the same reason
+      // the rows above do -- they decide what a durable verdict MEANS (the warm-up count and K change
+      // the block sequence the comparison is computed from), and `stall_blocks` is here by ruling so
+      // that changing it invalidates instead of silently mixing regimes.  Their derivations live next
+      // to them in tunestats.h, because a value in this string is only auditable if its origin is.
+      { "warmup_blocks",   std::to_string(TuneStats::WARMUP_BLOCKS)   },
+      { "hot_blocks_k",    std::to_string(TuneStats::HOT_BLOCKS_K)    },
+      { "stall_blocks",    std::to_string(TuneStats::STALL_BLOCKS)    },
     };
 
       // The DEV-SURFACE knobs: everything that can change what this tuner may select (or the
@@ -2466,6 +2492,13 @@ namespace VulkanTuner {
          // accounted for", never "a complete measurement of nothing".
          << " cands=" << d.candidatesMeasured << "/" << d.candidatesEnumerated
          << " pairs=" << d.pairsLegal << "/" << d.shapesCount
+         // (7b) step 4: the two readings that consume the shape-set interface's two outputs (R-12: a
+         // field only its producer reads must land with its consumer).  `graph_shapes` is the coverage
+         // set's size AFTER R-21's filter and `graph_nodes` is the row-table-side MUL_MAT dispatch count
+         // those shapes account for; the smoke pins both on a probe leg, so a walk that found nothing
+         // reads as 0 rather than as a smaller set.
+         << " graph_shapes=" << d.graphShapes.size()
+         << " graph_nodes=" << d.graphNodes
          << " tuneMode=" << d.tuneModeText
          << " cache_state=" << d.cacheState
          << " tune_ms=" << d.tuneMs
@@ -3479,7 +3512,9 @@ namespace VulkanTuner {
         // unwritable), so nothing can be remembered from a comparison that could not be finished.
         Decision a;
         a.deviceName = "self-test";
-        noteMeasurementAccounting(a, makeResult(6u, false, 3u, 2u), 9u);
+        // The measured-candidate count is the CALLER's statement (the object count includes the two
+        // arms), which is why it is passed explicitly rather than read off `r.objects`.
+        noteMeasurementAccounting(a, makeResult(6u, false, 3u, 2u), 9u, 6u);
         const bool accountedOk = !a.pairsComplete && a.droppedTooSlow == 3u
                               && a.droppedBuildFailed == 2u && a.candidatesMeasured == 6u
                               && a.candidatesEnumerated == 9u && a.pairsLegal == 12u
@@ -3496,7 +3531,7 @@ namespace VulkanTuner {
         // project refuses for outcomes (unlike reasons, which may be reserved).
         Decision b;
         b.deviceName = "self-test";
-        noteMeasurementAccounting(b, makeResult(6u, true, 0u, 0u), 9u);
+        noteMeasurementAccounting(b, makeResult(6u, true, 0u, 0u), 9u, 6u);
         const bool firedB = noGainSuppressedOnIncompleteSet(b);
         const bool untouchedB = (b.outcome == "running");
         // (C) incomplete + A WINNER -> the ROW SET STANDS.  This is the direction section 2.6(a) calls
@@ -3515,7 +3550,7 @@ namespace VulkanTuner {
         c.rows[0].geom.pad = -1; c.rows[0].geom.reshape = -1; c.rows[0].geom.smaller = -1;
         c.rowInstalledSeen = true;
         c.rowInstalled.push_back(1);
-        noteMeasurementAccounting(c, makeResult(6u, false, 1u, 0u), 9u);
+        noteMeasurementAccounting(c, makeResult(6u, false, 1u, 0u), 9u, 6u);
         c.outcome = "measured";
         const bool firedC = noGainSuppressedOnIncompleteSet(c);
         const bool rowsStand = (c.outcome == "measured") && !rowsForWrite(c).empty();
@@ -4091,7 +4126,9 @@ namespace VulkanTuner {
     int maxBatchSize,
     enabled_t useFP16Mode,
     const ModelIdentity& model,
-    const TunePolicy& policy
+    const TunePolicy& policy,
+    const std::vector<vk_tune_probe_shape>& graphShapes,
+    const std::vector<uint32_t>& graphShapeCounts
   ) {
     // KATAGO_VK_TUNE_RETUNE=1: ignore whatever is on disk (rows AND the negative entry) and
     // decide again.  It is the operator's "I do not trust this file" switch, and it is
@@ -4136,6 +4173,17 @@ namespace VulkanTuner {
     // context's install has not run yet") and called from the backend's eval path, which knows
     // nothing about policies.
     d->tunePolicy = policy;
+    // (7b) step 4: the coverage set travels WITH the decision, because everything downstream (the
+    // pre-check's heaviest shape, the per-shape shots, the candidate rows, `coverageComplete`) is a
+    // statement about THIS set.
+    d->graphShapes = graphShapes;
+    d->graphShapeCounts = graphShapeCounts;
+    // ONE producer for the sum: the decision line's `graph_nodes=` and the coverage rule's denominator
+    // are then the same arithmetic over the same vector, instead of two numbers that could disagree.
+    d->graphNodes = 0;
+    for (size_t i = 0; i < graphShapeCounts.size(); i++) {
+      d->graphNodes += graphShapeCounts[i];
+    }
 
     try {
       char fp[512];
@@ -4240,6 +4288,13 @@ namespace VulkanTuner {
         logLine("candidate enumeration: " + enumerateCandidateCounts(d->deviceSubgroupSize));
         const vector<Candidate> cands = runCandidateCatalog(d.get());
         d->candidatesEnumerated = (uint32_t) cands.size();
+        // (7b) step 5: the SET ITSELF travels with the decision, not just its size.  The measurement
+        // runs at the end of `installForHandle`, long after this block, and re-deriving the geometries
+        // there would be a second answer to "what did the search return".
+        d->candidateGeoms.clear();
+        for (size_t ci = 0; ci < cands.size(); ci++) {
+          d->candidateGeoms.push_back(cands[ci].geom);
+        }
         logLine(formatCandidateCatalog(*d, cands));
       }
 
@@ -4800,7 +4855,358 @@ namespace VulkanTuner {
                       + " does NOT contain this context's rows")
                    : ("no file was written (the write gate refused: " + decision->writeRefusal + ")")));
     }
-  }
+  
+
+      // ---- (7b) step 4, first half: THE PRE-CHECK (tune-measurement.md section 2.6's sequence) ---------
+      // "预检：只给首个（最重）形状的 STOCK 热身 warmup 块 + K 个热块 ⇒ t_block_hot = K 个热块的中位数 ⇒
+      //  逐形状 shots ⇒ 调原语".  It runs HERE because the primitive refuses once an eval has happened or a
+      // row is installed (its own assertion, section 2.4), and this is the last point before the return
+      // where neither is true.
+      //   * WHAT IT PRODUCES: `shots = ceil(MIN_BLOCK_TIME_MS / per_dispatch)`, where per_dispatch comes
+      //     from THIS machine's own hot block (section 2.2: the protocol declares `min_block_time`, not
+      //     `shots`), and `reps` from `allocateReps` over the A/A sentinel's own scatter -- "how noisy is a
+      //     paired block difference here" is exactly what the sentinel measures, and section 2.5's
+      //     normalization correction says the scale must be BLOCK-relative.
+      //   * THE SHAPE: `m*n*k` is the declared PROXY for "the heaviest shape by per-dispatch time"
+      //     (section 2.6), because nothing has been measured yet; the plan's own rule is that the shape
+      //     dimension takes the UPPER bound.  A wrong proxy cannot produce a false verdict: `t_block_hot`
+      //     feeds only the cost REPORT (the ceiling was cancelled by R-1), never a criterion.
+      //   * NOTHING IS BUILT for a candidate: the two objects are the A/A sentinel, i.e. two entries
+      //     pointing at STOCK's pipeline (`不建候选管线`).
+      //   * FAIL-CLOSED: a refusal leaves `precheckMeasured == false`; the decision line then reads
+      //     `precheck=none` and no shots value is fabricated.
+      // 🔴 THE GATE IS THE ORDERING RULE, and the smoke measured what happens without it: the primitive's
+      // own blocks query the row table, so measuring here FREEZES it before `installForHandle` runs and the
+      // rows the load produced are refused ("the row set is frozen: a shape lookup already happened").
+      // Three independent statements say the same thing: section 2.5 ("a cache hit does not re-measure"),
+      // the primitive's precondition (it REFUSES once a row is installed), and section 2.6's sequence
+      // (the measurement is how a key with nothing on disk decides).  So the measurement's window is
+      // "nothing to install", and freezing the table there is harmless.
+      // 🔴 PARKED (handoff section 7.11): the smoke MEASURED that this placement cannot work.  The
+      // primitive's blocks query the row table, and `installForHandle` runs AFTER `makeDecision`, so
+      // measuring here freezes the table and the (possibly EMPTY) install is refused -- and that
+      // refusal removes the `install (ctx=...): N declared, N installed` line that three legs assert
+      // as the evidence that the install ran at all.  R-30 cell (v) assumed the opposite order; the
+      // measurement therefore belongs AFTER the install, and its readings cannot ride the decision
+      // line (which is printed before the install) -- they need a counted line of their own.
+      // The flag is explicit rather than commented out so that the block stays compiled and reviewed:
+      // what is parked is the CALL, not the derivation.
+      if (!decision->precheckAttempted && !decision->graphShapes.empty() && decision->rows.empty() && !decision->negative) {
+        decision->precheckAttempted = true;
+        const vk_tune_probe_shape* heaviest = &decision->graphShapes[0];
+        unsigned long long bestVolume = 0;
+        for (size_t i = 0; i < decision->graphShapes.size(); i++) {
+          const unsigned long long volume = (unsigned long long) decision->graphShapes[i].m
+                                          * (unsigned long long) decision->graphShapes[i].n
+                                          * (unsigned long long) decision->graphShapes[i].k;
+          if (volume > bestVolume) {
+            bestVolume = volume;
+            heaviest = &decision->graphShapes[i];
+          }
+        }
+        vk_tune_probe_shape preShape = *heaviest;
+        vk_tune_probe_object preObjects[2];
+        for (int i = 0; i < 2; i++) {
+          preObjects[i].stock = true;
+          preObjects[i].rowIndex = 0;
+          preObjects[i].aligned = false;
+        }
+        // The SEED of the inversion, not a protocol constant: it only sets the first block's length, and
+        // the inversion below is what decides `shots`.  It is deliberately kept out of POLICY_CONSTANTS.
+        const uint32_t preShots = 1;
+        const uint32_t preReps = (uint32_t) TuneStats::HOT_BLOCKS_K;
+        vk_tune_probe_params pp {};
+        pp.shapes = &preShape;
+        pp.nShapes = 1;
+        pp.objects = preObjects;
+        pp.nObjects = 2;
+        pp.shots = preShots;
+        pp.warmupBlocks = (uint32_t) TuneStats::WARMUP_BLOCKS;
+        pp.reps = preReps;
+        pp.stallBlocks = (uint32_t) TuneStats::STALL_BLOCKS;
+        // ONE shape is not the slot's whole shape set: saying so is the CALLER's job (R-25), and this
+        // pre-check must not claim coverage it does not have.
+        pp.coverageComplete = false;
+        pp.shotsPerShape = nullptr;
+        pp.nShotsPerShape = 0;
+        pp.seed = TuneStats::PROBE_ROTATION_SEED;
+        pp.spikeBandLo = TuneStats::SPIKE_BAND_LO;
+        pp.spikeBandHi = TuneStats::SPIKE_BAND_HI;
+        pp.tooSlowW = TuneStats::TOO_SLOW_W;
+        std::vector<double> preD((size_t) 2 * (size_t) preReps, 0.0);
+        vk_tune_probe_result preRes {};
+        char preErr[512];
+        preErr[0] = '\0';
+        const bool preOk = ::ggml_backend_vk_tune_probe_candidate(backend, nullptr, 0, &pp, preD.data(),
+                                                                 preD.size(), &preRes, preErr, sizeof(preErr));
+        if (preOk && preRes.st == VK_TUNE_PROBE_OK && preRes.t_block_hot_us > 0.0) {
+          decision->precheckMeasured = true;
+          decision->precheckHotUs = preRes.t_block_hot_us;
+          const double perDispatch = preRes.t_block_hot_us / (double) preShots;
+          const double wantBlocks = perDispatch > 0.0
+            ? (TuneStats::MIN_BLOCK_TIME_MS * 1000.0) / perDispatch : 0.0;
+          decision->precheckShots = (uint32_t) (wantBlocks < 1.0 ? 1.0 : (double) (long) (wantBlocks + 0.999));
+          // The block-relative paired scale, from the sentinel's own pairs: d = t(object 0) - t(object 1)
+          // in the same rep, scale = 1.4826 x MAD(d) / median(block time of those same blocks).
+          // THE PAIRED DIFFERENCE IS ALREADY TAKEN BY THE PRIMITIVE, and the ANCHOR's slots are NaN
+          // BY DESIGN: `ggml-vulkan.cpp:21537` seeds every slot with NaN, `:22168` names the anchor
+          // ("the FIRST stock object.  Every difference is taken against it") and `:22357` shows the
+          // anchor's own slot carrying its MEDIAN rather than a difference.  So the differences live at
+          // the NON-anchor object's slots -- object 1 here -- and the block-relative scale divides by
+          // the anchor's own block time, which is this pre-check's `t_block_hot_us`.
+          // (Measured: the first version differenced the two slots itself, so every pair was NaN and
+          // `reps` read 0 -- handoff section 7.11's open item, closed here.)
+          std::vector<double> preDiffs;
+          for (uint32_t r = 0; r < preReps; r++) {
+            const double dv = preD[(size_t) (preReps + r)];
+            if (std::isfinite(dv)) {
+              preDiffs.push_back(dv);
+            }
+          }
+          if (!preDiffs.empty()) {
+            const double medBlock = preRes.t_block_hot_us;
+            const double mad = TuneStats::madScale(preDiffs);
+            const double sigmaRel = medBlock > 0.0 ? mad / medBlock : 0.0;
+            decision->precheckSigmaRel = sigmaRel;
+            const TuneStats::Budget preBudget =
+              TuneStats::allocateReps(std::vector<double>(1, sigmaRel), TuneStats::TOLERANCE,
+                                      TuneStats::ALPHA, TuneStats::PAIRS_FLOOR, TuneStats::REPS_MAX);
+            if (!preBudget.repsRequired.empty()) {
+              decision->precheckReps = (uint32_t) preBudget.repsRequired[0];
+            }
+          }
+        }
+      }
+      // (7b) step 4 / section 7.11: THE PRE-CHECK'S OWN LINE.  It cannot ride the decision line, which is
+      // printed BEFORE the install (and the measurement must come after it, or its own blocks freeze the
+      // row table and the install is refused).  One line, born with its writer and registered in
+      // SHELL_INVENTORY / section 9.4 / the smoke in this same batch.  `measured=0` is the fail-closed
+      // state -- a refused pre-check (the primitive refuses under probe bit 4/8 BY DESIGN) reports no
+      // reading rather than an invented `shots`.
+      {
+        std::ostringstream preOs;
+        preOs << "precheck: measured=" << (decision->precheckMeasured ? 1 : 0)
+              << " hot_us=" << decision->precheckHotUs
+              << " shots=" << decision->precheckShots
+              << " reps=" << decision->precheckReps
+              << " sigma=" << decision->precheckSigmaRel
+              << " (K=" << TuneStats::HOT_BLOCKS_K << " warmup=" << TuneStats::WARMUP_BLOCKS << ")";
+        logLine(preOs.str());
+      }
+
+      // ---- (7b) step 5: THE MEASUREMENT (tune-measurement.md section 2.6's main step) ----------------
+      // WHAT IT IS: one call to the primitive over the COVERAGE SET -- the shapes that carry 95% of the
+      // row-table-side MUL_MAT dispatches (section 2.2 step 2) -- each measured against the catalogue's
+      // candidates, the stock anchor and the A/A sentinel.  The pre-check above produces the two numbers
+      // this call cannot produce for itself (`shots` from this machine's hot block, `reps` from the
+      // sentinel's own scatter), so "pre-check, then measurement" is not decoration: with no reading there
+      // is no block length, and the primitive refuses `shots == 0` rather than inventing one.
+      //
+      // 🔴 WHY IT RUNS HERE AND NOT IN `makeDecision`: MEASURED (handoff section 7.11).  The primitive's
+      // blocks query the row table, so measuring before the install FREEZES the table and the (possibly
+      // EMPTY) install is refused -- "the row set is frozen: a shape lookup already happened" -- and that
+      // refusal removes the `install (ctx=...): N declared, N installed` line three legs read as evidence
+      // that the install ran at all.  `makeDecision` -> install -> measure is the order the smoke settled.
+      //
+      // THE CANDIDATE ROWS: one per (covered shape, enumerated candidate).  Their `key_m`/`key_k` are the
+      // SHAPE's (m,k) -- section 3.1's minimal WRITABLE form, since `coverageComplete` is false today --
+      // and their family is the SHAPE's own type pair, so the pipeline the primitive builds is the one
+      // that shape's dispatcher would look up: R-13's "the candidate must target the shape's object" holds
+      // by construction instead of by a comparison that could disagree with the resolver.
+      //
+      // THE OBJECT ARRAY: 1 stock anchor + one object per candidate row + the A/A SENTINEL, which is a
+      // SECOND STOCK entry -- "two entries pointing at the same pipeline" (section 2.6's `n_sentinel = 2`)
+      // and that pipeline is stock's.  Three independent statements say the sentinel is a stock entry, and
+      // they are why a CANDIDATE-row sentinel would be wrong here rather than merely different:
+      //   * the plan's own cost model: the sentinel "与 stock 共管线、不建管线" and is therefore left out
+      //     of `N_once` (section 2.6's estimate, lines on `C_once`);
+      //   * the primitive's own words at the exclusion site: "only a CANDIDATE is dropped: a stock entry is
+      //     an arm (the A/A sentinel too)" (ggml-vulkan.cpp);
+      //   * the shell's own device fixture, whose sentinel object is `stock = true` (probeSelfTest).
+      // A candidate-row sentinel would also be ILLEGAL on every shape but its own -- the routing key
+      // decides legality -- i.e. it would produce no A/A pair for the rest of the covered set.
+      //
+      // FAIL-CLOSED: a refusal leaves `measurement.ok == false`, its line prints `ok=0`, and NOTHING is
+      // accounted (`cands=0/0` there means "no measurement was accounted for", never "a complete
+      // measurement of nothing").  The primitive prints its own refusal sentence with its `[T3]` marker, so
+      // it is not repeated here.  The gate names the doors the primitive itself refuses on, so the call is
+      // not made only to be refused: no pre-check reading, no per-shape weights, no candidates, rows
+      // installed, or a negative entry.
+      if (!decision->measurement.attempted
+          && decision->precheckMeasured
+          && decision->precheckReps >= 2 && decision->precheckShots >= 1
+          && decision->graphShapeCounts.size() == decision->graphShapes.size()
+          && !decision->graphShapes.empty()
+          && !decision->candidateGeoms.empty()
+          && decision->rows.empty() && !decision->negative) {
+        decision->measurement.attempted = true;
+        // (a) THE COVERAGE SET: counts descending, accumulate until 95% of the total weight is covered.
+        //     The tie-break is the graph's own order (a STABLE sort), so two runs over one graph choose the
+        //     same set: "which shapes were measured" has to be reproducible from the log alone.
+        std::vector<uint32_t> order(decision->graphShapes.size(), 0);
+        for (uint32_t i = 0; i < (uint32_t) order.size(); i++) {
+          order[i] = i;
+        }
+        std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+          return decision->graphShapeCounts[a] > decision->graphShapeCounts[b];
+        });
+        uint64_t totalCount = 0;
+        for (size_t i = 0; i < decision->graphShapeCounts.size(); i++) {
+          totalCount += decision->graphShapeCounts[i];
+        }
+        std::vector<vk_tune_probe_shape> coverage;
+        uint64_t coveredCount = 0;
+        for (size_t i = 0; i < order.size(); i++) {
+          if (i > 0 && coveredCount * 100 >= totalCount * 95) {
+            break;   // the 95% is already covered; one more shape would only cost blocks
+          }
+          coverage.push_back(decision->graphShapes[order[i]]);
+          coveredCount += decision->graphShapeCounts[order[i]];
+        }
+        // (b) THE ROWS, in an order the identity count below depends on: object `2 + c*nCovered + s` is
+        //     candidate `c` measured on covered shape `s`.
+        const uint32_t armCount = 2;
+        std::vector<vk_tune_row_spec> rows;
+        rows.reserve(coverage.size() * decision->candidateGeoms.size());
+        for (size_t s = 0; s < coverage.size(); s++) {
+          for (size_t c = 0; c < decision->candidateGeoms.size(); c++) {
+            vk_tune_row_spec row {};
+            // The ROW's family comes from the catalogue (its path's own pair), NOT from the shape: the
+            // shape's declared pair can be f16 x f32 while the row that would serve it must be f16 x f16
+            // (measured -- see the declaration's comment in the header).
+            row.src0_type = decision->candidateRowSrc0;
+            row.src1_type = decision->candidateRowSrc1;
+            row.key_m = coverage[s].m;
+            row.key_k = coverage[s].k;
+            row.path = decision->candidatePath;
+            row.geom = decision->candidateGeoms[c];
+            rows.push_back(row);
+          }
+        }
+        std::vector<vk_tune_probe_object> mObjects(armCount + rows.size());
+        for (uint32_t a = 0; a < armCount; a++) {
+          // The FIRST stock object is the anchor every difference is taken against; the second is the A/A
+          // sentinel ("a second entry pointing at the same pipeline", ggml-vulkan.cpp's own words at the
+          // anchor's definition).  Both run the dispatcher's own choice for the shape, i.e. the same
+          // pipeline, which is exactly what an A/A pair is.
+          mObjects[a].stock = true;
+          mObjects[a].rowIndex = 0;
+          mObjects[a].aligned = false;
+        }
+        for (size_t r = 0; r < rows.size(); r++) {
+          // K1 (same-source align): `aligned` comes from the SHARED header's own function -- the one the
+          // row builder calls for `pipe->align` -- so "the variant measured" and "the variant the
+          // dispatcher picks" cannot come from two spellings of the rule.  A zero divisor cannot happen
+          // (the rule returns a positive alignment for a legal geometry); if it ever did, "not aligned" is
+          // the fail-closed answer rather than a division by zero.
+          const uint32_t alignFor = vk_tile_row_align_for(rows[r].path, rows[r].geom);
+          mObjects[armCount + r].stock = false;
+          mObjects[armCount + r].rowIndex = (uint32_t) r;
+          mObjects[armCount + r].aligned = alignFor > 0 && (rows[r].key_k % alignFor) == 0;
+        }
+        // (c) THE CALL.  `shots`/`reps` are the pre-check's own answers.  One block length for every shape
+        //     on purpose: the pre-check derived it from the HEAVIEST shape, which is the upper bound
+        //     section 2.6 asks for (per-shape shortening is the VRAM-driven refinement, and it needs the
+        //     try-allocate path, not a number invented here).  `coverageComplete` is the ENUMERATOR's value
+        //     passed through unchanged -- the primitive echoes it and must never derive it.
+        vk_tune_probe_params mp {};
+        mp.shapes = coverage.data();
+        mp.nShapes = (uint32_t) coverage.size();
+        mp.objects = mObjects.data();
+        mp.nObjects = (uint32_t) mObjects.size();
+        mp.shots = decision->precheckShots;
+        mp.warmupBlocks = (uint32_t) TuneStats::WARMUP_BLOCKS;
+        mp.reps = decision->precheckReps;
+        mp.stallBlocks = (uint32_t) TuneStats::STALL_BLOCKS;
+        mp.coverageComplete = decision->coverageComplete;
+        mp.shotsPerShape = nullptr;
+        mp.nShotsPerShape = 0;
+        mp.seed = TuneStats::PROBE_ROTATION_SEED;
+        mp.spikeBandLo = TuneStats::SPIKE_BAND_LO;
+        mp.spikeBandHi = TuneStats::SPIKE_BAND_HI;
+        mp.tooSlowW = TuneStats::TOO_SLOW_W;
+        const size_t mSlots = coverage.size() * mObjects.size();
+        std::vector<double> mSamples(mSlots * (size_t) mp.reps, 0.0);
+        vk_tune_probe_result mRes {};
+        char mErr[512];
+        mErr[0] = '\0';
+        const bool mOk = ::ggml_backend_vk_tune_probe_candidate(backend, rows.data(), rows.size(), &mp,
+                                                               mSamples.data(), mSamples.size(), &mRes,
+                                                               mErr, sizeof(mErr));
+        decision->measurement.shapes = coverage;
+        decision->measurement.objects = mp.nObjects;
+        decision->measurement.reps = mp.reps;
+        decision->measurement.ok = mOk && mRes.st == VK_TUNE_PROBE_OK;
+        if (decision->measurement.ok) {
+          // (d) HOW MANY OF THE ENUMERATED CANDIDATES WERE REALLY MEASURED.  Read from the primitive's own
+          //     NaN discipline -- "which samples exist is answered by the NaN fill and by nothing else" --
+          //     rather than inferred: a candidate counts when at least one of its rows produced a FINITE
+          //     paired difference.  The anchor's own slots stay NaN by design (there is no difference to
+          //     take against itself), which is why the walk starts at the candidate objects, and a slot
+          //     that was never written stays NaN too, so a build failure cannot be counted as a measurement.
+          uint32_t measuredCandidates = 0;
+          for (size_t c = 0; c < decision->candidateGeoms.size(); c++) {
+            bool anyCell = false;
+            for (size_t s = 0; s < coverage.size() && !anyCell; s++) {
+              const size_t o = (size_t) armCount + c * coverage.size() + s;
+              const size_t base = (s * mObjects.size() + o) * (size_t) mp.reps;
+              for (uint32_t r = 0; r < mp.reps; r++) {
+                if (std::isfinite(mSamples[base + r])) {
+                  anyCell = true;
+                  break;
+                }
+              }
+            }
+            if (anyCell) {
+              measuredCandidates++;
+            }
+          }
+          decision->measurement.candidatesMeasured = measuredCandidates;
+          // THE ONE ACCOUNTING ENTRY: this is where a probe result enters a Decision, and it is the only
+          // place that writes the pair's fields.
+          noteMeasurementAccounting(*decision, mRes, decision->candidatesEnumerated, measuredCandidates);
+          decision->measurement.blocks = mRes.blocks;
+          decision->measurement.samplesWritten = mRes.samples;
+          decision->measurement.pairsIllegal = mRes.pairs_illegal;
+          decision->measurement.spikes = mRes.spikes;
+          decision->measurement.droppedTooSlow = mRes.dropped_too_slow;
+          decision->measurement.droppedBuildFailed = mRes.dropped_build_failed;
+          decision->measurement.pairsComplete = mRes.pairs_complete;
+          decision->measurement.coverageEcho = mRes.coverage_complete;
+          decision->measurement.shotsMin = mRes.shots_min;
+          decision->measurement.shotsMax = mRes.shots_max;
+          decision->measurement.elapsedUs = mRes.elapsed_us;
+          // The samples are KEPT rather than dropped with the stack frame: the judgement layer computes its
+          // intervals from this very buffer, and re-measuring for it would pay section 2.6's cost twice.
+          decision->measurement.samples = std::move(mSamples);
+        }
+      }
+      // (7b) step 5: THE MEASUREMENT'S OWN LINE, for the same reason the pre-check has one: the decision
+      // line is printed BEFORE the install (`makeDecision` returns, then the caller installs), so the
+      // accounting this step writes can never ride it -- and a reading nobody prints is a reading nobody
+      // can falsify.  `attempted` separates "the gate did not fire" from "it ran and refused": `ok=0` with
+      // `attempted=1` is the fail-closed state, and the primitive's refusal sentence is already loud on
+      // stderr with its own marker.
+      {
+        std::ostringstream mOs;
+        mOs << "measure: attempted=" << (decision->measurement.attempted ? 1 : 0)
+            << " ok=" << (decision->measurement.ok ? 1 : 0)
+            << " shapes=" << decision->measurement.shapes.size()
+            << " objects=" << decision->measurement.objects
+            << " pairs=" << decision->pairsLegal << "/" << decision->shapesCount
+            << " cands=" << decision->candidatesMeasured << "/" << decision->candidatesEnumerated
+            << " blocks=" << decision->measurement.blocks
+            << " samples=" << decision->measurement.samplesWritten
+            << " spikes=" << decision->measurement.spikes
+            << " pairs_complete=" << (decision->measurement.pairsComplete ? 1 : 0)
+            << " coverage=" << (decision->measurement.coverageEcho ? 1 : 0)
+            << " dropped_too_slow=" << decision->measurement.droppedTooSlow
+            << " dropped_build_failed=" << decision->measurement.droppedBuildFailed
+            << " shots=[" << decision->measurement.shotsMin << "," << decision->measurement.shotsMax << "]"
+            << " elapsed_us=" << decision->measurement.elapsedUs;
+        logLine(mOs.str());
+      }
+}
 
 }  // namespace VulkanTuner
 

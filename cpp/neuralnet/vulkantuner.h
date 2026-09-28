@@ -83,6 +83,14 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
                                           double* dOut, size_t dCap,
                                           vk_tune_probe_result* out,
                                           char* err, size_t errSize);
+// (7b) step 4: THE COVERAGE SET'S SHAPES (tune-measurement.md section 3).  One name, no new type: `out`
+// receives `vk_tune_probe_shape` entries -- the same type the primitive's params use -- after the
+// dmmv-gated shapes have been excluded (R-21), and `counts[i]` is how many graph nodes carried that
+// geometry.  `cgraph` crosses as `const void*` so no ggml tensor surface is exported to the shell.  The
+// caller sizes the buffer from `ggml_graph_n_nodes`, which is always an upper bound; a too-small cap is
+// refused (returns 0) rather than truncated.  It is a HOST walk: nothing is submitted, built or selected.
+size_t ggml_backend_vk_tune_graph_shapes(const void* cgraph, vk_tune_probe_shape* out,
+                                         uint32_t* counts, size_t cap);
 
 namespace VulkanTuner {
 
@@ -375,6 +383,82 @@ namespace VulkanTuner {
     uint32_t candidatesEnumerated = 0;
     uint32_t pairsLegal = 0;
     uint32_t shapesCount = 0;
+    // (7b) step 4: WHAT THE GRAPH GAVE US -- the coverage set, read from the built graph at the decision
+    // point.  `graphShapes` is the filtered (kept) set in the graph's own order with the dmmv-gated shapes
+    // removed (R-21), and `graphNodes` is how many row-table-side MUL_MAT dispatches those shapes carry
+    // (the sum of their counts, i.e. the weight the coverage rule will use).  Both are PRINTED on the
+    // decision line, which is what makes the new interface's two outputs consumed rather than a parameter
+    // nobody reads (R-12), and what lets the smoke pin the set's size instead of trusting it.
+    std::vector<vk_tune_probe_shape> graphShapes;
+    uint32_t graphNodes = 0;
+    // (7b) step 5: THE WEIGHT of each shape in `graphShapes`, same order -- the second output of the
+    // enumeration interface.  `graphNodes` is their SUM and stays the decision line's reading; the
+    // per-shape vector is what the coverage rule needs ("counts descending until 95% of the weight is
+    // covered": tune-measurement.md section 2.2 step 2), because that rule chooses a SUBSET.
+    std::vector<uint32_t> graphShapeCounts;
+    // (7b) step 5: the enumeration's own CANDIDATES -- the catalogue's geometries, in its order -- and
+    // the path they belong to.  The catalogue runs in `makeDecision` and the measurement runs at the
+    // END of `installForHandle`, so without these the rows to measure would have to be re-derived
+    // there: a second answer to "what did the search return", which is the drift this batch keeps
+    // closing.  `candidateGeoms.size() == candidatesEnumerated` is the invariant the two share.
+    std::vector<vk_tile_geometry> candidateGeoms;
+    int candidatePath = 0;
+    // (7b) step 5: the (src0, src1) pair a ROW of that path may declare.  It is deliberately NOT
+    // the shape's own pair, and the difference is MEASURED: the backend's cm2 branch has exactly one
+    // non-quant tuned-row module ("there is no cm2 f16xf32 module at all", ggml-vulkan.cpp's
+    // `ggml_vk_tuned_row_shader_for`), so a cm2 row must say f16 x f16 while a shape may well say
+    // f16 x f32 -- the family of a row belongs to its PATH, not to the shape it will serve.  First
+    // version declared the shape's pair and every candidate failed to build; the smoke's cm2 fixture
+    // row (`ROW cm2 1 1 ...`) is the independent witness that f16 x f16 is the pair that works.
+    int candidateRowSrc0 = 0;
+    int candidateRowSrc1 = 0;
+    // (7b) step 4, first half: THE PRE-CHECK's readings (tune-measurement.md section 2.6's sequence).  Its
+    // whole point is to produce `shots` and `reps` for the measurement -- but those are OUTPUTS, and a
+    // computation whose output nobody prints is a computation nobody can falsify, so all five travel on
+    // the decision line.  `precheckMeasured == false` is the fail-closed state: no shots are invented, and
+    // the line says `precheck=none`.
+    bool precheckMeasured = false;
+    // (7b) step 4 / section 7.11: the pre-check runs at the END of `installForHandle`, which runs once per
+    // CONTEXT -- so "did this decision already try" has to be a fact on the decision, or a two-context
+    // device would measure twice.
+    bool precheckAttempted = false;
+    double precheckHotUs = 0.0;     // `t_block_hot`: the median of the K hot stock blocks
+    uint32_t precheckShots = 0;     // the inverted time constraint: ceil(min_block_time / per_dispatch)
+    uint32_t precheckReps = 0;      // `allocateReps`'s answer for this machine's block-relative scale
+    double precheckSigmaRel = 0.0;  // the A/A sentinel's own block-relative paired scale
+    // (7b) step 5: THE MEASUREMENT (tune-measurement.md section 2.6's main step): one call over the
+    // COVERAGE SET, every covered shape against the catalogue's candidates plus the stock anchor and
+    // the A/A sentinel.  It lives on the decision for the same reason the pre-check does -- the call
+    // happens once per CONTEXT, and "did this decision already measure" has to be a fact, or a
+    // two-context device would pay section 2.6's cost twice.
+    struct Measurement {
+      bool attempted = false;   // the once flag: the gate fired (not "it succeeded")
+      bool ok = false;          // the primitive returned a usable comparison (its `OK`)
+      std::vector<vk_tune_probe_shape> shapes;   // the COVERAGE set actually measured, in call order
+      uint32_t objects = 0;     // that call's nObjects: 2 arms (anchor + sentinel) + candidate rows
+      uint32_t reps = 0;        // the budget actually used (the pre-check's own answer)
+      uint32_t blocks = 0;      // the primitive's own readings, echoed for the log
+      uint32_t samplesWritten = 0;
+      uint32_t pairsIllegal = 0;
+      uint32_t spikes = 0;
+      uint32_t droppedTooSlow = 0;
+      uint32_t droppedBuildFailed = 0;
+      bool pairsComplete = false;
+      bool coverageEcho = false;   // the enumerator's flag, echoed back by the primitive
+      uint32_t shotsMin = 0;
+      uint32_t shotsMax = 0;
+      uint64_t elapsedUs = 0;
+      // Of `candidatesEnumerated`, how many were REALLY measured.  Counted from the NaN discipline
+      // below (a finite cell = that candidate ran), never inferred from a count of objects.
+      uint32_t candidatesMeasured = 0;
+      // THE SAMPLES: dense, `(shape*objects + object)*reps + rep`, NaN = never measured -- the
+      // primitive's own answer to "which pairs exist" (it has no side channel, by design).
+      // Consumer in THIS batch: `candidatesMeasured` above is counted from it.  The judgement layer
+      // of this batch's next segment reads the same buffer for the intervals; keeping it here is what
+      // keeps section 2.6's expensive step ONCE per decision rather than once per segment.
+      std::vector<double> samples;
+    };
+    Measurement measurement;
     // W2 (decision C): the PER-ROW truth, the same order as `rows` (index i describes rows[i]),
     // folded with AND across this device's contexts -- a row is durable only if EVERY context
     // installed it.  🔴 The aggregate fields above can only BOUND this set (min/max), so the WRITE
@@ -469,7 +553,14 @@ namespace VulkanTuner {
                                   // F1 showed a False request rewrites the graph as GGML_PREC_F32,
                                   // so this is a request that changes the computation.
     const ModelIdentity& model,
-    const TunePolicy& policy
+    const TunePolicy& policy,
+    // (7b) step 4: the coverage set's shapes and their WEIGHTS, read from the built graph by the
+    // backend's ONE walker.  `(shape set, counts)` is the parameter tune-measurement.md section 3.2-3
+    // prescribes.  The decision line prints the set's size and the counts' SUM, and the measurement's
+    // coverage rule reads the per-shape counts -- so both of the interface's outputs have their
+    // consumers in this batch (R-12), one of them being the rule that decides WHICH shapes are measured.
+    const std::vector<vk_tune_probe_shape>& graphShapes,
+    const std::vector<uint32_t>& graphShapeCounts
   );
 
   // Per-context install.  Called once per ComputeHandle, after the backend exists and

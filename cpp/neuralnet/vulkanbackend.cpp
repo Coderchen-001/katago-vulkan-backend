@@ -2629,65 +2629,6 @@ struct ComputeHandle {
         throw StringError("VULKAN backend: could not initialize Vulkan backend for device " + Global::intToString(deviceIdx));
     }
 
-    // --- T3 tuner hook (t3-shell-plan.md section 6, step 1) --------------------------
-    // Placement is a hard requirement, not a convenience. It must be
-    //   * after the backend exists -- the fingerprint and the install both need it, and
-    //     the fingerprint is what names the cache file;
-    //   * before anything can select a pipeline, i.e. before the ONNX/graph build below,
-    //     because the pre-record path stops SELECTING once it replays (section 5) and a
-    //     row installed after that would never be read.
-    // The single flight (per evaluator+device) and the per-context install are what make
-    // "1 decision, N installs" true instead of hoped for.  Nothing between here and the
-    // install may query the selector, so the install cannot race the freeze.
-    // Skipped on the KATAGO_VULKAN_CPU cross-check path: there is no Vulkan device to
-    // describe and no Vulkan pipeline to tune.
-    if(!cpucrossCheck) {
-      const int effectiveDeviceIdx = deviceIdx >= 0 ? deviceIdx : 0;
-      // The model half of the cache's outer key (t1-schema.md section 4): two models can
-      // share the device, board size and batch size and still need different tiles, because
-      // the model decides the (m,k) shapes.  Uses the model's OWN sha256 (already computed
-      // when the model was loaded -- no extra 64-355 MB hash on every startup).  The sha goes
-      // into the file NAME truncated to 16 hex characters (an identity, not a checksum:
-      // mv+name are the backstop), the name only into the header.
-      const ModelDesc& md = loadedModel->modelDesc;
-      VulkanTuner::ModelIdentity modelKey;
-      modelKey.version = md.modelVersion;
-      modelKey.sha16 = md.sha256.empty() ? "none" : md.sha256.substr(0, 16);
-      modelKey.name = md.name;
-      std::shared_ptr<VulkanTuner::Decision> tuneDecision;
-      {
-        // The decision map is per ComputeContext and NN server threads are created
-        // concurrently, so the single flight needs this lock.
-        std::lock_guard<std::mutex> tuneLock(ctx->tuneMutex);
-        std::map<int, std::shared_ptr<VulkanTuner::Decision>>::iterator it =
-          ctx->tuneDecisions.find(effectiveDeviceIdx);
-        if(it == ctx->tuneDecisions.end()) {
-          it = ctx->tuneDecisions.emplace(
-            effectiveDeviceIdx,
-            VulkanTuner::makeDecision(
-              backend, effectiveDeviceIdx, ctx->homeDataDirOverride,
-              ctx->nnXLen, ctx->nnYLen, maxBatchSize, ctx->useFP16Mode, modelKey, ctx->tunePolicy)
-          ).first;
-        }
-        tuneDecision = it->second;
-        // W2 (decision E, 2'): the install runs under the SAME lock as the decision.  "Same" means
-        // WITHIN ONE ComputeContext -- a different ctx has its own tuneMutex and its own decisions; the
-        // Decision lives in THIS ctx's tuneDecisions map, and the handle that installs it was created
-        // by this ctx.  Why it has to be inside: installForHandle mutates the shared Decision (the
-        // per-row fold, the aggregates, the outcome, the ctx identity list, the once hook), and the
-        // eval point takes that hook and its snapshot under this same lock -- an unlocked install would
-        // make the snapshot a torn read.  The price is that a first eval may wait for an install that is
-        // compiling pipelines; both happen once, during startup.
-        if(tuneDecision != nullptr)
-          VulkanTuner::installForHandle(tuneDecision, backend);
-        // W2 (decision E, 2'): made reachable from the eval path only AFTER the install, so the two facts
-        // ("this handle has a decision" and "its rows were installed") are set together.  The eval point
-        // can then read "the hook has not even been assembled" as the monitored anomaly instead of
-        // assuming that install always precedes the first eval.
-        this->tuneDecision = tuneDecision;
-      }
-    }
-
     // --- Get the ONNX bytes (external .onnx shared, .bin.gz built here) ---
     const string* onnxBytesPtr = NULL;
     string builtOnnxBytes;
@@ -2908,6 +2849,84 @@ struct ComputeHandle {
       logger->write("VULKAN backend: graph built (" + Global::uint64ToString((uint64_t)onnxBytes.size()) + " onnx bytes, " +
                     Global::uint64ToString((uint64_t)ggml_graph_n_nodes(graph)) + " ggml nodes) [prec] accumulation=" +
                     string(precClass) + " source=" + string(precSource) + " mode=" + ctx->useFP16Mode.toString());
+
+    // --- T3 tuner hook (t3-shell-plan.md section 6, step 1) --------------------------
+    // Placement is a hard requirement, not a convenience, and since (7b) it is a requirement that pulls
+    // in the OTHER direction as well.  It must be
+    //   * after the backend exists -- the fingerprint and the install both need it, and
+    //     the fingerprint is what names the cache file;
+    //   * AFTER the graph is built -- the measurement's shape set is enumerated FROM the graph
+    //     (tune-measurement.md section 3, "形状集与权重：从图枚举"), which is the step this same (7b)
+    //     batch adds: a decision taken before the graph exists has nothing to measure, and
+    //     `coverageComplete` would be a statement about a set nobody built;
+    //   * BEFORE the first `graph_compute` -- the row table FREEZES on its first query (R3/R22), and the
+    //     selector only queries it from inside `graph_compute` (tune-measurement.md section 3.5:
+    //     building and enumerating neither select nor freeze), so a row installed after replay begins
+    //     would never be read.  The smoke's "row installed + tuned row hit" legs are what hold that
+    //     claim: if the build ever started selecting, they would redden.
+    // The single flight (per evaluator+device) and the per-context install are what make
+    // "1 decision, N installs" true instead of hoped for.  Nothing between here and the
+    // install may query the selector, so the install cannot race the freeze.
+    // Skipped on the KATAGO_VULKAN_CPU cross-check path: there is no Vulkan device to
+    // describe and no Vulkan pipeline to tune.
+    if(!cpucrossCheck) {
+      const int effectiveDeviceIdx = deviceIdx >= 0 ? deviceIdx : 0;
+      // The model half of the cache's outer key (t1-schema.md section 4): two models can
+      // share the device, board size and batch size and still need different tiles, because
+      // the model decides the (m,k) shapes.  Uses the model's OWN sha256 (already computed
+      // when the model was loaded -- no extra 64-355 MB hash on every startup).  The sha goes
+      // into the file NAME truncated to 16 hex characters (an identity, not a checksum:
+      // mv+name are the backstop), the name only into the header.
+      const ModelDesc& md = loadedModel->modelDesc;
+      VulkanTuner::ModelIdentity modelKey;
+      modelKey.version = md.modelVersion;
+      modelKey.sha16 = md.sha256.empty() ? "none" : md.sha256.substr(0, 16);
+      modelKey.name = md.name;
+      // (7b) step 4: the coverage set's shapes, read from THE BUILT GRAPH (this hook now sits after the
+      // graph exists -- P2) by the backend's ONE walker, and handed to the decision as (shape set,
+      // counts).  The buffer is sized by the graph's node count, an upper bound the caller can always
+      // afford; a failed enumeration leaves the set empty, and the decision line's pinned
+      // `graph_shapes=` is what turns that into a red instead of a quiet under-coverage.
+      std::vector<vk_tune_probe_shape> graphShapes((size_t) ggml_graph_n_nodes(graph));
+      std::vector<uint32_t> graphShapeCounts((size_t) ggml_graph_n_nodes(graph), 0u);
+      const size_t graphShapeCount = ggml_backend_vk_tune_graph_shapes(
+        (const void*) graph, graphShapes.data(), graphShapeCounts.data(), graphShapes.size());
+      graphShapes.resize(graphShapeCount);
+      graphShapeCounts.resize(graphShapeCount);
+      std::shared_ptr<VulkanTuner::Decision> tuneDecision;
+      {
+        // The decision map is per ComputeContext and NN server threads are created
+        // concurrently, so the single flight needs this lock.
+        std::lock_guard<std::mutex> tuneLock(ctx->tuneMutex);
+        std::map<int, std::shared_ptr<VulkanTuner::Decision>>::iterator it =
+          ctx->tuneDecisions.find(effectiveDeviceIdx);
+        if(it == ctx->tuneDecisions.end()) {
+          it = ctx->tuneDecisions.emplace(
+            effectiveDeviceIdx,
+            VulkanTuner::makeDecision(
+              backend, effectiveDeviceIdx, ctx->homeDataDirOverride,
+              ctx->nnXLen, ctx->nnYLen, maxBatchSize, ctx->useFP16Mode, modelKey, ctx->tunePolicy,
+              graphShapes, graphShapeCounts)
+          ).first;
+        }
+        tuneDecision = it->second;
+        // W2 (decision E, 2'): the install runs under the SAME lock as the decision.  "Same" means
+        // WITHIN ONE ComputeContext -- a different ctx has its own tuneMutex and its own decisions; the
+        // Decision lives in THIS ctx's tuneDecisions map, and the handle that installs it was created
+        // by this ctx.  Why it has to be inside: installForHandle mutates the shared Decision (the
+        // per-row fold, the aggregates, the outcome, the ctx identity list, the once hook), and the
+        // eval point takes that hook and its snapshot under this same lock -- an unlocked install would
+        // make the snapshot a torn read.  The price is that a first eval may wait for an install that is
+        // compiling pipelines; both happen once, during startup.
+        if(tuneDecision != nullptr)
+          VulkanTuner::installForHandle(tuneDecision, backend);
+        // W2 (decision E, 2'): made reachable from the eval path only AFTER the install, so the two facts
+        // ("this handle has a decision" and "its rows were installed") are set together.  The eval point
+        // can then read "the hook has not even been assembled" as the monitored anomaly instead of
+        // assuming that install always precedes the first eval.
+        this->tuneDecision = tuneDecision;
+      }
+    }
   }
 
   ~ComputeHandle() {

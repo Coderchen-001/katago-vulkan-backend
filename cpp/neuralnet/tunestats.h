@@ -92,6 +92,33 @@ namespace TuneStats {
   // it must not be read as doing so: at R = 2 a median IS the mean, so the criterion runs (the parameter
   // checks allow R >= 2) but is weak there.  The declared power floor is R >= 4 (section 2.5).
   constexpr double TOO_SLOW_W = 2.0;
+  // ---- (7b): THE PRE-CHECK'S OWN NUMBERS (w4e-preview.md section 10 N4; ruled 2026-09-27) ----------
+  // N4 registered that "the first block's `shots` and the value of `K` were never written down", and
+  // R-5 turns that into a rule for whoever produces them: a constant that comes out of a calibration
+  // lands WITH its derivation and its provenance.  The shape it prevents is a number nobody can
+  // recompute -- this file's own history has three of them (`k_spike`, `sigma_max`, the MDE tiers) and
+  // 6b37a1d deleted exactly those.  All three are in POLICY_CONSTANTS, so changing one invalidates the
+  // row sets measured under the old one by construction, while TUNER_POLICY_VERSION does NOT move: this
+  // is a policy change, not a protocol change (R-30 cell (v)).
+  //   WARMUP_BLOCKS -- the per-eval medians in section 2.2 are 117.180 / 6.420 / 5.220 / 5.220 us for
+  //   evals 1..4: the cold transient is entirely in eval 1 (18.3x), but eval 2 is STILL 23% above the
+  //   plateau, so TWO warm-up blocks are what reaches it.  The primitive refuses warmupBlocks < 2 for
+  //   the same reason, which makes this the measured floor rather than a tuning knob -- and the value
+  //   is that floor, not something above it.
+  constexpr long WARMUP_BLOCKS = 2;
+  //   HOT_BLOCKS_K -- `t_ref` = t_block_hot = the MEDIAN of K hot blocks (section 2.6's sequence), so K
+  //   must be big enough for a median to reject a spike: the measured spike rate is 10.6% on the
+  //   calibration arm and 15% is the gate's own bound, and a median of 3 survives one spike while a
+  //   "median" of 2 is just the mean (zero rejection).  Cost = K blocks = 3 x ~2 ms, so the value that
+  //   buys the property is also the cheap one.  RULED 2026-09-27 (the one number N4 left open).
+  constexpr long HOT_BLOCKS_K = 3;
+  //   STALL_BLOCKS -- section 2.6's ruling detects a stall at SECOND granularity, and the only honest
+  //   unit to convert that with is the block the protocol defines by TIME (MIN_BLOCK_TIME_MS).  Written
+  //   as an expression rather than 500 so that if that block length ever moves this moves with it,
+  //   instead of becoming a number nobody can recompute.  It can only ever ABORT a run (no verdict
+  //   changes meaning because of it); it is in the fingerprint by ruling, so a change invalidates the
+  //   row sets rather than silently mixing two regimes.
+  constexpr long STALL_BLOCKS = (long) (1000.0 / MIN_BLOCK_TIME_MS);
   // THE ROTATION SEED: the block sequence rotates with a randomized Latin square (tune-measurement.md
   // section 2.2, one block per (shape, object) slot), and "fixed seed, reproducible" is only true if
   // the seed is declared.  It is the same value the statistics self-test uses as its default base seed

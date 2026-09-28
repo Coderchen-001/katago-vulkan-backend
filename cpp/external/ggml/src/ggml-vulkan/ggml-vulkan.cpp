@@ -11975,6 +11975,129 @@ static void ggml_vk_fwht(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf }, pc, { workgroups_x, 1, 1 });
 }
 
+// (7b) step 2 / R-21: THE ONE HOME OF THE dmmv GATE.  It is the condition of the `vec_q_f16` branch
+// below -- the ROW-LESS exit whose shapes the coverage set must exclude -- and it is named because the
+// shape-set enumeration has to ask the SAME question from the graph, where no dispatch has happened yet.
+// A second copy of this condition in the traversal would be a second copy of the dispatch RULE, which is
+// what R-34/R-21 forbid ("reuse, never a second derivation"): the two readers must agree by construction,
+// and the smoke's shape-set leg pins that they agree with R-23's measured distribution.
+static bool ggml_vk_mul_mat_is_dmmv(const ggml_tensor * dst, const ggml_tensor * src0, const ggml_tensor * src1) {
+    return (dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1))
+        && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16
+            || ggml_is_quantized(src0->type));
+}
+
+// (7b) step 2 / P2: THE COVERAGE SET'S SHAPES, READ FROM THE GRAPH.  tune-measurement.md section 3
+// ("形状集与权重：从图枚举") prescribes exactly this: a HOST walk -- it submits nothing, builds no
+// pipeline and selects nothing, and in particular it must never touch the row table's resolver (R22's
+// caller whitelist), because a query there freezes the table and locks the install out.
+//   * m/n/k use the SAME definitions the row-table side uses (ne01/ne11/ne10), so this line and R-23's
+//     exit record stay comparable field by field.
+//   * the dmmv-gated shapes are EXCLUDED (R-21) and reported SEPARATELY: "we did not count it" and "it
+//     has no candidates" must never read the same -- the rule the catalogue's `undeclared=` clause
+//     carries.  The gate is `ggml_vk_mul_mat_is_dmmv`, not a re-typed condition.
+//   * it is a PREDICTION from the built graph, and R-23's record is the dispatch-time TRUTH; the smoke
+//     leg asserts the two agree (11 row-side shapes, 6 dmmv-side on this workload).
+// (7b) step 4 / R1: ONE walker, TWO readers.  The exported enumeration (which hands the shape set to the
+// shell) and the bit-8 evidence line below MUST read the same walk, or "the set the shell received" and
+// "the set the evidence reports" become two facts that can drift apart -- the shape this project keeps
+// paying for.  The gate is `ggml_vk_mul_mat_is_dmmv` (the dispatcher's own predicate), so the split is the
+// dispatch rule rather than a second opinion about it.
+struct VkTuneShapeCount { vk_tune_probe_shape shape; uint32_t count; };
+
+// Host walk only: it submits nothing, builds no pipeline and selects nothing -- in particular it must
+// never touch the row table's resolver (R22's caller whitelist), because a query there freezes the table
+// and locks the install out.  The ggml walk API takes a NON-const graph while the dispatcher holds a
+// const one, and this walk is read-only in fact; the cast is the API's shape rather than a decision, and
+// it is confined to these two calls.
+static void ggml_vk_tune_shape_walk(const struct ggml_cgraph * cgraph,
+                                    std::vector<VkTuneShapeCount> & kept,
+                                    std::vector<VkTuneShapeCount> & excluded,
+                                    uint32_t & mulMats) {
+    ggml_cgraph * g = const_cast<ggml_cgraph *>(cgraph);
+    const int nNodes = ggml_graph_n_nodes(g);
+    mulMats = 0;
+    for (int i = 0; i < nNodes; i++) {
+        const ggml_tensor * dst = ggml_graph_node(g, i);
+        if (dst->op != GGML_OP_MUL_MAT || dst->src[0] == nullptr || dst->src[1] == nullptr) {
+            continue;
+        }
+        const ggml_tensor * src0 = dst->src[0];
+        const ggml_tensor * src1 = dst->src[1];
+        mulMats++;
+        // `vk_tune_probe_shape`'s field order is {m, n, k, src0_type, src1_type} and its types are the
+        // transcoded vk_tune_src_type numbers, which ggml-vulkan.cpp static_asserts to be GGML_TYPE_*
+        // (so the cast is the transcription, not a re-interpretation).
+        const vk_tune_probe_shape here { (uint32_t) src0->ne[1], (uint32_t) src1->ne[1],
+                                         (uint32_t) src0->ne[0], (int) src0->type, (int) src1->type };
+        std::vector<VkTuneShapeCount> & into = ggml_vk_mul_mat_is_dmmv(dst, src0, src1) ? excluded : kept;
+        bool seen = false;
+        for (size_t s = 0; s < into.size(); s++) {
+            if (into[s].shape.m == here.m && into[s].shape.n == here.n && into[s].shape.k == here.k
+                && into[s].shape.src0_type == here.src0_type
+                && into[s].shape.src1_type == here.src1_type) {
+                into[s].count++;
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) {
+            into.push_back(VkTuneShapeCount { here, 1 });
+        }
+    }
+}
+
+// (7b) step 4 / R1: THE SHAPE SET, HANDED TO THE CONTROL PLANE.  This is the (7b) batch's ONE new
+// interface name, and it exists because the shapes must be read from the GRAPH (tune-measurement.md
+// section 3) while the decision point lives in `vulkanbackend.cpp`: the alternative -- walking the graph
+// there -- would have to repeat `ggml_vk_mul_mat_is_dmmv`, i.e. the dispatch rule, in a second place
+// (R-34/R-21 forbid exactly that).  The walker is shared with the dev evidence line, so what a caller
+// receives and what the evidence reports cannot drift.
+//   * `out` receives the KEPT shapes (`vk_tune_probe_shape`: m, n, k, src0_type, src1_type -- the same
+//     type the primitive's params use, so no new type is introduced).  The dmmv-gated ones are excluded
+//     by R-21 and reported by the evidence line instead.
+//   * `counts[i]` is how many graph nodes carried that geometry: the weight the coverage rule needs.
+//   * `cap` is the caller's buffer size.  `kept <= distinct geometries <= graph nodes`, so a caller that
+//     sizes its buffer from `ggml_graph_n_nodes` can always afford it; a too-small cap is REFUSED
+//     (return 0, never a truncated set -- a truncated set silently shrinks the comparison).
+//   * HOST walk only: no submit, no pipeline to build, nothing selected, and no row-table query.
+size_t ggml_backend_vk_tune_graph_shapes(const void * cgraph, vk_tune_probe_shape * out,
+                                         uint32_t * counts, size_t cap) {
+    if (cgraph == nullptr || out == nullptr || counts == nullptr) {
+        return 0;
+    }
+    std::vector<VkTuneShapeCount> kept, excluded;
+    uint32_t mulMats = 0;
+    ggml_vk_tune_shape_walk((const struct ggml_cgraph *) cgraph, kept, excluded, mulMats);
+    (void) mulMats;   // the excluded/duplicate accounting is the evidence line's business, not the caller's
+    if (kept.size() > cap) {
+        return 0;
+    }
+    for (size_t i = 0; i < kept.size(); i++) {
+        out[i] = kept[i].shape;
+        counts[i] = kept[i].count;
+    }
+    return kept.size();
+}
+
+static std::string ggml_vk_tune_shape_set(const struct ggml_cgraph * cgraph) {
+    std::vector<VkTuneShapeCount> kept, excluded;
+    uint32_t mulMats = 0;
+    ggml_vk_tune_shape_walk(cgraph, kept, excluded, mulMats);
+    std::ostringstream os;
+    os << "mul_mat=" << mulMats << " distinct=" << (kept.size() + excluded.size())
+       << " kept=" << kept.size() << " excluded_dmmv=" << excluded.size();
+    for (const VkTuneShapeCount & s : kept) {
+        os << " [kept m=" << s.shape.m << " n=" << s.shape.n << " k=" << s.shape.k
+           << " src=" << s.shape.src0_type << "x" << s.shape.src1_type << " count=" << s.count << "]";
+    }
+    for (const VkTuneShapeCount & s : excluded) {
+        os << " [excluded m=" << s.shape.m << " n=" << s.shape.n << " k=" << s.shape.k
+           << " src=" << s.shape.src0_type << "x" << s.shape.src1_type << " count=" << s.count << "]";
+    }
+    return os.str();
+}
+
 static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
@@ -12041,8 +12164,7 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
         ggml_vk_mul_mat_vec_nc_f16_f32(ctx, subctx, cgraph, node_idx);
     // mul_mat_vec supports batching ne12*ne13 when ne11==1, or treating ne11 as the batch size (up to four)
     // when ne12 and ne13 are one.
-    } else if ((dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1)) &&
-               (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type))) {
+    } else if (ggml_vk_mul_mat_is_dmmv(dst, src0, src1)) {
         exit_name = "vec_q_f16";   // the ROW-LESS exit the coverage set excludes shapes for
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
     } else {
@@ -12054,6 +12176,22 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
     // (ne01/ne11/ne10), so this line and the item-12 geometry line stay comparable field by field.
     ggml_vk_t2_log_mul_mat_exit(ctx, exit_name, (uint32_t) src0->ne[1], (uint32_t) src1->ne[1],
                                (uint32_t) src1->ne[0], (int64_t) (src1->ne[2] * src1->ne[3]));
+
+    // (7b) step 2: ONE reading of the shape set per PROCESS -- the graph is the same object on every
+    // eval, so a second line would be the same fact printed twice -- and dev-only, under the same probe
+    // bit R-23's exit record uses.  The traversal itself is PURE (it reads the graph and returns a
+    // string); what makes it evidence is that the smoke pins it against the dispatch-time record.
+    if (vk_t2_on(8)) {
+        static std::atomic<bool> tuneShapeSetLogged {false};
+        bool shapeExpected = false;
+        if (tuneShapeSetLogged.compare_exchange_strong(shapeExpected, true)) {
+            // ONE statement owns the counted literal AND calls the writer (R10's shape: the inventory
+            // clause attributes a literal to the statement that routes it, and the multi-insertion clause
+            // wants the whole line passed at once).  The builder returns only the tail, so no part of this
+            // line is assembled where the other NN thread could interleave into it.
+            ggml_vk_t3_line("tune shape set: " + ggml_vk_tune_shape_set(cgraph));
+        }
+    }
 }
 
 static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
