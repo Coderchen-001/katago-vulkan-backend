@@ -208,7 +208,12 @@ namespace VulkanTuner {
     //                call, so it has to be able to tell "mine" from "not mine" -- sharing one value would
     //                let its reset wipe a verdict it never reached, and the gate's verdict is not the
     //                accounting's to retitle (it judges the MEASUREMENT, which is upstream of it).
-    enum class NegativeOrigin { None, FromFile, AllReject, SpikeGate };
+    enum class NegativeOrigin { None, FromFile, AllReject, SpikeGate, NoGain };
+  // 🆕 (7d) `NoGain`: the branch selection is the producer of the `no-gain` marker, and a marker with no
+  // provenance would be the "one field, two writers, no record of who wrote it" shape this enum exists
+  // to prevent.  By construction the finalizer only ever takes away ITS OWN marker (`AllReject`) and the
+  // loader only the file one (`FromFile`), so a new value needs no change there -- it is automatically
+  // left alone, and the self-test (k) case is what holds that claim for the values that exist.
     NegativeOrigin negativeOrigin = NegativeOrigin::None;
 
     // G-D20 (t3-shell-plan.md 6.9): "deterministically all-rejected" is a claim about the DEVICE
@@ -498,6 +503,10 @@ namespace VulkanTuner {
       double winnerMargin = 0.0;         // report: the winner's tightest `ciLow + tolerance`
     };
     Judgement judgement;
+    // (7d): the branch selection runs ONCE per decision, like the pre-check, the measurement and the
+    // judgement.  It is a fact on the decision rather than a local because `installForHandle` runs once
+    // per CONTEXT.
+    bool branchesConcluded = false;
     // W2 (decision C): the PER-ROW truth, the same order as `rows` (index i describes rows[i]),
     // folded with AND across this device's contexts -- a row is durable only if EVERY context
     // installed it.  🔴 The aggregate fields above can only BOUND this set (min/max), so the WRITE

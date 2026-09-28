@@ -637,6 +637,19 @@ namespace VulkanTuner {
       // written, which is the "implicit knowledge in a branch" the first design rule bans.  The
       // writer reports the FIRST named condition that does not hold, so a refusal names its clause.
       const char* condition;
+      // 🆕 (7d): THE DURABLE EFFECT, as DECLARED data.  Section 4.5 of the plan requires outcome =>
+      // "what lands on disk" to be a TOTAL FUNCTION, and this column is that function:
+      //   `rows`              -- the durable artifact is the row set;
+      //   `negative:<reason>` -- it is a NEGATIVE entry and the reason is named HERE, so a fixture can
+      //                         be driven BY THIS STRING instead of hand-assembling the state (the way
+      //                         a fixture ends up asserting the wrong thing);
+      //   `nothing:<why>`     -- this attempt leaves no durable claim, and the why is the plan table own
+      //                         wording (`in-progress` / `transient` / `rerun`).
+      // 🔴 THE RULE THAT MAKES IT A CRITERION: every `structural` and `completed` row must NOT be
+      // `nothing:` -- a finished run that remembers nothing is the "pay for the measurement on every
+      // startup" shape this project exists to prevent.  R19 pins the closed set, that rule, and the
+      // fact that the self-test READS the column.
+      const char* effect;
     };
     const DecisionOutcomeSpec DECISION_OUTCOMES[] = {
       // A structural all-reject is a KIND-LEVEL, STICKY claim ("this key has no injectable slot"), so
@@ -646,14 +659,25 @@ namespace VulkanTuner {
       // first two -- who produced the set, and how completely it was searched, are different
       // questions -- and W4b's measured answer is that this build can satisfy neither tonight: the
       // catalogue is a sampling surface, so no durable all-reject verdict is reachable yet.
-      { "structural-all-reject", "structural",  true,  "device-only,measured-here,swept-here,no-prune-in-effect" },
+      { "structural-all-reject", "structural",  true,  "device-only,measured-here,swept-here,no-prune-in-effect", "negative:no-injection-slot" },
       // A completed measurement writes ROWS, not a verdict about what does not exist.  The two W4b
       // conditions are named here TOO, deliberately: the coverage question is not about the outcome
       // name but about the candidate set, and leaving them off this row would mean an unmarked or
       // pruned run could write rows as if the set had been swept -- the same silent drift, one row
       // over.  Today this row cannot fire either (nothing installs a row yet); it is what keeps the
       // rule attached to the SET rather than to one outcome's spelling.
-      { "measured",              "completed",   true,  "measured-here,swept-here,no-prune-in-effect" },
+      { "measured",              "completed",   true,  "measured-here,swept-here,no-prune-in-effect",            "rows" },
+      // 🆕 (7d) BRANCH (2) THE HARD NEGATIVE CONCLUSION.  It is declared here with its PRODUCER in the same
+      // batch (section 2.3: an OUTCOME name may never precede the code that can set it), its class is
+      // `completed` -- a measurement that finished -- and its durable effect is the `no-gain` NEGATIVE
+      // entry, NOT a row set.  That last part is exactly what the old class-only fixture selector could
+      // not see (it would have exercised this row with a rows fixture), which is why the effect column
+      // and the fixture dispatch land together.
+      // Its conditions are the ones a WHOLE-KEY negative claim needs: this process measured the set
+      // (measured-here) and the set is a sweep rather than a sample (swept-here) with no PRUNE rule
+      // having narrowed it (no-prune-in-effect) -- the same three the `measured` row carries, because
+      // the coverage question belongs to the SET, not to the outcome spelling.
+      { "measured-no-gain",      "completed",   true,  "measured-here,swept-here,no-prune-in-effect",            "negative:no-gain" },
       // R-28 step (2): THE ONE ROW WHOSE FLAG IS TRUE AND WHOSE CLASS IS `gate`.  It carries
       // `measured-here` for the same reason the rows above do (W3-P1): what a gate refusal remembers --
       // "this device's block times spike too often for the comparison to be trusted" -- is a claim
@@ -663,12 +687,12 @@ namespace VulkanTuner {
       // Its durable effect is a NEGATIVE entry and NEVER a row set: `rejectBySpikeGate` clears the rows
       // for exactly that reason.  Note the class token is unchanged -- the class is the guardrail's
       // whitelist key and the self-test's fixture selector, not the runtime verdict.
-      { "gate-reject",           "gate",        true,  "measured-here" },
-      { "running",               "measurement", false, ""            },
-      { "timeout",               "measurement", false, ""            },
-      { "io-error",              "measurement", false, ""            },
-      { "device-lost",           "measurement", false, ""            },
-      { "no-winner",             "measurement", false, ""            },
+      { "gate-reject",           "gate",        true,  "measured-here",                                          "negative:gate-reject" },
+      { "running",               "measurement", false, "",                                                       "nothing:in-progress" },
+      { "timeout",               "measurement", false, "",                                                       "nothing:transient" },
+      { "io-error",              "measurement", false, "",                                                       "nothing:transient" },
+      { "device-lost",           "measurement", false, "",                                                       "nothing:transient" },
+      { "no-winner",             "measurement", false, "",                                                       "nothing:rerun" },
       // A1 (probe batch): `unstable` means "we do NOT know" -- the re-measurement did not re-confirm
       // the decision inside the stability boundary (STABILITY_BOUNDARY_SE, tunestats.h) -- which is a
       // THIRD thing next to "no answer was produced" (timeout / io-error / device-lost / no-winner)
@@ -686,7 +710,7 @@ namespace VulkanTuner {
       // precisely because the parser must accept names no writer has produced yet; registering these
       // two in the SAME batch as their producers is what keeps the row from being reverse drift, and the
       // ledger is what makes that an obligation someone can check instead of prose.
-      { "unstable",              "measurement", false, ""            },
+      { "unstable",              "measurement", false, "",                                                       "nothing:rerun" },
     };
 
     // ── P12: THE RUNTIME SPIKE-RATE GATE (R-28 step (2), 2026-09-26) ──────────────────────────────
@@ -1039,6 +1063,100 @@ namespace VulkanTuner {
       logLine("NOTICE: " + d.deviceName
               + ": no-gain suppressed: candidate set incomplete (" + formatCandidateDrops(d) + ")");
       return true;
+    }
+
+    // ── (7d) THE THREE BRANCHES (tune-measurement.md section 2.6(a)) ────────────────────────────────
+    // WHAT THIS IS: the selection that turns the judgement into an OUTCOME.  It is the only producer of
+    // `measured-no-gain` and the only place the three branches are ordered, and it decides nothing about
+    // the measurement itself: by the ruling the gate ran first (it judges the measurement), the interval
+    // layer second, and this third.
+    //
+    // THE BRANCHES, with the plan wording:
+    //   ① a candidate that is not worse than stock on EVERY covered shape => `measured`, and the row set
+    //      is written (completeness does NOT veto it: what an incomplete set drops is an ALTERNATIVE,
+    //      section 2.6(a)).  BUT the row-set claim requires the WINNER CONFIRMATION step first -- same
+    //      paired test, same alpha, FRESH blocks, section 2.3 (4) -- and this build has not declared the
+    //      confirmation budget (`R_confirm` is written into the cost model and never given a value), so
+    //      the confirmation CANNOT run.  Fail-closed: no row set, and the outcome is the `no-winner`
+    //      class, which is what A2 requires of a failed or missing confirmation ("confirmation failure =>
+    //      the `no-winner` class, never a sticky negative entry": a confirmation that did not happen is
+    //      NO EVIDENCE, not evidence of equality).
+    //   ② no candidate is not-worse AND the pair set is complete => `measured-no-gain`, whose durable
+    //      effect (declared in the outcome table) is the `NEGATIVE no-gain` entry.
+    //   ③ otherwise => `no-winner`, and `noGainSuppressedOnIncompleteSet` is the ONE owner of that
+    //      sentence and of its loud (re-implementing it here would give one rule two spellings).
+    //
+    // TWO THINGS THIS FUNCTION DELIBERATELY DOES NOT DO.  It does not run when the judgement produced no
+    // verdicts at all (the interval layer is parked on the missing block-relative normaliser): that is
+    // NO DATA, and A2 forbids minting a sticky negative entry from it -- the outcome stays as it was and
+    // the write gate refuses it by name.  And it never touches a decision the gate already rejected: the
+    // gate verdict is about the measurement, which is upstream of every count here.
+    void concludeBranches(Decision & d) {
+      const Decision::Judgement & j = d.judgement;
+      if (j.gateRejected) {
+        return;   // the gate settled it (and cleared the rows) before this ran
+      }
+      if (!d.measurement.ok || !j.verdictsComputed) {
+        return;   // nothing was compared: the outcome stays `running`, and `writeCacheIfAllowed` refuses
+                  // it with its own sentence (which is why no second loud is minted here)
+      }
+      if (j.winner >= 0) {
+        // ① WITH the confirmation step in front of it.  The flag is DECLARED so that landing the
+        // confirmation budget is a deliberate act that this criterion forces (R49), exactly like the
+        // parked normaliser of the interval layer.
+        const bool winnerConfirmationAvailable = false;
+        if (!winnerConfirmationAvailable) {
+          if (d.outcome == "running") {
+            d.outcome = "no-winner";
+          }
+          logLine("NOTICE: " + d.deviceName + ": candidate " + to_string(j.winner)
+                  + " is not worse than stock on every covered shape, but the winner confirmation step is "
+                    "not declared in this build (R_confirm has no value in the plan while the cost model "
+                    "names it), so NO row set is written: a winner chosen from the same blocks it was "
+                    "selected on is the winner-curse shape section 2.3 exists to refuse, and a missing "
+                    "confirmation is not evidence of anything (A2: the `no-winner` class, never a sticky "
+                    "negative entry)");
+          return;
+        }
+        // Unreachable while the flag is false, and kept compiled on purpose (the parked-call precedent):
+        // when the confirmation lands, this is the branch that sets the writable outcome.
+        d.outcome = "measured";
+        return;
+      }
+      if (!d.pairsComplete) {
+        noGainSuppressedOnIncompleteSet(d);   // ③, owned there (sentence + loud)
+        return;
+      }
+      // ② THE HARD NEGATIVE CONCLUSION: every covered shape had every legal pair measured and no
+      //    candidate is not-worse.  This is the ONE place that mints `no-gain`, and the reason string is
+      //    the same one the outcome table declares as this row's durable effect.
+      d.outcome = "measured-no-gain";
+      d.negative = true;
+      d.negativeReason = "no-gain";
+      d.negativeScope.clear();
+      d.negativeScope.push_back("mm");
+      d.negativeOrigin = Decision::NegativeOrigin::NoGain;
+      logLine("NOTICE: " + d.deviceName + ": measured, no gain: every legal pair of every covered shape "
+              "was measured and no candidate is not-worse than stock, so the durable verdict for this key "
+              "is the `no-gain` negative entry (sticky until the key changes); no row set is written");
+    }
+
+    // Does a decision really hold the durable effect its outcome row declares?  The effect column is
+    // DECLARED data, so something has to READ it -- otherwise it is a label that can drift from what the
+    // writer does.  The self-test calls this for every row (and an unknown effect string is never
+    // satisfied, the same fail-closed shape as an unknown condition name).
+    bool effectMatches(const Decision & d, const char * effect) {
+      const string e = effect;
+      if (e == "rows") {
+        return !d.negative && !rowsForWrite(d).empty();
+      }
+      if (e.rfind("negative:", 0) == 0) {
+        return d.negative && d.negativeReason == e.substr(string("negative:").size());
+      }
+      if (e.rfind("nothing:", 0) == 0) {
+        return !d.negative && rowsForWrite(d).empty();
+      }
+      return false;
     }
 
     // The extra conditions named by a table row (G-D20 + W3-P1).  Fail-closed: EVERY name in the list
@@ -3003,35 +3121,70 @@ namespace VulkanTuner {
         rejectBySpikeGate(d, judgeSpikeRate(25u, 100u, 6u));
       }
       else if (o.writable && string(o.klass) == "completed") {
-        // The rows-file shape: one legal row, so the CONTENT gate passes and only the state gate
-        // is left to check.  The geometry is the one the smoke's A3 leg proves legal, and the
-        // verdict below re-checks it against the rule table -- a self-test whose own fixture went
-        // illegal would otherwise test nothing while looking green.
+        // 🔴 (7d): THE COMPLETED CLASS IS NO LONGER ONE SHAPE.  The rows-file fixture below is right for a
+        // row whose durable effect is `rows`, and WRONG for one whose effect is a NEGATIVE entry: the
+        // first version of this loop selected by CLASS alone, so `measured-no-gain` would have been
+        // exercised by a rows fixture and the loop would have gone green while asserting the wrong
+        // durable effect -- "a green self-test row that asserts the wrong durable effect is worse than a
+        // missing row" (section 2.3 of the plan).  So the fixture is now selected by (class, effect), and
+        // the negative shape is MINTED BY THE REAL PRODUCER (`concludeBranches`), for the same reason the
+        // gate fixture above is minted by the real gate: a hand-assembled state proves the table is
+        // self-consistent and nothing about the function that has to produce it.
         aMeasuredSet(d);
         aSweptSet(d);
-        vk_tune_row_spec r {};
-        r.path = VK_TILE_PATH_SCALAR;
-        r.src0_type = 1;
-        r.src1_type = 0;
-        r.key_m = 0;
-        r.key_k = 0;
-        r.geom.BM = 64;
-        r.geom.BN = 64;
-        r.geom.BK = 0;
-        r.geom.WM = 32;
-        r.geom.WN = 32;
-        r.geom.WMITER = 1;
-        r.geom.TM = 4;
-        r.geom.TN = 4;
-        r.geom.BS = 128;
-        r.geom.pad = -1;
-        r.geom.reshape = -1;
-        r.geom.smaller = -1;
-        d.rows.push_back(r);
+        if (string(o.effect) == "rows") {
+          // The rows-file shape: one legal row, so the CONTENT gate passes and only the state gate
+          // is left to check.  The geometry is the one the smoke A3 leg proves legal, and the
+          // verdict below re-checks it against the rule table -- a self-test whose own fixture went
+          // illegal would otherwise test nothing while looking green.
+          vk_tune_row_spec r {};
+          r.path = VK_TILE_PATH_SCALAR;
+          r.src0_type = 1;
+          r.src1_type = 0;
+          r.key_m = 0;
+          r.key_k = 0;
+          r.geom.BM = 64;
+          r.geom.BN = 64;
+          r.geom.BK = 0;
+          r.geom.WM = 32;
+          r.geom.WN = 32;
+          r.geom.WMITER = 1;
+          r.geom.TM = 4;
+          r.geom.TN = 4;
+          r.geom.BS = 128;
+          r.geom.pad = -1;
+          r.geom.reshape = -1;
+          r.geom.smaller = -1;
+          d.rows.push_back(r);
+        }
+        else {
+          // THE NEGATIVE-ENTRY SHAPE, and it is the THIRD BRANCH own executor (section 2.6(a) asks for an
+          // executor per branch): a complete pair set (so branch ③ must NOT fire) with no candidate
+          // not-worse on every covered shape (so branch ① must NOT fire) => branch ②, whose durable
+          // effect the table declares as `negative:no-gain`.  The verdict below then checks that the
+          // decision holds exactly that effect, which is what makes this fixture prove the function
+          // rather than the table.
+          d.deviceName = "self-test";
+          // The fixture stands AFTER a successful measurement -- that is the state the branch selection
+          // reads, and forgetting it is what the first version of this fixture did: the loop then reported
+          // "measured-no-gain was not refused as declared", because the selection returned early on
+          // `!measurement.ok` and the decision never reached the outcome the table declares.
+          d.measurement.ok = true;
+          d.judgement.verdictsComputed = true;
+          d.judgement.winner = -1;
+          d.pairsComplete = true;
+          d.outcome = "running";
+          concludeBranches(d);
+        }
       }
       string err;
       bool verdict = false;
       const bool stateOk = (outcomeWritable(d) == o.writable);   // the table agrees with itself
+      // (7d) and the decision really HOLDS the durable effect its row declares: the column is read here,
+      // which is what keeps it from being a label that drifts from what the writer does.  The effect
+      // string also DROVE the fixture above (a negative row is minted by the real branch selection), so
+      // this assertion is the positive half of "the self-test does not assert the wrong effect".
+      const bool effectOk = effectMatches(d, o.effect);
       // The condition's OTHER direction, per row (G-D20): a row that names an extra condition must
       // be REFUSED when that condition does not hold.  Asserting only the satisfying direction would
       // leave the condition itself untested (and would let it decay into a comment).
@@ -3087,7 +3240,7 @@ namespace VulkanTuner {
         allowed++;
       }
       declared++;
-      if (!verdict || !stateOk || !fixtureOk) {
+      if (!verdict || !stateOk || !fixtureOk || !effectOk) {
         ok = false;
         if (firstBad.empty()) {
           firstBad = string(o.outcome)
@@ -5332,6 +5485,14 @@ namespace VulkanTuner {
       // pre-check's and the measurement's.
       if (decision->measurement.ok && !decision->judgement.attempted) {
         judgeMeasurement(*decision);
+      }
+      // (7d) THE THREE BRANCHES, ONCE PER DECISION (tune-measurement.md section 2.6(a)).  The order is
+      // the ruling order: the gate judged the measurement, the judgement produced the verdicts, and
+      // this turns them into an outcome.  It runs at the END of the install path because that is where
+      // every input exists -- and BEFORE the once hook, which is the only thing that may write.
+      if (!decision->branchesConcluded) {
+        decision->branchesConcluded = true;
+        concludeBranches(*decision);
       }
       // (7c): THE JUDGEMENT'S OWN LINE.  Same two reasons as the pre-check's and the measurement's: a
       // reading nobody prints is a reading nobody can falsify, and the decision line (printed before
