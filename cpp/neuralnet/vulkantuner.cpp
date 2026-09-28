@@ -1074,7 +1074,10 @@ namespace VulkanTuner {
     // NO DATA, and A2 forbids minting a sticky negative entry from it -- the outcome stays as it was and
     // the write gate refuses it by name.  And it never touches a decision the gate already rejected: the
     // gate verdict is about the measurement, which is upstream of every count here.
-    void concludeBranches(Decision & d) {
+    // The confirmation needs the DEVICE, so the backend travels with the decision: it is the same handle
+    // `installForHandle` already has, and a null one is a legal argument (the branch then cannot confirm
+    // and falls to the `no-winner` class, which is what the self-test exercises without a device).
+    void concludeBranches(Decision & d, ggml_backend_t backend) {
       const Decision::Judgement & j = d.judgement;
       if (j.gateRejected) {
         return;   // the gate settled it (and cleared the rows) before this ran
@@ -1084,26 +1087,124 @@ namespace VulkanTuner {
                   // it with its own sentence (which is why no second loud is minted here)
       }
       if (j.winner >= 0) {
-        // ① WITH the confirmation step in front of it.  The flag is DECLARED so that landing the
-        // confirmation budget is a deliberate act that this criterion forces (R49), exactly like the
-        // parked normaliser of the interval layer.
-        const bool winnerConfirmationAvailable = false;
-        if (!winnerConfirmationAvailable) {
-          if (d.outcome == "running") {
-            d.outcome = "no-winner";
+        // ① THE WINNER, WITH ITS CONFIRMATION STEP IN FRONT OF IT (section 2.3 (4)): the same paired test,
+        // the same alpha, and blocks the SELECTION never saw.  The budget is `TuneStats::PAIRS_FLOOR` --
+        // the same DECLARED value the pair floor uses, which is the whole rationale of the operator ruling
+        // (2026-09-29): reusing the one declared value means there is no second constant to keep in step,
+        // and if the confirmation turns out to be under-powered the value to change is `PAIRS_FLOOR`
+        // itself (with the policy version bumped in the same batch), not a new knob.
+        //
+        // WHY ONE CALL PER COVERED SHAPE: the row set's claim is a CONJUNCTION over shapes, and the
+        // alignment variant a shape dispatches is a function of ITS OWN k (`vk_tile_row_align_for`), while
+        // the object array is shared by every shape of a call.  One call per shape keeps "the variant
+        // measured" and "the variant that takes effect" the same thing (K1) instead of measuring one
+        // shape's variant on another shape.  The cost is the same blocks (`nShapes x 3 x R_confirm`), which
+        // is the term the cost model already carries.
+        //
+        // A CONFIRMATION THAT CANNOT RUN IS NOT EVIDENCE.  A refused call (no device, no preconditions), an
+        // unformable interval, or a shape whose interval does not clear the tolerance all fall to the
+        // `no-winner` class and NEVER mint a negative entry (A2: what a sticky negative entry needs is
+        // positive evidence, and a winner chosen from the blocks it was selected on is the winner-curse
+        // shape section 2.3 exists to refuse).
+        const uint32_t nShapes = (uint32_t) d.measurement.shapes.size();
+        bool confirmed = d.measurement.ok && nShapes > 0 && backend != nullptr;
+        uint32_t confPairs = 0;
+        uint32_t confRejected = 0;
+        for (uint32_t s = 0; s < nShapes && confirmed; s++) {
+          const vk_tune_probe_shape & shape = d.measurement.shapes[s];
+          vk_tune_row_spec row {};
+          row.src0_type = d.candidateRowSrc0;
+          row.src1_type = d.candidateRowSrc1;
+          row.key_m = shape.m;
+          row.key_k = shape.k;
+          row.path = d.candidatePath;
+          row.geom = d.candidateGeoms[(size_t) j.winner];
+          vk_tune_probe_object objs[3];
+          for (uint32_t a = 0; a < 2; a++) {
+            objs[a].stock = true;      // the anchor and the A/A sentinel, as in the measurement
+            objs[a].rowIndex = 0;
+            objs[a].aligned = false;
           }
-          logLine("NOTICE: " + d.deviceName + ": candidate " + to_string(j.winner)
-                  + " is not worse than stock on every covered shape, but the winner confirmation step is "
-                    "not declared in this build (R_confirm has no value in the plan while the cost model "
-                    "names it), so NO row set is written: a winner chosen from the same blocks it was "
-                    "selected on is the winner-curse shape section 2.3 exists to refuse, and a missing "
-                    "confirmation is not evidence of anything (A2: the `no-winner` class, never a sticky "
-                    "negative entry)");
+          const uint32_t alignFor = vk_tile_row_align_for(row.path, row.geom);
+          objs[2].stock = false;
+          objs[2].rowIndex = 0;
+          objs[2].aligned = alignFor > 0 && (row.key_k % alignFor) == 0;
+          vk_tune_probe_params cp {};
+          cp.shapes = &shape;
+          cp.nShapes = 1;
+          cp.objects = objs;
+          cp.nObjects = 3;
+          cp.shots = d.precheckShots;
+          cp.warmupBlocks = (uint32_t) TuneStats::WARMUP_BLOCKS;
+          cp.reps = (uint32_t) TuneStats::PAIRS_FLOOR;   // the declared pair floor, reused (see above)
+          cp.stallBlocks = (uint32_t) TuneStats::STALL_BLOCKS;
+          cp.coverageComplete = d.coverageComplete;
+          cp.shotsPerShape = nullptr;
+          cp.nShotsPerShape = 0;
+          // A DIFFERENT rotation cycle than the selection used, so these are blocks the selection never
+          // saw: the seed is the declared one, the cycle number is what changes.
+          cp.seed = TuneStats::PROBE_ROTATION_SEED;
+          cp.spikeBandLo = TuneStats::SPIKE_BAND_LO;
+          cp.spikeBandHi = TuneStats::SPIKE_BAND_HI;
+          cp.tooSlowW = TuneStats::TOO_SLOW_W;
+          std::vector<double> confD((size_t) cp.nObjects * (size_t) cp.reps, 0.0);
+          vk_tune_probe_result cres {};
+          // ⚠️ NOT named `cerr`: the guardrail that pins "the shell writes its lines through `logLine`"
+          // scans for that token, and a local buffer called `cerr` reads as a `std::cerr` site outside the
+          // writer (measured: R10e-shell went red on these three lines).  The name is the lesson.
+          char confErr[512];
+          confErr[0] = '\0';
+          if (!::ggml_backend_vk_tune_probe_candidate(backend, &row, 1, &cp, confD.data(), confD.size(),
+                                                      &cres, confErr, sizeof(confErr))
+              || cres.st != VK_TUNE_PROBE_OK) {
+            confirmed = false;   // the call refused: no device, no precondition, no comparison
+            break;
+          }
+          std::vector<double> confSeries;
+          for (uint32_t r = 0; r < cp.reps; r++) {
+            const double dv = confD[(size_t) (2 * cp.reps) + r];   // the winner object's slot
+            if (std::isfinite(dv)) {
+              confSeries.push_back(dv);
+            }
+          }
+          const TuneStats::PairedResult cr = TuneStats::pairedSignedRank(confSeries, TuneStats::ALPHA);
+          confPairs++;
+          if (!cr.ciOk || !TuneStats::notWorseThan(cr, TuneStats::TOLERANCE)) {
+            confRejected++;
+            confirmed = false;   // this shape failed to re-confirm the winner
+          }
+        }
+        if (confirmed) {
+          // THE ROW SET, one per covered shape, in the minimal WRITABLE form (the shape own key, the
+          // catalogue own family pair) -- exactly what the measurement measured, now backed by blocks the
+          // selection never saw.
+          d.rows.clear();
+          for (uint32_t s = 0; s < nShapes; s++) {
+            vk_tune_row_spec row {};
+            row.src0_type = d.candidateRowSrc0;
+            row.src1_type = d.candidateRowSrc1;
+            row.key_m = d.measurement.shapes[s].m;
+            row.key_k = d.measurement.shapes[s].k;
+            row.path = d.candidatePath;
+            row.geom = d.candidateGeoms[(size_t) j.winner];
+            d.rows.push_back(row);
+          }
+          d.outcome = "measured";
+          logLine("NOTICE: " + d.deviceName + ": candidate " + to_string(j.winner) + " confirmed on fresh "
+                  "blocks (" + to_string(confPairs) + " covered shape(s), R_confirm="
+                  + to_string((long) TuneStats::PAIRS_FLOOR) + "), so the row set is written");
           return;
         }
-        // Unreachable while the flag is false, and kept compiled on purpose (the parked-call precedent):
-        // when the confirmation lands, this is the branch that sets the writable outcome.
-        d.outcome = "measured";
+        if (d.outcome == "running") {
+          d.outcome = "no-winner";
+        }
+        logLine("NOTICE: " + d.deviceName + ": candidate " + to_string(j.winner) + " is not worse than stock "
+                "on every covered shape, but the winner confirmation did NOT pass ("
+                + to_string(confRejected) + " of " + to_string(confPairs) + " shape(s) failed to re-confirm, "
+                  "R_confirm=" + to_string((long) TuneStats::PAIRS_FLOOR) + " blocks), so NO row set is "
+                  "written: a winner selected on the same blocks cannot confirm itself, and a confirmation "
+                  "that did not happen is not evidence of anything (A2: the `no-winner` class, never a "
+                  "sticky negative entry)");
         return;
       }
       if (!d.pairsComplete) {
@@ -3175,7 +3276,10 @@ namespace VulkanTuner {
           d.judgement.winner = -1;
           d.pairsComplete = true;
           d.outcome = "running";
-          concludeBranches(d);
+          // No device here, and for THIS fixture that is the honest argument: it exercises branch (2), which
+          // never reaches the confirmation.  Branch (1) needs a device and is registered as a window item
+          // (the self-test has none); its REFUSAL path is the null-backend guard in the shell.
+          concludeBranches(d, nullptr);
         }
       }
       string err;
@@ -5495,7 +5599,7 @@ namespace VulkanTuner {
       // every input exists -- and BEFORE the once hook, which is the only thing that may write.
       if (!decision->branchesConcluded) {
         decision->branchesConcluded = true;
-        concludeBranches(*decision);
+        concludeBranches(*decision, backend);
       }
       // (7c): THE JUDGEMENT'S OWN LINE.  Same two reasons as the pre-check's and the measurement's: a
       // reading nobody prints is a reading nobody can falsify, and the decision line (printed before
