@@ -5699,7 +5699,19 @@ namespace VulkanTuner {
           const double aUs = mRes.shape_anchor_us[sIdx];
           if (aUs > 0.0 && aUs < targetBlockUs) {
             anyShapeShort = true;
-            const double want = (double) mp.shots * targetBlockUs / aUs;
+            // 🔴 DAMPED, AND HERE IS WHY (measured, B-2).  The first pass computes every ratio while
+            // ALL shapes share one `shots`; once the shapes carry different block lengths their per-dispatch
+            // costs move (differently sized blocks interfere through cache and thermals), so a full step
+            // overshoots -- the heaviest shape came out at 3596 us against a 2000 us target and the run cost
+            // ~40% more for the same blocks, with NO correctness benefit: the floor is a MINIMUM.
+            // THE BLOCK LENGTH IS A FUNCTION OF DEVICE STATE, not a constant of the protocol, which is why
+            // this is damped rather than solved once -- a device whose state shifts will show it in
+            // `anchor_us=` on the measurement line, which is the reading that exists for exactly this.
+            // Damping (not a second feedback round): a second round would double the measurement budget to
+            // chase a quantity that cannot change any verdict.
+            const double rawRatio = targetBlockUs / aUs;
+            const double dampedRatio = 1.0 + 0.5 * (rawRatio - 1.0);
+            const double want = (double) mp.shots * dampedRatio;
             const uint32_t wantShots = (uint32_t) (want + 0.999);
             if (wantShots > shotsPerShape[sIdx]) {
               shotsPerShape[sIdx] = wantShots;
