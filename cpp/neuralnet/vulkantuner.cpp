@@ -939,6 +939,16 @@ namespace VulkanTuner {
             }
           }
         }
+        // (R52) WHAT THIS PAIR CONTRIBUTED, counted on the READ side: a pair with samples is one the
+        // judgement could actually judge, and a pair with none is recorded WITH its address -- because
+        // "the pairing is wrong" is only actionable if the log names the slot it went wrong at.
+        if (finite >= 2) {
+          j.pairsMeasured++;
+        }
+        else if (j.firstMissingShape < 0) {
+          j.firstMissingShape = (int) shapeIndex;
+          j.firstMissingObject = (int) objectIndex;
+        }
         out = TuneStats::pairedSignedRank(series, TuneStats::ALPHA);
         // 🔴 THE BOUND COMES FROM THE DATA, not from a ruler constant -- and it is measured, twice over.
         // FIRST FORM (all differences exactly zero) never fired: the real series is mostly exact zeros
@@ -5788,6 +5798,11 @@ namespace VulkanTuner {
             << " not_worse=" << decision->judgement.notWorsePairs
             << " ci_missing=" << decision->judgement.ciMissing
             << " ci_never=" << decision->judgement.ciNever
+            << " pairs_measured=" << decision->judgement.pairsMeasured
+            << "/" << (decision->pairsLegal > decision->measurement.shapes.size()
+                        ? decision->pairsLegal - (uint32_t) decision->measurement.shapes.size() : 0u)
+            << " miss_slot=" << decision->judgement.firstMissingShape
+            << ":" << decision->judgement.firstMissingObject
             << " ci_coarse=" << decision->judgement.ciMissingCoarse
             << " ci_wide=" << decision->judgement.ciMissingWide
             << " winner=" << decision->judgement.winner
@@ -5796,7 +5811,22 @@ namespace VulkanTuner {
             << " spikes=" << decision->judgement.gateSpikes
             << " blocks=" << decision->judgement.gateBlocks
             << " objects=" << decision->judgement.gateObjects;
-        logLine(jOs.str());
+        // 🔴 (R52) THE PAIRING INVARIANT, as a LOUD rather than a silent counter: the read set and the
+      // measured set are computed independently, and a mismatch means this layer judged slots the primitive
+      // never wrote -- which is exactly how a "no candidate is not-worse" claim was minted from 14 pairs of
+      // nothing.  The address is printed so the offender is findable from the log alone.
+      {
+        const uint32_t measuredByPrimitive = decision->pairsLegal > decision->measurement.shapes.size()
+          ? decision->pairsLegal - (uint32_t) decision->measurement.shapes.size() : 0u;
+        if (decision->judgement.pairsMeasured != measuredByPrimitive) {
+          logLine("WARNING: the judgement found samples for " + to_string(decision->judgement.pairsMeasured) + " slot(s) while "
+                  "the measurement reported " + to_string(measuredByPrimitive) + " measured slot(s) (the "
+                  "first slot without samples was shape " + to_string(decision->judgement.firstMissingShape) + " / object "
+                  + to_string(decision->judgement.firstMissingObject) + "): THE PAIRING IS NOT THE MEASUREMENT, so the counts "
+                  "this line reports are about slots that were never written");
+        }
+      }
+      logLine(jOs.str());
       }
       // (7b) step 5: THE MEASUREMENT'S OWN LINE, for the same reason the pre-check has one: the decision
       // line is printed BEFORE the install (`makeDecision` returns, then the caller installs), so the

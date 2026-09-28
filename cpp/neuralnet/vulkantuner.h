@@ -513,6 +513,13 @@ namespace VulkanTuner {
       // slot.  It is counted apart because "we did not measure it" must never be read as "we measured it and
       // the ruler was coarse", and because the partition is what makes the counts add up.
       uint32_t ciNever = 0;
+      // (R52) THE PAIRING INVARIANT'S READINGS.  `pairsMeasured` is what the judgement found samples in;
+      // the primitive's `pairsLegal - nShapes` is what it measured.  Two independently computed sets, so
+      // agreement is evidence; the first slot without samples is named because that is the address of a
+      // wrong object identity.
+      uint32_t pairsMeasured = 0;
+      int firstMissingShape = -1;
+      int firstMissingObject = -1;
       uint32_t ciMissingWide = 0;
       // The shapes whose own block is below `MIN_BLOCK_TIME_MS`, and the lightest ruler seen: the floor as
       // a reading rather than a silent gate.
