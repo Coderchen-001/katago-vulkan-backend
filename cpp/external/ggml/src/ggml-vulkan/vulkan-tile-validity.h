@@ -282,6 +282,12 @@ enum vk_tune_probe_status {
     VK_TUNE_PROBE_NOT_MEASURED,           // ran, but produced no usable comparison
 };
 
+// The most per-shape rulers one result carries.  It is a SIZE, not a policy: the caller of a wider shape
+// set still gets the first `VK_TUNE_MAX_SHAPE_RULERS` medians and `n_shape_anchor_us` tells it how many
+// actually arrived, so a consumer fails closed (unknown ruler => no bounded claim) instead of reading past
+// the end.  The value is comfortably above the shape set the tuner's own instrument can build.
+#define VK_TUNE_MAX_SHAPE_RULERS 16
+
 struct vk_tune_probe_result {
     enum vk_tune_probe_status st;
     uint32_t shapes;
@@ -326,6 +332,17 @@ struct vk_tune_probe_result {
     uint32_t shots_max;
     double t_block_hot_us;   // the estimate's input: median of the hot blocks of the heaviest shape
     uint64_t elapsed_us;
+    // 🔴 (7e-3) THE PER-SHAPE RULER.  `t_block_hot_us` is the HEAVIEST shape's block, but a block's
+    // microsecond clock gives THAT BLOCK a relative floor of 1/block_us, and the block length differs per
+    // shape (one shared `shots`, different per-dispatch costs).  A shape whose block is a sixth of the
+    // heaviest one therefore carries a six-times coarser ruler, and a consumer holding one number cannot
+    // tell "the difference is below the ruler" from "the difference is below the HEAVIEST shape's ruler".
+    // These are the SAME medians the primitive already divides by (the `d_out` normaliser's per-shape
+    // scale), EXPORTED rather than recomputed -- a consumer may not derive a ruler the producer did not
+    // state.  `n_shape_anchor_us` says how many arrived; a consumer that needs shape `s` and finds
+    // `s >= n_shape_anchor_us` has NO ruler for it and must fail closed.
+    double shape_anchor_us[VK_TUNE_MAX_SHAPE_RULERS];
+    uint32_t n_shape_anchor_us;
 };
 
 // ---------------------------------------------------------------------------

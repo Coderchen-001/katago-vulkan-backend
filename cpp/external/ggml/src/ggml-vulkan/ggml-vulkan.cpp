@@ -22476,6 +22476,13 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
         // anchor without one leaves the shape's slots at NaN (the caller's `ci_missing` counts it) with a
         // loud saying why: a zero denominator or a single block is not a scale.
         const double scale = slot_median[anchor_slot];
+        // (7e-3) THE OUTLET: this shape's own ruler, which is the divisor the write below uses.  It is
+        // filled for every shape the loop reaches, measured or not, so a consumer can see a zero scale
+        // rather than infer one from an absence.
+        if (result != nullptr && s < (uint32_t) VK_TUNE_MAX_SHAPE_RULERS) {
+            result->shape_anchor_us[s] = scale;
+            result->n_shape_anchor_us = s + 1;
+        }
         uint32_t anchor_blocks = 0;
         for (uint32_t r = 0; r < params->reps; r++) {
             if (block_measured[anchor_slot * (size_t) params->reps + r] != 0) {

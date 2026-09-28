@@ -450,6 +450,11 @@ namespace VulkanTuner {
       uint32_t reps = 0;        // the budget actually used (the pre-check's own answer)
       uint32_t blocks = 0;      // the primitive's own readings, echoed for the log
       double hotUs = 0.0;       // the block length actually achieved on the heaviest shape (R50's carrier)
+      // (7e-3) THE PER-SHAPE RULERS, straight from the primitive's own reading: each shape's anchor median
+      // block time, which is the divisor its paired differences were normalised by.  The floor and the
+      // bounded-tie rule are decided per shape from these, because one shared ruler was measured to be
+      // wrong for six shapes at once.
+      std::vector<double> anchorUs;
       uint32_t samplesWritten = 0;
       uint32_t pairsIllegal = 0;
       uint32_t spikes = 0;
@@ -500,6 +505,19 @@ namespace VulkanTuner {
       // (resolution <= tolerance).  They carry a BOUNDED interval, not a missing one, and this counter is
       // what keeps the two distinguishable on the line.
       uint32_t tiesBounded = 0;
+      // (7e-3): `ciMissing` split by cause -- a shape whose block is below the declared floor (its ruler
+      // cannot support the claim) versus a band wider than the tolerance (no bound, no data).  Two causes,
+      // two readings: that is the whole point of the split.
+      uint32_t ciMissingCoarse = 0;
+      // (7e-3): the third cause -- fewer than two finite samples, i.e. the primitive never wrote this pair's
+      // slot.  It is counted apart because "we did not measure it" must never be read as "we measured it and
+      // the ruler was coarse", and because the partition is what makes the counts add up.
+      uint32_t ciNever = 0;
+      uint32_t ciMissingWide = 0;
+      // The shapes whose own block is below `MIN_BLOCK_TIME_MS`, and the lightest ruler seen: the floor as
+      // a reading rather than a silent gate.
+      uint32_t shapesBelowFloor = 0;
+      double minAnchorUs = 0.0;
       uint32_t notWorsePairs = 0;
       bool sentinelEquivalent = false;   // EVERY covered shape's sentinel interval inside +-tolerance
       // Did the interval verdicts actually run?  They do now that the primitive hands over the

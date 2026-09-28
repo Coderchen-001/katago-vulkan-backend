@@ -897,8 +897,33 @@ namespace VulkanTuner {
       // not fire (a zero difference would not bound anything the criterion asks about), which is why the
       // resolution is compared here instead of assumed.  A pair that fails that test stays `ciMissing`,
       // which is what branch (2) refuses to read as "nothing won".
-      const double resolutionRel = m.hotUs > 0.0 ? (1.0 / m.hotUs) : 0.0;
+      const double resolutionRel = m.hotUs > 0.0 ? (1.0 / m.hotUs) : 0.0;   // the heaviest shape's, kept
+                                                                              // as the fallback reading
+      // (7e-3) THE FLOOR AS A READING: how many covered shapes have a block below the declared minimum,
+      // and which ruler is the lightest one seen.  A silent gate would leave "the ruler was too coarse"
+      // invisible, which is exactly how two causes came to share one counter.
+      for (size_t sIdx = 0; sIdx < m.shapes.size(); sIdx++) {
+        const double aUs = sIdx < m.anchorUs.size() ? m.anchorUs[sIdx] : 0.0;
+        if (!(aUs >= TuneStats::MIN_BLOCK_TIME_MS * 1000.0)) {
+          j.shapesBelowFloor++;
+        }
+        if (aUs > 0.0 && (j.minAnchorUs == 0.0 || aUs < j.minAnchorUs)) {
+          j.minAnchorUs = aUs;
+        }
+      }
       const auto intervalFor = [&](uint32_t objectIndex, uint32_t shapeIndex, TuneStats::PairedResult & out) {
+        // (7e-3) THE SHAPE'S OWN RULER, and the floor that decides whether it supports a claim at all.  A
+        // shape whose block is below `MIN_BLOCK_TIME_MS` cannot bound anything the tolerance asks about
+        // (its quantum is comparable to the tolerance), so the bounded rule below must not fire for it --
+        // and WHEN it does not fire, this is what says which of the two causes it was.
+        const double shapeAnchorUs = shapeIndex < m.anchorUs.size() ? m.anchorUs[shapeIndex] : 0.0;
+        const double shapeRes = shapeAnchorUs > 0.0 ? (1.0 / shapeAnchorUs) : 0.0;
+        // ⚠️ UNITS (measured 2026-09-29, from the raw list): `MIN_BLOCK_TIME_MS` is
+        // MILLISECONDS (2.0) and every anchor median here is MICROSECONDS, so the first form of this
+        // comparison was true for any real block -- the gate could not fire, and the same loop printed
+        // `shapes_below_floor=0` beside `min_anchor_us=1747`.  The declared constant is the source of
+        // the threshold; this line is the conversion, and `ci_coarse` is the reading that proves it.
+        const bool shapeRulerOk = shapeAnchorUs >= TuneStats::MIN_BLOCK_TIME_MS * 1000.0;
         std::vector<double> series;
         uint32_t finite = 0;
         double maxAbs = 0.0;
@@ -926,13 +951,31 @@ namespace VulkanTuner {
         // observations wide.  Anything wider than the tolerance is NOT bounded this way: it stays
         // `ciMissing` (no data), which is the fail-closed half branch (2) depends on.
         if (!out.ciOk && finite >= (uint32_t) TuneStats::PAIRS_FLOOR && maxAbs > 0.0
-            && maxAbs <= TuneStats::TOLERANCE) {
+            && maxAbs <= TuneStats::TOLERANCE && shapeRulerOk && shapeRes > 0.0
+            && shapeRes <= TuneStats::TOLERANCE) {
           out.hl = 0.0;
           out.ciLow = -maxAbs;
           out.ciHigh = maxAbs;
           out.ciOk = true;
           out.pairs = (long) finite;
           j.tiesBounded++;
+        }
+        else if (!out.ciOk) {
+          // THE DECOMPOSITION (7e-3), and it is a PARTITION BY CONSTRUCTION: every pair that ends up with
+          // no interval lands in exactly one bucket, so the parts add up to `ciMissing` and the next
+          // question becomes askable.  The first form required `finite >= 2` and therefore answered zero for
+          // every bucket while `ci_missing` read 14 -- MEASURED, and the reason `ci_never` exists: those
+          // pairs had NO finite samples at all (the primitive never wrote their slot), which is a different
+          // question from any ruler.
+          if (finite < 2) {
+            j.ciNever++;
+          }
+          else if (!shapeRulerOk || shapeRes <= 0.0 || shapeRes > TuneStats::TOLERANCE) {
+            j.ciMissingCoarse++;
+          }
+          else {
+            j.ciMissingWide++;
+          }
         }
       };
       // (c) THE SENTINEL, one interval per covered shape, and EVERY one of them has to pass: "this
@@ -956,7 +999,15 @@ namespace VulkanTuner {
         double worstMargin = 0.0;
         for (uint32_t s = 0; s < nShapes; s++) {
           TuneStats::PairedResult r {};
-          intervalFor(2u + c * nShapes + s, s, r);
+          // 🔴 THE IDENTITY THE MEASUREMENT ACTUALLY BUILT (measured 2026-09-29).  Rows -- and therefore
+          // objects 2.. -- are SHAPE-MAJOR: the measurement walks the covered shapes and, for each, its
+          // candidates, so candidate c on shape s is object 2 + s*nCands + c.  The judgement read it
+          // as 2 + c*nShapes + s, which is the same set of indices in a different order, so the counts
+          // looked fine and the PAIRINGS were wrong: 14 of 18 (shape, candidate) combinations pointed at
+          // objects that belong to another shape, and the primitive had never measured them there -- which
+          // is exactly what pairs_illegal=90 says (6 shapes x 15 objects that are not theirs) and what
+          // ci_never=14 counted.  A bijection is not enough: the pairing is the measurement.
+          intervalFor(2u + s * nCands + c, s, r);
           j.candidatePairs++;
           if (!r.ciOk) {
             // NO INTERVAL IS NOT "UNSTABLE": it is missing data, and the branches answer for it.
@@ -5680,6 +5731,10 @@ namespace VulkanTuner {
           // R50's carrier: the block length this run ACTUALLY achieved on the heaviest shape, so "the
           // block is defined by time" can be checked instead of believed.
           decision->measurement.hotUs = mRes.t_block_hot_us;
+          // (7e-3) the per-shape rulers, copied out of the primitive's reading: the judgement gates on the
+          // shape's OWN block length, and `ci_missing` is split by which cause produced it.
+          decision->measurement.anchorUs.assign(mRes.shape_anchor_us,
+                                                mRes.shape_anchor_us + mRes.n_shape_anchor_us);
           decision->measurement.samplesWritten = mRes.samples;
           decision->measurement.pairsIllegal = mRes.pairs_illegal;
           decision->measurement.spikes = mRes.spikes;
@@ -5724,12 +5779,17 @@ namespace VulkanTuner {
             << " verdicts=" << (decision->judgement.verdictsComputed ? 1 : 0)
             << " sentinel_ok=" << (decision->judgement.sentinelEquivalent ? 1 : 0)
             << " ties_bounded=" << decision->judgement.tiesBounded
+            << " shapes_below_floor=" << decision->judgement.shapesBelowFloor
+            << " min_anchor_us=" << decision->judgement.minAnchorUs
             << " resolution_rel=" << (decision->measurement.hotUs > 0.0
                                          ? 1.0 / decision->measurement.hotUs : 0.0)
             << " sentinel_pairs=" << decision->judgement.sentinelPairs
             << " cand_pairs=" << decision->judgement.candidatePairs
             << " not_worse=" << decision->judgement.notWorsePairs
             << " ci_missing=" << decision->judgement.ciMissing
+            << " ci_never=" << decision->judgement.ciNever
+            << " ci_coarse=" << decision->judgement.ciMissingCoarse
+            << " ci_wide=" << decision->judgement.ciMissingWide
             << " winner=" << decision->judgement.winner
             << " winner_unstable=" << (decision->judgement.winnerUnstable ? 1 : 0)
             << " winner_margin=" << decision->judgement.winnerMargin
@@ -5767,6 +5827,21 @@ namespace VulkanTuner {
             << " dropped_build_failed=" << decision->measurement.droppedBuildFailed
             << " shots=[" << decision->measurement.shotsMin << "," << decision->measurement.shotsMax << "]"
             << " elapsed_us=" << decision->measurement.elapsedUs;
+        // (7e-3) THE RAW PER-SHAPE RULERS, because `min_anchor_us=` and `shapes_below_floor=` disagreed in
+        // the first run and a list is what settles which of the two means what.  Microseconds, in the
+        // primitive's shape order, as many as it exported.
+        {
+          string anchorList = "[";
+          for (size_t ai = 0; ai < decision->measurement.anchorUs.size(); ai++) {
+            if (ai != 0) {
+              anchorList += ",";
+            }
+            anchorList += to_string((long) (decision->measurement.anchorUs[ai] + 0.5));
+          }
+          anchorList += "]";
+          mOs << " anchor_us=" << anchorList << " n_anchor_us="
+              << decision->measurement.anchorUs.size();
+        }
         logLine(mOs.str());
       }
 }
