@@ -4106,6 +4106,183 @@ namespace VulkanTuner {
       }
     }
 
+
+    // ── (n) THE POSITIVE WRITE-PATH LEG (step 4's A10b fixture): a decision that passes every gate
+    // LANDS a file, and the file it lands is one this process reads back ─────────────────────────────
+    //
+    // WHY THIS CASE EXISTS.  Until it, NO leg had ever written through the GATED writer: the (a)-(e)
+    // loop stops every state-writable row at the read-only policy ON PURPOSE (so that the test itself
+    // would not create the probe file), and r6's encoding probe deliberately goes AROUND the gate
+    // because its subject is how a PATH is encoded.  So "the cache write path can write" was a claim
+    // about code that nothing executed -- and it is the last unproven link of the chain that ends in a
+    // durable row set.
+    //
+    // WHAT IT IS NOT.  It is evidence about no measurement, no candidate and no device: the row below is
+    // SYNTHESIZED (this function has no backend, no pipeline and no primitive to call), and the decision
+    // is hand-filled the way (j)/(k) fill theirs.  It proves the PATH -- the gates, the formatter, the
+    // atomic write, the parser -- and nothing about whether the numbers that would feed it are any good.
+    // That division is why it is worth having: the claims that DO need a machine in the right mood (A3's
+    // boundary gate, branch (1)'s confirmation) get a carrier whose reading does not move between
+    // machines.
+    //
+    // ONE VARIABLE.  Every gate is satisfied, so the only thing left that can stop the write is the
+    // write path itself.  `aMeasuredSet`/`aSweptSet` are the same two helpers (d) and (j) use.  The
+    // install mask is deliberately NOT set, because (g)/(h) own the fold and a fixture that set both
+    // would make an install-fold bug read as a write-path bug.  The one precondition it INHERITS rather
+    // than restates: a write-ALLOWED policy, which the (a)-(e) loop already requires -- its unwritable
+    // direction asserts that the STATE gate, not the mode, is what refused.
+    //
+    // 🔴 WRITING A REAL FILE BRINGS TWO DUTIES, and both are asserted here rather than promised: it must
+    // use its OWN path (reusing the first probe's path would dismantle that probe's "still absent"
+    // verdict), and it must REMOVE the file again, because the line below is read by a smoke leg that
+    // requires no `self-test*` entry to survive the run.  The name carries the pid for r6's reason (two
+    // NN server threads must not collide), and it reuses r6's pid: what has to be unique is the NAME,
+    // not the call.
+    const string caseNPath = cacheDir + "/self-test-" + to_string(encProbePid) + "-case-n.txt";
+    // The verdict, SPLIT BY CLAUSE rather than folded into one bool: a failure has to name which half of
+    // "the file is right" broke (its legality, the write, the read, the key, the rows, the cleanup),
+    // because those send a reader to six different places.
+    bool caseNWasAbsent = false, caseNRowLegal = false, caseNWrote = false;
+    bool caseNRead = false, caseNKey = false, caseNRows = false, caseNRemoved = false;
+    string caseNDetail;
+    {
+      Decision d;
+      d.deviceName = "self-test";
+      d.cachePath = caseNPath;
+      d.nnXLen = 19;
+      d.nnYLen = 19;
+      d.maxBatchSize = 8;
+      d.fingerprint = "self-test";
+      // The REAL policy string, not a literal: POLICY is what the loader compares against the running
+      // policy, so a fixture that invented one would only prove that the write path can land a file no
+      // run could ever load.
+      d.policyFingerprint = policyFingerprint();
+      d.baselineVersion = "1";
+      d.modelIdentity = "self-test";
+      d.modeString = modeString(enabled_t::True);
+      d.outcome = "measured";
+      aMeasuredSet(d);
+      aSweptSet(d);
+      // The (a)-(e) loop's `completed` row, and the wave it is legal under is SYNTHESIZED here for the
+      // same reason it is there: there is no device in this function.  Its legality is asserted rather
+      // than assumed -- a fixture that wrote a row the catalogue could never produce would prove the
+      // file format, not the write path -- and that same synthesized wave is what the read-back must be
+      // parsed with, because the parser re-checks the row against it.
+      vk_tune_row_spec r {};
+      r.path = VK_TILE_PATH_SCALAR;
+      r.src0_type = 1;
+      r.src1_type = 0;
+      r.geom.BM = 64; r.geom.BN = 64; r.geom.BK = 0;
+      r.geom.WM = 32; r.geom.WN = 32; r.geom.WMITER = 1;
+      r.geom.TM = 4;  r.geom.TN = 4;  r.geom.BS = 128;
+      r.geom.pad = -1; r.geom.reshape = -1; r.geom.smaller = -1;
+      d.rows.push_back(r);
+      caseNRowLegal = vk_tile_candidate_reason(r.path, r.geom, vk_tile_wave_for(32)) == nullptr;
+      caseNWasAbsent = !FileUtils::exists(caseNPath);
+      if (!caseNRowLegal) {
+        caseNDetail = "the fixture's own row is not one the catalogue could produce (illegal geometry)";
+      }
+      else if (!caseNWasAbsent) {
+        // The name carries the pid, so this can only be a file an earlier run of THIS process left
+        // behind -- a real finding, not a precondition to skip: a fixture that reused a file would read
+        // as "the writer created it" while having proved nothing.
+        caseNDetail = "the probe file already existed before the write (" + caseNPath + ")";
+      }
+      else {
+        // THE CACHE WRITE PATH, through the REAL gated writer, and the FIRST call in this function
+        // with a policy that allows writing -- which is what makes this case the executor of it.
+        string err;
+        caseNWrote = writeCacheIfAllowed(d, policy, err);
+        if (!caseNWrote) {
+          caseNDetail = "the write path refused a decision that satisfies every gate: " + err;
+        }
+      }
+      if (caseNWrote) {
+        // ── THE READ-BACK, through the pair the PRODUCTION loader uses (`readWholeFile` +
+        // `parseRowsFile`): a file this process can write and cannot read back is a cache that can never
+        // load, and that is the half which makes the write durable rather than decorative.
+        string text, rdErr;
+        RowsFile back;
+        caseNRead = readWholeFile(caseNPath, text, rdErr)
+                 && parseRowsFile(text, vk_tile_wave_for(32), back, rdErr);
+        if (!caseNRead) {
+          caseNDetail = "the file just written did not read back: " + rdErr;
+        }
+        else {
+          // (1) THE KEY.  These are the comparisons the loader makes before it will believe a file,
+          // quoted in the loader's own order: a fixture that checked fewer of them would go green on a
+          // file the loader refuses.  `absentKeys` is the one that catches a header the writer forgot --
+          // the loader REFUSES a file carrying any -- so "the writer emits every key it declares" is
+          // executed here rather than asserted.
+          caseNKey = back.foundVersion && back.version == SCHEMA_VERSION
+                  && back.foundTunerVersion && back.tunerVersion == TUNER_VERSION
+                  && back.foundFingerprint && back.fingerprint == d.fingerprint
+                  && back.foundPolicy && back.policy == d.policyFingerprint
+                  && back.foundBaseline && back.baseline == d.baselineVersion
+                  && back.foundModel && back.model == d.modelIdentity
+                  && back.foundBoard && back.boardX == d.nnXLen && back.boardY == d.nnYLen
+                  && back.foundMaxBatch && back.maxBatch == d.maxBatchSize
+                  && back.foundMode && back.mode == d.modeString
+                  && back.foundCreated
+                  && back.absentKeys.empty()
+                  && !back.negative && back.negativeScope.empty();
+          // (2) THE ROWS, field by field, against the DURABLE set the writer announced -- plus the one
+          // link that makes the file describe ITSELF: the declared ROWSET_HASH must equal the hash of
+          // the rows that came back, which is exactly the check the loader performs.
+          const vector<vk_tune_row_spec> want = rowsForWrite(d);
+          caseNRows = back.foundDeclaredRows && back.declaredRows == (long) want.size()
+                   && back.rows.size() == want.size()
+                   && back.foundRowSetHash && back.declaredRowSetHash == rowSetHash(back.rows);
+          for (size_t i = 0; caseNRows && i < want.size(); i++) {
+            const vk_tune_row_spec & got = back.rows[i];
+            const vk_tune_row_spec & exp = want[i];
+            caseNRows = got.path == exp.path && got.src0_type == exp.src0_type
+                     && got.src1_type == exp.src1_type && got.key_m == exp.key_m
+                     && got.key_k == exp.key_k
+                     && got.geom.BM == exp.geom.BM && got.geom.BN == exp.geom.BN
+                     && got.geom.BK == exp.geom.BK && got.geom.WM == exp.geom.WM
+                     && got.geom.WN == exp.geom.WN && got.geom.WMITER == exp.geom.WMITER
+                     && got.geom.TM == exp.geom.TM && got.geom.TN == exp.geom.TN
+                     && got.geom.BS == exp.geom.BS && got.geom.pad == exp.geom.pad
+                     && got.geom.reshape == exp.geom.reshape && got.geom.smaller == exp.geom.smaller;
+          }
+          if (!caseNKey) {
+            caseNDetail = "the file does not carry the key its decision was written under";
+          }
+          else if (!caseNRows) {
+            caseNDetail = "the file does not carry the row set the writer announced";
+          }
+        }
+        // The cleanup is attempted even when the read-back failed, and LAST: leaving the file behind
+        // would make the NEXT run report "the probe file already existed" instead of this failure, i.e.
+        // the second run would name the wrong cause.
+        caseNRemoved = FileUtils::tryRemoveFile(caseNPath);
+        if (!caseNRemoved && caseNDetail.empty()) {
+          caseNDetail = "the probe file could not be removed (" + caseNPath + ")";
+        }
+      }
+    }
+    const bool caseNOk = caseNRowLegal && caseNWasAbsent && caseNWrote && caseNRead
+                      && caseNKey && caseNRows && caseNRemoved;
+    if (!caseNOk) {
+      if (caseNDetail.empty()) {
+        // Fail-closed: a clause that failed with no sentence would leave the line saying "FAIL: " and
+        // nothing else, which is the "error string that does not name the clause" failure (see (g)/(h)).
+        caseNDetail = "a clause failed without naming itself (the read-back verdict is incomplete)";
+      }
+      ok = false;
+      if (firstBad.empty()) {
+        firstBad = string("(n) the write path did not land the row set it was allowed to write: ")
+                 + caseNDetail + " [fixture-legal=" + (caseNRowLegal ? "yes" : "NO (BUG)")
+                 + " path-absent=" + (caseNWasAbsent ? "yes" : "NO")
+                 + " wrote=" + (caseNWrote ? "yes" : "no")
+                 + " read=" + (caseNRead ? "yes" : "no")
+                 + " key=" + (caseNKey ? "ok" : "BAD")
+                 + " rows=" + (caseNRows ? "ok" : "BAD")
+                 + " removed=" + (caseNRemoved ? "yes" : "no") + "]";
+      }
+    }
+
     // ── R-29 Cut 5: THE MOVED `A1_export` ASSERTION, READ FROM THE REAL FORMATTER ─────────────────
     // The `A1_export` Check voted on the header of the file the EXPORT channel wrote, and the export
     // channel is gone (Cut 1).  Its POLICY half -- "the header the product writes carries all 8 declared
@@ -4180,8 +4357,10 @@ namespace VulkanTuner {
             + ((encWrote && encReadBack && encRemoved) ? "ok" : "FAIL") + "]"
             + "; (a)(b) no marker / (c) from-file retirement / (d) measured control / (e) our-gap / (f) all-reject->measured retracts / (g)(h) fold AND+mismatch / (i) unmeasured marker refused by name / (j) the formatter's throw is contained / (k) spike gate: both directions + no-row-set + the durable entry's write/read pair / (l) third branch: drop accounting + the three directions + the finalizer leaves it alone ["
             + (verdictOk ? "ok" : "FAIL: " + verdictBad) + "]"
+            + "; (n) the positive write-path leg (the real writer lands the row set it was allowed to write, the real reader reads it back, and the probe is removed) ["
+            + (caseNOk ? "ok" : ("FAIL: " + caseNDetail)) + "]"
             + "; POLICY row [" + policyRowText + "]"
-            + " [" + ((ok && absent && encWrote && encReadBack && encRemoved && verdictOk && policyRowOk) ? "ok" : "FAIL") + "]"
+            + " [" + ((ok && caseNOk && absent && encWrote && encReadBack && encRemoved && verdictOk && policyRowOk) ? "ok" : "FAIL") + "]"
             + (ok ? "" : " first problem: " + firstBad));
   }
 
