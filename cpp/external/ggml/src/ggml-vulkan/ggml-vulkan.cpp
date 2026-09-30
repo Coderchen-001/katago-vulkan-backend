@@ -21591,18 +21591,6 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
                       "detector's definition comes from the envelope generator (+40..100% of that "
                       "object's median), and a band that marks nothing would report a rate of zero");
     }
-    if (!(params->tooSlowW > 1.0)) {
-        // The ratio is handed in (the declared value lives in cpp/neuralnet/tunestats.h), so this is the
-        // one place that can catch a caller passing something that is not a drop ratio at all.  A ratio of
-        // 1 or less means "anything that is not faster than the anchor is out": nearly every candidate is
-        // discarded and the exclusion -- not the measurement -- would decide the comparison.  Written as
-        // `!(x > 1.0)` on purpose: that form also catches a NaN, which a `<=` test would let through.
-        return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
-                      "tooSlowW is " + std::to_string(params->tooSlowW) + ", which is not a usable drop "
-                      "ratio: it must be greater than 1, because a value of 1 or less discards every "
-                      "candidate that is not faster than the anchor and the exclusion, not the "
-                      "measurement, would decide the comparison");
-    }
     if (params->reps < 2) {
         // The plan's hard calibration floor, not a convenience: one block per object has no scale
         // (section 2.3's MAD and the A/A sentinel both need >= 2 points) and t_block_hot is a median of
@@ -22325,9 +22313,10 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
     // section 2.6, so a slot whose candidate could not be built has to make the flag FALSE
     // rather than leave the denominator unmeasured-and-silent.
     std::vector<double> anchor_median(params->nShapes, 0.0);
-    // The per-slot median of the MEASURED blocks, kept because the `too-slow` exclusion below is decided
-    // from completed blocks only.  It is the same median the spike detector was handed for that slot, not
-    // a second derivation of it, so the two cannot disagree about what a slot's "typical" block is.
+    // The per-slot median of the MEASURED blocks, kept for the block-relative normaliser below, which
+    // divides each shape's paired differences by that shape's own anchor median.  It is the same median
+    // the spike detector was handed for that slot, not a second derivation of it, so the two cannot
+    // disagree about what a slot's "typical" block is.
     std::vector<double> slot_median((size_t) params->nShapes * (size_t) params->nObjects, 0.0);
 
     uint32_t samples_written = 0;
@@ -22378,70 +22367,6 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
         }
     }
 
-    // ---- the POST-HOC `too-slow` exclusion (w4e-preview.md R-27) ---------------------------------
-    //
-    // The criterion and its W are section 2.6's; only the TIMING changed.  Every legal pair has already
-    // run its full budget above and the exclusion is applied to the completed matrix, so (i) nothing was
-    // decided from a PREFIX of the data -- the sequential bias an early stop carries is gone by
-    // construction rather than merely reduced -- and (ii) the grid does not move: only the judgeable set
-    // does.  The two readings a reader needs are printed by the line below, and the shell plan's rule
-    // ("too-slow joins the denominator, leaves the numerator, gates") is what the subtraction at
-    // `pairs_complete` then executes.
-    //
-    // The denominator is THAT SHAPE's own stock anchor median, from the same reps.  `t_block_hot_us` is
-    // deliberately NOT used as it: it is taken from the heaviest shape, so on a light shape it would be a
-    // far too large divisor and the criterion would silently stop dropping anything.
-    uint32_t dropped_too_slow = 0;
-    for (uint32_t s = 0; s < params->nShapes; s++) {
-        const size_t anchor_slot = (size_t) s * params->nObjects + anchor_index;
-        // THE REFERENCE GUARD, and it is not decoration: if the anchor has fewer than two measured blocks
-        // on this shape -- it never came up in the rotation, its own pipeline failed to build, or a stall
-        // cut the run short -- then a MISSING reference read as zero would make `median(cand) > W * 0`
-        // true for every candidate, drop the whole shape and turn the measurement into a silent
-        // `no-winner`.  The fail-closed answer is "do not judge this shape", the same shape as the
-        // "candidate was never built" skip above.  The post-hoc form removes the early-stop CAUSE of a
-        // missing reference, not the state itself (R-27's review correction).
-        if (slot_median[anchor_slot] <= 0.0) {
-            continue;
-        }
-        uint32_t anchor_blocks = 0;
-        for (uint32_t r = 0; r < params->reps; r++) {
-            if (block_measured[anchor_slot * (size_t) params->reps + r] != 0) {
-                anchor_blocks++;
-            }
-        }
-        if (anchor_blocks < 2) {
-            continue;   // one block is not a scale: a median over a single point is that point
-        }
-        const double t_stock = slot_median[anchor_slot];
-        for (uint32_t o = 0; o < params->nObjects; o++) {
-            if (o == anchor_index || params->objects[o].stock) {
-                continue;   // only a CANDIDATE is dropped: a stock entry is an arm (the A/A sentinel too)
-            }
-            const size_t slot = (size_t) s * params->nObjects + o;
-            if (pair_legal[slot] == 0) {
-                continue;   // not in the denominator at all (the routing predicate already ruled it out)
-            }
-            if (block_measured[slot * (size_t) params->reps] == 0) {
-                continue;   // never measured: that is the build-failure bucket, not this one
-            }
-            const double t_cand = slot_median[slot];
-            if (!(t_cand > params->tooSlowW * t_stock)) {
-                continue;   // "not slower" is the DEFAULT: a zero or NaN reading must not become a drop
-            }
-            // At most once per pair: this loop visits each (shape, object) exactly once, and the evidence
-            // for the drop is this line -- both medians, their ratio and the W that was applied -- so the
-            // decision can be re-derived from the log alone.  It is LOUD and unconditional: a pair leaving
-            // the judgeable set is a fact about the run, not optional per-block evidence.
-            dropped_too_slow++;
-            ggml_vk_t3_line("probe too-slow: shape=" + std::to_string(s) + " candidate="
-                            + std::to_string(params->objects[o].rowIndex)
-                            + " median_cand_us=" + std::to_string((uint64_t) t_cand)
-                            + " median_stock_us=" + std::to_string((uint64_t) t_stock)
-                            + " ratio=" + std::to_string(t_cand / t_stock)
-                            + " too_slow_w=" + std::to_string(params->tooSlowW));
-        }
-    }
 
     // The paired differences, in the DENSE slot layout the caller already knows: index
     // (shape * nObjects + object) * reps + rep.  A slot whose object IS the anchor stays NaN (there is
@@ -22457,10 +22382,10 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
     // than allowed to report that as a verdict.  This write is what unparking it waits for.
     //
     // THE DIVISOR is that shape OWN anchor median: the same quantity, and the same `> 0` plus `>= 2
-    // measured blocks` guard, that the `too-slow` rule above already divides by -- one scale for both
-    // rules.  The alternative (hand over microseconds and let the caller convert) was rejected on
-    // evidence: the per-shape anchor median has no other outlet (`t_block_hot_us` is the HEAVIEST shape,
-    // and the `too-slow` comment above rejects it as a divisor because it is far too large on a light
+    // measured blocks` guard the normaliser below applies -- one scale for the whole write.  The
+    // alternative (hand over microseconds and let the caller convert) was rejected on evidence: the
+    // per-shape anchor median has no other outlet (`t_block_hot_us` is the HEAVIEST shape, and using it
+    // as the divisor was rejected because it is far too large on a light shape -- the OPTIMISTIC
     // shape -- the OPTIMISTIC direction), and a caller dividing by a quantity of its own choosing would be
     // a second spelling of the scale.
     for (uint32_t s = 0; s < params->nShapes; s++) {
@@ -22469,8 +22394,8 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
             continue;   // cannot happen (the anchor is legal and needs no pipeline), and skipping is
                         // safer than reading uninitialised block times if it ever does
         }
-        // The guard is re-stated here rather than shared with the `too-slow` loop above because the two
-        // ask different questions of it: that one asks "may this pair be compared at all", this one asks
+        // The one place a scale's existence is decided: "may this shape's difference be EXPRESSED in
+        // units of its own stock block".
         // "may this shape's difference be EXPRESSED in units of its own stock block".  What they must not
         // do is disagree about when a scale exists -- so the predicate is the same two conditions, and an
         // anchor without one leaves the shape's slots at NaN (the caller's `ci_missing` counts it) with a
@@ -22525,15 +22450,11 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
         }
     }
 
-    // `pairs_complete`: every legal pair of every covered shape produced a FULL budget AND is still
-    // judgeable.  It is an equality between two counts rather than a flag somebody sets, and its
-    // denominator cannot be empty without the call having refused above ("no legal pair").
-    //
-    // The SUBTRACTION is the whole of the `too-slow` drop's effect on the accounting (R-27): a pair that
-    // ran its budget and was then excluded is no longer judgeable, so this flag goes false, `no-gain` is
-    // suppressed and the run cannot be reported as "measured, no gain".  One subtraction, no new state --
-    // and a wrapped difference could only ever make the equality FAIL, which is the fail-closed side.
-    const bool pairs_complete = (pairs_measured - dropped_too_slow == pairs_legal);
+    // `pairs_complete`: every legal pair of every covered shape produced a FULL budget.  It is an
+    // equality between two counts rather than a flag somebody sets, and its denominator cannot be empty
+    // without the call having refused above ("no legal pair").  A build failure keeps a pair in the
+    // denominator, so it makes this flag FALSE rather than leaving it unaccounted for.
+    const bool pairs_complete = (pairs_measured == pairs_legal);
 
     if (result != nullptr) {
         result->st = VK_TUNE_PROBE_OK;
@@ -22542,15 +22463,6 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
         result->blocks = blocks_timed;
         result->samples = samples_written;
         result->spikes = spikes;
-        // The count the exclusion above produced: section 2.6's third bucket, reported rather than folded
-        // into the flag, so that "nothing was slow" and "two pairs were excluded" are different readings.
-        // ✅ Its consumer in the DECISION layer LANDED in R-28 step (3): `CANDIDATE_DROPS[]`'s `too-slow`
-        // item is paired with `Decision::droppedTooSlow`, `noteMeasurementAccounting()` is the one place a
-        // result enters a decision, and the suppression loud is BUILT from that table -- so this count can
-        // no longer be read only by the primitive.  What is still owed is the PRODUCTION filler (a real
-        // probe result reaching a Decision), which goes with the probe's own production caller; that half
-        // stays registered, the same shape as R-11's `pairs_illegal`.
-        result->dropped_too_slow = dropped_too_slow;
         result->dropped_build_failed = build_failed;
         result->pairs_complete = pairs_complete;
         // COVERAGE IS NOT THIS FUNCTION'S TO ANSWER, and this line is an ECHO rather than a judgement: the
@@ -22584,9 +22496,7 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
                     + std::to_string(params->reps) + " pairs_legal=" + std::to_string(pairs_legal)
                     + " pairs_illegal=" + std::to_string(pairs_illegal) + " pairs_measured="
                     + std::to_string(pairs_measured) + " pairs_complete="
-                    + std::string(pairs_complete ? "1" : "0") + " dropped_too_slow="
-                    + std::to_string(dropped_too_slow) + " too_slow_w="
-                    + std::to_string(params->tooSlowW) + " samples="
+                    + std::string(pairs_complete ? "1" : "0") + " samples="
                     + std::to_string(samples_written) + " blocks=" + std::to_string(blocks_timed)
                     + " spikes=" + std::to_string(spikes) + " band=["
                     + std::to_string(params->spikeBandLo) + "," + std::to_string(params->spikeBandHi)

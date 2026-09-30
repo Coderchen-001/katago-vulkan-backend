@@ -473,24 +473,6 @@ namespace VulkanTuner {
                  "SAMPLED geometries were rejected, so the coarse outcome 'structural-all-reject' is "
                  "recorded WITHOUT a durable verdict (t3-shell-plan.md F17)";
         } },
-      { "no-prune-in-effect", [](const Decision & x) { return x.pruneExcluded.empty(); },
-        [](const Decision & x) {
-          // W4b.  🔴 It NAMES the rules that bit, one by one.  A refusal that only said "a prune was
-          // in effect" would send the next reader to the rule table to guess which one; the W3b
-          // lesson is that a refusal has to point at the clause that owns it.  The distinction the
-          // sentence carries is the whole reason this condition exists: a MUST rule rejects a
-          // configuration already proven unusable, while a PRUNE rule only says "not worth trying",
-          // so only the latter can make "nothing here works" false.
-          string names;
-          for (size_t i = 0; i < x.pruneExcluded.size(); i++) {
-            names += (i ? ", " : "") + x.pruneExcluded[i];
-          }
-          return "a PRUNE rule (not a MUST rule) excluded " + to_string(x.pruneExcluded.size())
-               + " candidate(s) from the set this run searched [" + names
-               + "]: a prune is 'legal but not worth trying', so 'nothing in the domain works' is "
-                 "NOT established -- the coarse outcome 'structural-all-reject' is recorded WITHOUT a "
-                 "durable verdict (w4b-preview section 1.7)";
-        } },
     };
 
     // Fail-closed lookup: an unknown name is never satisfied AND has no sentence to quote, so a typo
@@ -577,11 +559,27 @@ namespace VulkanTuner {
       return out;
     }
 
+    // The effect column of this decision's outcome row, by name (`nullptr` for an outcome this build
+    // does not know -- the same fail-closed shape as `outcomeWritable`).  FORWARD DECLARED because this
+    // gate is its first reader; the definition sits with the table, so the column has exactly ONE
+    // reader and cannot drift between the gate, the writer and the self-test.
+    const char * declaredEffectFor(const Decision & d);
+
     bool cacheEntryWritable(const Decision & d) {
       // W2: the gate now asks about the rows this process may actually WRITE (the durable per-row set
       // when an install happened, the declared set otherwise) -- the SAME helper the formatter uses, so
       // "there is something to write" and "here is what gets written" cannot disagree.
       if (!rowsForWrite(d).empty()) {
+        return true;
+      }
+      // 🔴 ONE CACHE FORM (2026-09-30 ruling; option D landed): an EMPTY ROW SET is a durable
+      // artifact in its own right -- "this key was measured, and the stock configuration is the best
+      // this device has" -- so an outcome whose row declares the effect `rows` may write `ROWS 0`.
+      // The TABLE decides, not this function: a `negative:` row still needs its marker, and a
+      // `nothing:` row is not admitted by this arm.  The completeness gate asks THIS predicate
+      // (firstUnconcludedKind), so "may write" and "is complete" cannot disagree about an empty set.
+      const char * effect = declaredEffectFor(d);
+      if (effect != nullptr && string(effect) == "rows") {
         return true;
       }
       return d.negative && negativeReasonKnown(d.negativeReason);
@@ -630,9 +628,8 @@ namespace VulkanTuner {
       // The EXTRA conditions on top of `writable`, as a comma-separated LIST from the closed set in
       // `CONDITION_SPECS`: "" = none, "device-only" = every rejection reason must be a device property
       // (G-D20), "measured-here" = the candidate set must be this process's own measurement (W3-P1),
-      // "swept-here" = it must cover the declared domain rather than a sampling surface (W4b),
-      // "no-prune-in-effect" = no PRUNE rule may have excluded a candidate from what was searched
-      // (W4b).  They live in the table on purpose -- a condition expressed as a branch on `klass`, or as
+      // "swept-here" = it must cover the declared domain rather than a sampling surface (W4b).
+      // They live in the table on purpose -- a condition expressed as a branch on `klass`, or as
       // a clause inside one of the gates, would let a rename or a refactor silently change what may be
       // written, which is the "implicit knowledge in a branch" the first design rule bans.  The
       // writer reports the FIRST named condition that does not hold, so a refusal names its clause.
@@ -653,31 +650,33 @@ namespace VulkanTuner {
     };
     const DecisionOutcomeSpec DECISION_OUTCOMES[] = {
       // A structural all-reject is a KIND-LEVEL, STICKY claim ("this key has no injectable slot"), so
-      // it needs all four: the reasons must be about the DEVICE (device-only), the candidate set must
-      // be OURS (measured-here), it must be a SWEEP rather than a sample (swept-here), and no PRUNE
-      // may have narrowed what we searched (no-prune-in-effect).  The last two are ORTHOGONAL to the
-      // first two -- who produced the set, and how completely it was searched, are different
-      // questions -- and W4b's measured answer is that this build can satisfy neither tonight: the
-      // catalogue is a sampling surface, so no durable all-reject verdict is reachable yet.
-      { "structural-all-reject", "structural",  true,  "device-only,measured-here,swept-here,no-prune-in-effect", "negative:no-injection-slot" },
-      // A completed measurement writes ROWS, not a verdict about what does not exist.  The two W4b
-      // conditions are named here TOO, deliberately: the coverage question is not about the outcome
-      // name but about the candidate set, and leaving them off this row would mean an unmarked or
-      // pruned run could write rows as if the set had been swept -- the same silent drift, one row
-      // over.  Today this row cannot fire either (nothing installs a row yet); it is what keeps the
-      // rule attached to the SET rather than to one outcome's spelling.
-      { "measured",              "completed",   true,  "measured-here,swept-here,no-prune-in-effect",            "rows" },
-      // 🆕 (7d) BRANCH (2) THE HARD NEGATIVE CONCLUSION.  It is declared here with its PRODUCER in the same
-      // batch (section 2.3: an OUTCOME name may never precede the code that can set it), its class is
-      // `completed` -- a measurement that finished -- and its durable effect is the `no-gain` NEGATIVE
-      // entry, NOT a row set.  That last part is exactly what the old class-only fixture selector could
-      // not see (it would have exercised this row with a rows fixture), which is why the effect column
-      // and the fixture dispatch land together.
+      // it needs all three: the reasons must be about the DEVICE (device-only), the candidate set must
+      // be OURS (measured-here), and it must be a SWEEP rather than a sample (swept-here).  The last
+      // two are ORTHOGONAL to the first -- who produced the set, and how completely it was searched,
+      // are different questions.
+      { "structural-all-reject", "structural",  true,  "device-only,measured-here,swept-here", "negative:no-injection-slot" },
+      // A completed measurement writes ROWS, not a verdict about what does not exist.  The W4b coverage
+      // condition is named here TOO, deliberately: the question is not about the outcome name but about
+      // the candidate set, and leaving it off this row would mean an unmarked run could write rows as if
+      // the set had been swept -- the same silent drift, one row over.  Today this row cannot fire
+      // either (nothing installs a row yet); it is what keeps the rule attached to the SET rather than
+      // to one outcome's spelling.
+      { "measured",              "completed",   true,  "measured-here,swept-here",            "rows" },
+      // 🆕 (7d) BRANCH (2): THE COMPLETED MEASUREMENT THAT FOUND NO WINNER.  It is declared here with
+      // its PRODUCER in the same batch (section 2.3: an OUTCOME name may never precede the code that can
+      // set it) and its class is `completed` -- a measurement that finished.
+      // 🔴 ITS DURABLE EFFECT IS `rows`, AND THE ROW SET IS EMPTY (2026-09-30 ruling: ONE cache form,
+      // "the complete set of this machine's best parameters").  "No candidate is not-worse than stock" IS
+      // an answer -- it says "use the stock configuration everywhere" -- and `ROWS 0` plus its
+      // ROWSET_HASH is how that answer is written; the durable NEGATIVE entry it used to write was the
+      // SECOND cache form the ruling deletes.  That is exactly what the old class-only fixture selector
+      // could not see (it would have exercised this row with a rows fixture), which is why the effect
+      // column and the fixture dispatch land together.
       // Its conditions are the ones a WHOLE-KEY negative claim needs: this process measured the set
-      // (measured-here) and the set is a sweep rather than a sample (swept-here) with no PRUNE rule
-      // having narrowed it (no-prune-in-effect) -- the same three the `measured` row carries, because
-      // the coverage question belongs to the SET, not to the outcome spelling.
-      { "measured-no-gain",      "completed",   true,  "measured-here,swept-here,no-prune-in-effect",            "negative:no-gain" },
+      // (measured-here) and the set is a sweep rather than a sample (swept-here) -- the same two the
+      // `measured` row carries, because the coverage question belongs to the SET, not to the outcome
+      // spelling.  The PRUNE condition that used to be the third is gone with the layer (option D).
+      { "measured-no-gain",      "completed",   true,  "measured-here,swept-here",            "rows" },
       // R-28 step (2): THE ONE ROW WHOSE FLAG IS TRUE AND WHOSE CLASS IS `gate`.  It carries
       // `measured-here` for the same reason the rows above do (W3-P1): what a gate refusal remembers --
       // "this device's block times spike too often for the comparison to be trusted" -- is a claim
@@ -871,7 +870,7 @@ namespace VulkanTuner {
       }
       // (7e-1) THE NORMALISER EXISTS NOW, so nothing is parked here any more.  The ruling was option (i):
       // the primitive writes `d_out` block-relative (that shape own anchor median as the divisor, with the
-      // `too-slow` guard), which is the unit `TOLERANCE` lives in -- so the interval verdicts below run
+      // `> 0` and `>= 2` measured-block guard), which is the unit `TOLERANCE` lives in -- so the interval verdicts below run
       // unconditionally and `units_missing` is gone from this layer line.  The third path (derive the scale
       // from the measured differences) was REJECTED and is registered, because it degenerates exactly on the
       // two cases this layer judges: `median(d)` is ~0 for the A/A sentinel (the divisor blows up) and
@@ -1055,9 +1054,9 @@ namespace VulkanTuner {
     // section 2.6(a), restated in t3-shell-plan.md:442): a DETERMINISTIC rejection -- `illegal` (the rule
     // table says this geometry cannot exist) or `unsupported` (this device/family cannot build it) --
     // never entered the denominator at all, because the candidate was never going to be compared; an
-    // ACCIDENTAL or budget-shaped one (`too-slow`, `build-failed`) did enter it, so it LEAVES the
-    // judgeable set and has to be counted.  The two names below are therefore the GATING set, and their
-    // counts are what the suppression loud prints.
+    // ACCIDENTAL or budget-shaped one (`build-failed`) did enter it, so it LEAVES the judgeable set and
+    // has to be counted.  The name below is therefore the GATING set, and its count is what the
+    // suppression loud prints.
     //   🔴 `illegal` IS NOT A MEMBER, and that is the rule rather than an omission: folding it in would
     //   make "the denominator shrank because our own rule table refused everything" look like "we measured
     //   what we set out to measure" -- the false green section 2.6(a) warns about.  Its count lives on the
@@ -1072,7 +1071,7 @@ namespace VulkanTuner {
       uint32_t Decision::*count;
     };
     const CandidateDropSpec CANDIDATE_DROPS[] = {
-      { "too-slow",     &Decision::droppedTooSlow },
+
       { "build-failed", &Decision::droppedBuildFailed },
     };
 
@@ -1102,7 +1101,7 @@ namespace VulkanTuner {
     void noteMeasurementAccounting(Decision & d, const vk_tune_probe_result & r,
                                    uint32_t enumeratedCandidates, uint32_t measuredCandidates) {
       d.pairsComplete = r.pairs_complete;
-      d.droppedTooSlow = r.dropped_too_slow;
+
       d.droppedBuildFailed = r.dropped_build_failed;
       d.candidatesMeasured = measuredCandidates;
       d.candidatesEnumerated = enumeratedCandidates;
@@ -1271,7 +1270,7 @@ namespace VulkanTuner {
           cp.seed = TuneStats::PROBE_ROTATION_SEED;
           cp.spikeBandLo = TuneStats::SPIKE_BAND_LO;
           cp.spikeBandHi = TuneStats::SPIKE_BAND_HI;
-          cp.tooSlowW = TuneStats::TOO_SLOW_W;
+
           std::vector<double> confD((size_t) cp.nObjects * (size_t) cp.reps, 0.0);
           vk_tune_probe_result cres {};
           // ⚠️ NOT named `cerr`: the guardrail that pins "the shell writes its lines through `logLine`"
@@ -1354,18 +1353,27 @@ namespace VulkanTuner {
                   "nothing won and no durable verdict is written (A2: missing evidence is not evidence)");
         return;
       }
-      // ② THE HARD NEGATIVE CONCLUSION: every covered shape had every legal pair measured and no
-      //    candidate is not-worse.  This is the ONE place that mints `no-gain`, and the reason string is
-      //    the same one the outcome table declares as this row's durable effect.
+      // ② THE HARD CONCLUSION: every covered shape had every legal pair measured and no candidate is
+      //    not-worse.  The durable answer is the EMPTY ROW SET (`ROWS 0`), which is why this branch sets
+      //    NO marker: with ONE cache form there is nothing else this key could remember (2026-09-30).
       d.outcome = "measured-no-gain";
-      d.negative = true;
-      d.negativeReason = "no-gain";
-      d.negativeScope.clear();
-      d.negativeScope.push_back("mm");
-      d.negativeOrigin = Decision::NegativeOrigin::NoGain;
       logLine("NOTICE: " + d.deviceName + ": measured, no gain: every legal pair of every covered shape "
               "was measured and no candidate is not-worse than stock, so the durable verdict for this key "
-              "is the `no-gain` negative entry (sticky until the key changes); no row set is written");
+              "is the EMPTY ROW SET (`ROWS 0` with its ROWSET_HASH: use the stock configuration "
+              "everywhere), which is the one cache form this build writes");
+    }
+
+    // The effect column, read by NAME (see the forward declaration above the write gate).  ONE reader
+    // for the three askers -- the write gate (may an empty row set be written?), the writer (what to
+    // emit) and the self-test (does each row's fixture hold the row's own effect?) -- so the column
+    // cannot drift.
+    const char * declaredEffectFor(const Decision & d) {
+      for (const DecisionOutcomeSpec & o : DECISION_OUTCOMES) {
+        if (d.outcome == o.outcome) {
+          return o.effect;
+        }
+      }
+      return nullptr;
     }
 
     // Does a decision really hold the durable effect its outcome row declares?  The effect column is
@@ -1375,7 +1383,11 @@ namespace VulkanTuner {
     bool effectMatches(const Decision & d, const char * effect) {
       const string e = effect;
       if (e == "rows") {
-        return !d.negative && !rowsForWrite(d).empty();
+        // `rows` = "the durable artifact is this decision's row set"; with ONE CACHE FORM that includes
+        // the EMPTY set (`ROWS 0`: measured, and stock is the best this device has).  So the question is
+        // whether the row set may be written at all -- the write gate's own question, ASKED rather than
+        // re-spelled, so the column and the writer cannot disagree.
+        return !d.negative && cacheEntryWritable(d);
       }
       if (e.rfind("negative:", 0) == 0) {
         return d.negative && d.negativeReason == e.substr(string("negative:").size());
@@ -1472,13 +1484,19 @@ namespace VulkanTuner {
     const uint32_t CM2_BS_VALUES[]      = { 128, 256 };
     const uint32_t CM2_BM_VALUES[]      = { 32, 64, 128 };
     const uint32_t CM2_BN_VALUES[]      = { 64, 128, 256 };
-    const uint32_t CM2_BK_VALUES[]      = { 64, 128 };
+    // 🔴 OPTION D (2026-09-30 ruling 1): the cm2 BK axis DECLARES {64} only.  This declaration IS the
+    // old C4-BK exclusion -- the rule that said it (and the PRUNE ledger that counted it) is deleted, so
+    // the measured exclusion lives here, with its evidence: BK=128 is LEGAL (stock itself builds
+    // `s_warptile_mmq` with BK=128) but measured 33 ms pathological vs 1579.8 us at BK=64
+    // (census-t05-shapes.md section 4.4, mm total).  Trying it cannot change "the best", so the search
+    // domain is 36 geometries, not 72.  Re-open it only by re-running that BK sweep on this device.
+    const uint32_t CM2_BK_VALUES[]      = { 64 };
     const uint32_t CM2_SMALLER_VALUES[] = { 0, 1 };
     const AxisDomain CM2_DOMAIN[] = {
       { "BS",      VK_TILE_AXIS_BS,      CM2_BS_VALUES,      2 },
       { "BM",      VK_TILE_AXIS_BM,      CM2_BM_VALUES,      3 },
       { "BN",      VK_TILE_AXIS_BN,      CM2_BN_VALUES,      3 },
-      { "BK",      VK_TILE_AXIS_BK,      CM2_BK_VALUES,      2 },
+      { "BK",      VK_TILE_AXIS_BK,      CM2_BK_VALUES,      1 },
       { "smaller", VK_TILE_AXIS_SMALLER, CM2_SMALLER_VALUES, 2 },
     };
     const size_t CM2_DOMAIN_SIZE = sizeof(CM2_DOMAIN) / sizeof(CM2_DOMAIN[0]);
@@ -1695,19 +1713,7 @@ namespace VulkanTuner {
     // comment cannot be checked, and R44's second clause has to be able to say "the declared values
     // satisfy the candidate table's verdicts".
     //
-    // THE TWO DIRECTIONS ARE NOT THE SAME CLAIM, and conflating them is what makes a negative entry
-    // false.  A MUST rule names a configuration ALREADY PROVEN unusable (it does not build, or it
-    // computes the wrong answer) -- excluding it cannot make "nothing in this domain works" false.  A
-    // PRUNE rule means "legal, but not worth trying", so every PRUNE that really BITES narrows what we
-    // searched and weakens the verdict; that is what `pruneExcluded` records and what the
-    // `no-prune-in-effect` condition reads.
     //
-    //   C4 (t1-predicate.md:105, measured in census-t05-shapes.md section 4.4): the BK axis's useful
-    //     values are {64} on cm2's stock geometry.  BK=128 is LEGAL (the predicate accepts it, and stock
-    //     itself builds `s_warptile_mmq` with BK=128) but it measured 33 ms pathological vs 1579.8 us at
-    //     BK=64 -- a PERFORMANCE verdict, therefore PRUNE, and its exclusion is the ledger's first real
-    //     entry.  "Unlock it" needs one experiment: a BK sweep on THIS device with this geometry, i.e.
-    //     re-run census-t05-shapes.md section 4.4 the day somebody suspects BK matters here.
     //   E1 (t1-predicate.md:136): `WM == 16 && WN == 16 && BS >= 256` HUNG THE DRIVER, and the custom:
     //     parser lets it through.  A MUST rule (an unusable configuration), and it is already covered by
     //     "skip that combination" rather than by vk_tile_candidate_reason -- which is exactly why it has
@@ -1745,25 +1751,17 @@ namespace VulkanTuner {
       const char* name;
       const char* kind;
       RuleShape shape;
-      const char* axis;    // the axis fieldA names; the exclusion sentence says which value was dropped
+      const char* axis;    // the axis fieldA names; the refusal sentence says which value was dropped
       AxisValueRule values;      // shape == AxisValue
       ForbiddenCombo combo;      // shape == ForbiddenCombo
-      bool prune;          // true = "legal but not worth trying"; false = MUST
       const char* evidence;  // where the verdict comes from
-      const char* unlock;    // what experiment would lift it (PRUNE entries must name one)
     };
-    const int C4_BK_ALLOWED[] = { 64 };
     const CandidateRule CANDIDATE_RULES[] = {
-      { "C4-BK", "mm", RuleShape::AxisValue, "BK", { C4_BK_ALLOWED, 1 }, { nullptr }, true,
-        "census-t05-shapes.md section 4.4: mm total 64=1579.8us vs 128=2792.2us with 33 ms pathological "
-        "samples (BK=128 legal, just not worth trying)",
-        "re-run the BK sweep of census-t05-shapes.md section 4.4 on this device" },
       { "E1-blacklist", "mm", RuleShape::ForbiddenCombo, nullptr, { nullptr, 0 },
-        { vk_tile_e1_blacklist_hit }, false,
+        { vk_tile_e1_blacklist_hit },
         "t1-predicate.md:136 (E1): WM==16 && WN==16 && BS>=256 hung the driver, and the custom: "
         "validation lets it through; the boundary lives in vulkan-tile-validity.h so that this table "
-        "and the backend's install firewall (ggml_vk_tuned_row_capability_reason) cannot drift",
-        nullptr },
+        "and the backend's install firewall (ggml_vk_tuned_row_capability_reason) cannot drift" },
     };
     const size_t CANDIDATE_RULE_COUNT = sizeof(CANDIDATE_RULES) / sizeof(CANDIDATE_RULES[0]);
 
@@ -1772,7 +1770,6 @@ namespace VulkanTuner {
     struct Candidate {
       vk_tile_geometry geom;
       bool legal;
-      string exclusion;   // empty = no PRUNE rule bit; otherwise the candidate-level exclusion sentence
     };
 
     bool axisValueAllowed(const int* values, size_t n, int v) {
@@ -1802,26 +1799,13 @@ namespace VulkanTuner {
       return 0;
     }
 
-    // The candidate-table verdicts for ONE geometry, into the out-parameters the catalogue carries.
-    //   `pruneName`  non-empty <=> a PRUNE rule rejected it.  The LEDGER entry (the rule's own name:
-    //                "which rule bit" is the question the `no-prune-in-effect` sentence answers).
-    //   `pruneDetail` the candidate-level sentence ("... excludes BK=128"): which VALUE it dropped, which
-    //                is what a reader needs in the log.
-    //   `mustName`   non-empty <=> a MUST rule rejected it.  An unusable configuration, not a preference.
-    // 🔴 `resolution` says whether the geometry is ADMISSIBLE, and it is a separate out-parameter for a
-    // reason this batch paid for: the first version returned `mustName.empty()`, so a PRUNE rule set
-    // `pruneName` and the function still said "fine".  The ledger filled up while 36 pre-defined
-    // candidates sailed through the gate they had just been excluded by -- and NOTHING in the line could
-    // tell that apart from "no rule bit".  Both directions now come out of ONE function, so the two
-    // readers (the ledger and the skip) cannot disagree.
-    //   "admissible" = admitted by the MUST rules AND not excluded by a PRUNE rule.  A MUST violation is
-    //   NOT an exclusion: it is unusable, so it belongs in neither the ledger nor the candidate set.
-    enum class RuleResolution { Admissible, ExcludedByPrune, RejectedByMust };
+    // The candidate-table verdict for ONE geometry.  `mustName` non-empty <=> a MUST rule rejected it:
+    // an unusable configuration, not a preference.  The MUST violation is NOT an exclusion -- it is
+    // unusable, so it belongs in neither the candidate set nor any ledger (the PRUNE direction and its
+    // ledger are deleted: option D, 2026-09-30 ruling 1).
+    enum class RuleResolution { Admissible, RejectedByMust };
 
-    RuleResolution candidateRuleVerdict(int rulePath, const vk_tile_geometry& g, string& pruneName,
-                                        string& pruneDetail, string& mustName) {
-      pruneName.clear();
-      pruneDetail.clear();
+    RuleResolution candidateRuleVerdict(int rulePath, const vk_tile_geometry& g, string& mustName) {
       mustName.clear();
       for (size_t i = 0; i < CANDIDATE_RULE_COUNT; i++) {
         const CandidateRule& r = CANDIDATE_RULES[i];
@@ -1833,13 +1817,7 @@ namespace VulkanTuner {
           if (v == 0 || axisValueAllowed(r.values.allowed, r.values.count, v)) {
             continue;
           }
-          if (r.prune) {
-            pruneName = r.name;
-            pruneDetail = string(r.name) + " excludes " + r.axis + "=" + to_string(v);
-          }
-          else {
-            mustName = r.name;
-          }
+          mustName = r.name;
         }
         else if (r.shape == RuleShape::ForbiddenCombo) {
           // The verdict comes from the SHARED predicate, and so does the sentence (the firewall
@@ -1847,9 +1825,7 @@ namespace VulkanTuner {
           // speak: rule names and axis values, which are this table's business.  `ruleAxisValue` is
           // still used for that -- an axis this build does not know returns 0, which is why the
           // readout is spelled as the raw numbers rather than as a claim about why they are wrong.
-          const int a = ruleAxisValue(g, "WM");
-          const int b = ruleAxisValue(g, "WN");
-          const int c = ruleAxisValue(g, "BS");
+
           // The path is not in the geometry: the catalogue is a per-family walk, and the family's
           // own path is what the shared predicate needs to ask the axis table whether these are
           // row-settable axes at all.  Passed in rather than assumed, so a cm2 catalogue walk cannot
@@ -1857,23 +1833,11 @@ namespace VulkanTuner {
           if (r.combo.hit == nullptr || !r.combo.hit(rulePath, g)) {
             continue;
           }
-          if (r.prune) {
-            pruneName = r.name;
-            pruneDetail = string(r.name) + " excludes WM=" + to_string(a) + " WN=" + to_string(b)
-                        + " BS=" + to_string(c);
-          }
-          else {
-            mustName = r.name;
-          }
+          mustName = r.name;
         }
       }
-      // The MUST verdict wins: an unusable geometry is not "excluded by a preference", so a rule table
-      // that somehow hit both must not file it in the ledger.
       if (!mustName.empty()) {
         return RuleResolution::RejectedByMust;
-      }
-      if (!pruneName.empty()) {
-        return RuleResolution::ExcludedByPrune;
       }
       return RuleResolution::Admissible;
     }
@@ -1882,9 +1846,9 @@ namespace VulkanTuner {
     // product -- that is the probe's counting surface) and puts every preset through the REAL predicate and
     // then through the candidate table.  It builds nothing: no pipeline, no file, no measurement.
     //
-    // `d` receives the two facts the write side needs: `candidateCoverage` (HOW MUCH was searched) and
-    // `pruneExcluded` (which PRUNE rules really bit).  Both are set HERE and nowhere else, which is what
-    // makes them a property of the enumeration rather than of whoever calls it.
+    // `d` receives the fact the write side needs: `candidateCoverage` (HOW MUCH was searched).  It is set
+    // HERE and nowhere else, which is what makes it a property of the enumeration rather than of whoever
+    // calls it.
     vector<Candidate> runCandidateCatalog(Decision* d) {
       if (d != nullptr) {
         // 🔴 THE ONE SETTER of `candidateSearched` ((7a)).  At ENTRY, because the fact it records is "this
@@ -1913,12 +1877,6 @@ namespace VulkanTuner {
         for (size_t k = 0; k < sizeof(TUNE_KINDS) / sizeof(TUNE_KINDS[0]); k++) {
           scopeHere.push_back(TUNE_KINDS[k].name);
         }
-        // 🔴 THE LEDGER IS FILLED BY THE WALK BELOW, AND ONLY BY IT.  The first version of this looked at
-        // the DECLARED axis values as well ("does a rule reject a value this family declares") and that was
-        // wrong in a way worth recording: it made the ledger report an exclusion that had not narrowed the
-        // SEARCH, which is the one thing `no-prune-in-effect` exists to measure.  A rule "bites" exactly
-        // when it removes a candidate from the set this run considered -- and then that candidate is
-        // skipped, which is what the `continue` below encodes.
         // 🔴 THE SEARCH DOMAIN IS THE DECLARED DOMAIN -- (7f), 2026-09-29.  This walk used to enumerate
         // this family's three STOCK PRESET VECTORS (`CM2_PRESETS_*`), and the comment that stood here
         // argued that the Cartesian product was the wrong thing to search.  The ruling that changed it is
@@ -1938,32 +1896,16 @@ namespace VulkanTuner {
           Candidate c;
           c.geom = g;
           c.legal = false;
-          string pruneName, pruneDetail, mustName;
-          const RuleResolution verdict = candidateRuleVerdict(path, g, pruneName, pruneDetail, mustName);
+          string mustName;
+          const RuleResolution verdict = candidateRuleVerdict(path, g, mustName);
           if (verdict == RuleResolution::RejectedByMust) {
-            return;   // unusable: it belongs in neither the ledger nor the set this run searched
-          }
-          if (verdict == RuleResolution::ExcludedByPrune) {
-            // 🔴 THE LEDGER, and the candidate is SKIPPED in the same breath.  A rule "bites" exactly when
-            // it removes a candidate from the set this run considered -- so recording it and still
-            // considering the candidate would make `no-prune-in-effect` a statement about the table rather
-            // than about the search, which is the one thing it exists to measure.
-            if (d != nullptr) {
-              bool seen = false;
-              for (size_t k = 0; k < d->pruneExcluded.size(); k++) {
-                if (d->pruneExcluded[k] == pruneName) { seen = true; break; }
-              }
-              if (!seen) {
-                d->pruneExcluded.push_back(pruneName);
-              }
-            }
-            return;
+            return;   // unusable: it belongs in neither the candidate set nor the set this run searched
           }
           if (vk_tile_candidate_reason(path, g, vk_tile_wave_for(32)) != nullptr) {
             return;
           }
           c.legal = true;
-          c.exclusion = pruneDetail;
+
           out.push_back(c);
         };
         // The enumerated set, shape for shape, straight off the declared axis table (the same nesting
@@ -2006,9 +1948,8 @@ namespace VulkanTuner {
           d->rowSource = "measured";
           // 🔴 (7f): `swept`, and the claim is the one the write gate reads.  It is TRUE here by
           // construction rather than by assertion: the walk above enumerates `fam.axes` to exhaustion
-          // (every combination, no early exit), the only way to reach this line is that the M1 audit of
-          // that very domain passed, and a PRUNE that bites is recorded in the ledger instead of silently
-          // narrowing the set (`no-prune-in-effect` is then the second condition, separately checked).
+          // (every combination, no early exit), and the only way to reach this line is that the M1 audit
+          // of that very domain passed.
           // The old value was `sampled`, and it was right while the walk enumerated three stock vectors.
           d->candidateCoverage = "swept";
           // (7b) step 5: WHICH PATH these geometries belong to, recorded by the one function that knows
@@ -2037,8 +1978,6 @@ namespace VulkanTuner {
     }
 
     // The catalogue's own line (the probe above reports the DECLARED domain; this reports the SEARCH).
-    // Full lines only, never truncated: a dropped entry would read as "not excluded", which is the one
-    // direction this line must not fail in.
     string formatCandidateCatalog(const Decision& d, const vector<Candidate>& cands) {
       // The declared / post-rule pair PER FAMILY, recomputed from the declaration and the rule table
       // rather than stored, so the two numbers can never disagree with what they describe.  Per family
@@ -2046,7 +1985,7 @@ namespace VulkanTuner {
       // the LAST family's numbers against every family's name.
       size_t declaredCount[GEOMETRY_FAMILY_COUNT] = {};
       size_t postRuleCount[GEOMETRY_FAMILY_COUNT] = {};
-      size_t calls = 0, ruleRefused = 0, bkSurvived = 0, inconsistent = 0;
+      size_t calls = 0, inconsistent = 0;
       for (size_t f = 0; f < GEOMETRY_FAMILY_COUNT; f++) {
         const GeometryFamily& fam = GEOMETRY_FAMILIES[f];
         if (!fam.applicable || !tuneKindKnown(fam.kind)) {
@@ -2069,34 +2008,25 @@ namespace VulkanTuner {
                   g.BN      = fam.axes[2].values[v2];
                   g.BK      = fam.axes[3].values[v3];
                   g.smaller = (int) fam.axes[4].values[v4];
-                  string pruneName, pruneDetail, mustName;
+                  string mustName;
                   calls++;
                   // The path is the one this catalogue walks, spelled ONCE above it (both call sites
                   // pass it now): the shared ForbiddenCombo predicate needs it to ask the axis table
                   // whether WM/WN/BS are row-settable here, and a defaulted path would be a second
                   // answer to a question the caller already knows.
-                  const RuleResolution v = candidateRuleVerdict(VK_TILE_PATH_CM2, g, pruneName,
-                                                               pruneDetail, mustName);
-                  // 🔴 A PERMANENT cross-check, and it stays: this line's whole subject is "how much did
-                  // the rules take away", and the failure this batch hit was exactly a disagreement between
-                  // "a rule named a candidate" and "the candidate was skipped" (the first version's
-                  // `return mustName.empty()` admitted everything a PRUNE had just excluded, so the ledger
-                  // filled while the count did not move).  The two halves are asserted against EACH OTHER
-                  // here, offline, forever -- a rule table whose `prune` flag stops matching the skip is a
-                  // red line rather than a plausible-looking number.
-                  if (v == RuleResolution::ExcludedByPrune) {
-                    if (pruneName.empty()) { inconsistent++; }
-                    ruleRefused++;
-                    continue;
-                  }
+                  const RuleResolution v = candidateRuleVerdict(VK_TILE_PATH_CM2, g, mustName);
+                  // 🔴 A PERMANENT cross-check, and it stays.  The failure this batch hit was a
+                  // disagreement between "a rule named a geometry" and "the geometry was refused" (the
+                  // first version's `return mustName.empty()` admitted everything a PRUNE had just
+                  // excluded).  The verdict and its out-parameter are asserted against EACH OTHER here,
+                  // offline, forever, so a rule table that stops refusing what it names is a red line
+                  // rather than a plausible-looking number.
                   if (v == RuleResolution::RejectedByMust) {
                     if (mustName.empty()) { inconsistent++; }
-                    ruleRefused++;
                     continue;
                   }
-                  if (!pruneName.empty() || !mustName.empty()) { inconsistent++; }
-                  if (g.BK == 128) { bkSurvived++; }
-                  // `postRule` counts what survives the CANDIDATE TABLE, MUST and PRUNE alike -- it is the
+                  if (!mustName.empty()) { inconsistent++; }
+                  // `postRule` counts what survives the CANDIDATE TABLE -- it is the
                   // domain this build would be willing to build, before any question of provenance or
                   // coverage.  Counting only what the predicate also accepts would make this number equal
                   // to `legal` below and hide the effect of the rules, which is the one thing the pair
@@ -2128,25 +2058,16 @@ namespace VulkanTuner {
       // reusing the name here would make one token a count on one line and a flag on the other -- and
       // the two values (36 vs 1) never collide as strings, so no grep or criterion would report it.
       // It is the same class as `coverage=` (a string here, a 0/1 echo on the measurement line).
-      os << " candidates=" << cands.size() << " legal=" << legal
-         << " excluded=" << d.pruneExcluded.size() << " by-rule:";
-      if (d.pruneExcluded.empty()) {
-        os << " none";
-      }
-      else {
-        for (size_t i = 0; i < d.pruneExcluded.size(); i++) {
-          os << " " << d.pruneExcluded[i] << ";";
-        }
-      }
+      os << " candidates=" << cands.size() << " legal=" << legal;
       os << " coverage=" << d.candidateCoverage
          << " remaining=unknown (the format carries no coverage field; coverage IS remembered now that"
             " the search enumerates the declared domain, and the file's own conditions decide whether a"
             " row set or a marker may be written)";
       // The offline cross-check, on the SAME line so the two readings cannot be compared from different
-      // runs: `calls` = geometries the candidate table judged, `ruleRefused` = how many it took away, and
-      // `inconsistent` = 0 means the rule function's verdict and its out-parameters agreed every time.
-      os << " (postRule-check calls=" << calls << " ruleRefused=" << ruleRefused
-         << " bk128Admitted=" << bkSurvived << " inconsistent=" << inconsistent << ")";
+      // runs: `calls` = geometries the candidate table judged, and `inconsistent` = 0 means the rule
+      // function's verdict and its out-parameters agreed every time.
+      os << " (postRule-check calls=" << calls
+         << " inconsistent=" << inconsistent << ")";
       return os.str();
     }
 
@@ -2264,7 +2185,7 @@ namespace VulkanTuner {
     // change; these rows are simply no longer on it, because here the invalidation is automatic.
     //
     // WHAT BELONGS HERE: a value that changes what a DURABLE VERDICT means -- the spike gate and its
-    // band, the drop ratio, and the statistics the interval and the block definition are computed with.
+    // band, and the statistics the interval and the block definition are computed with.
     // What does NOT: the self-test's trial count (it changes no verdict), the rotation seed (it changes
     // the ORDER, which is already covered by the revision), and everything that is an env knob.
     struct PolicyConstantSpec {
@@ -2275,7 +2196,7 @@ namespace VulkanTuner {
       { "spike_rate_gate", std::to_string(TuneStats::SPIKE_RATE_GATE) },
       { "spike_band_lo",   std::to_string(TuneStats::SPIKE_BAND_LO)   },
       { "spike_band_hi",   std::to_string(TuneStats::SPIKE_BAND_HI)   },
-      { "too_slow_w",      std::to_string(TuneStats::TOO_SLOW_W)      },
+
       { "alpha",           std::to_string(TuneStats::ALPHA)           },
       { "tolerance",       std::to_string(TuneStats::TOLERANCE)       },
       { "min_block_ms",    std::to_string(TuneStats::MIN_BLOCK_TIME_MS) },
@@ -3128,8 +3049,15 @@ namespace VulkanTuner {
       return false;
     }
     if (!cacheEntryWritable(d)) {
-      err = "nothing to write: no rows and no negative entry (a file that says neither would "
-            "load as 'this key is already decided')";
+      // 🔴 ONE CACHE FORM (2026-09-30): "nothing to write" NO LONGER means "no rows and no negative
+      // entry" -- an EMPTY ROW SET is a durable artifact (`ROWS 0`), and `cacheEntryWritable` admits it
+      // for every outcome whose row declares the effect `rows`.  So this gate now fires only for an
+      // outcome whose declared effect is NOT a row set and which carries no provable negative entry:
+      // a state the table itself says cannot produce a file.  The predicate stays in this body on
+      // purpose (R16: the writer states its gates where it writes).
+      err = "nothing to write: this outcome's declared durable effect is not a row set and no provable "
+            "negative entry is carried (a file that says neither would load as 'this key is already "
+            "decided')";
       return false;
     }
     if (!allKindsConcluded(d)) {
@@ -3312,30 +3240,21 @@ namespace VulkanTuner {
     // a comment.  A named helper rather than inline assignments keeps the count a count of STATES
     // rather than of text occurrences.
     auto aMeasuredSet = [](Decision & x) { x.rowSource = "measured"; };
-    // W4b: the other two states the four-condition row needs, minted the same way.  They must be set
-    // EXPLICITLY even though their satisfying values are "swept" and "empty": `candidateCoverage` starts
-    // at the fail-closed "unknown" and `pruneExcluded` starts empty, so a fixture that only relied on the
-    // defaults would satisfy `no-prune-in-effect` for the wrong reason -- and the breaker for that
-    // condition (below) exists precisely because a condition whose default is "satisfied" is the one that
-    // can decay into a comment.
+    // W4b: the other state the remaining condition needs, minted the same way.  It must be set
+    // EXPLICITLY even though its satisfying value is "swept": `candidateCoverage` starts at the
+    // fail-closed "unknown", so a fixture that only relied on the default would satisfy `swept-here` for
+    // the wrong reason.
     auto aSweptSet = [](Decision & x) { x.candidateCoverage = "swept"; };
 
     // One breaker per condition NAME in the closed set: the refusing direction of a condition can only
     // be tested by making THAT condition false.  A name with no breaker returns false, and the caller
     // turns that into a FAIL rather than a skip -- an untestable condition is precisely what this loop
     // exists to prevent (a declared condition that nothing can falsify is a comment with a name).
-    // 🔴 W4b: `no-prune-in-effect` is the one condition whose SATISFYING direction is the DEFAULT (an
-    // empty ledger), so its breaker has to CONSTRUCT a non-empty one.  A breaker that merely cleared the
-    // vector would be a no-op on a fixture whose vector is already empty -- it would "test" the condition
-    // without ever falsifying it, which is the failure mode condition (b) of the mutation list is aimed at.
     auto breakCondition = [](const string & name, Decision & x) {
       if (name == "device-only")   { x.allRejectReasonsAreDevice = false; return true; }
       if (name == "measured-here") { x.rowSource = "none";                 return true; }
       if (name == "swept-here")    { x.candidateCoverage = "sampled";      return true; }
-      if (name == "no-prune-in-effect") {
-        x.pruneExcluded.push_back("C4-BK excludes BK=128");
-        return true;
-      }
+
       return false;
     };
 
@@ -3361,10 +3280,10 @@ namespace VulkanTuner {
         // a fixture that only met `device-only` would fail this loop's positive direction, which is
         // how "the table gained a condition nobody's fixture knows about" announces itself.
         aMeasuredSet(d);
-        // W4b: the row now names FOUR, and the scope is mandatory for the writer, so the fixture carries
-        // it.  Each new condition gets its state set HERE rather than left to a default: the positive
-        // direction of this loop is what makes forgetting one of them a FAIL instead of a silent pass
-        // (the same position W3-P1 landed in, one condition ago).
+        // W4b/option D: the row now names THREE (device-only, measured-here, swept-here), and the scope is
+        // mandatory for the writer, so the fixture carries it.  Each new condition gets its state set HERE
+        // rather than left to a default: the positive direction of this loop is what makes forgetting one
+        // of them a FAIL instead of a silent pass (the same position W3-P1 landed in).
         aSweptSet(d);
         d.negativeScope.clear();
         d.negativeScope.push_back("mm");
@@ -4062,17 +3981,16 @@ namespace VulkanTuner {
       //
       // A synthetic result, not a device run: the accounting is a copy plus one branch, and the numbers
       // that matter (which pairs were dropped, how many candidates were enumerated) are the CALLER's
-      // facts.  The device half -- that `dropped_too_slow` really moves when `W` moves -- is the probe
-      // self-test's own leg, and duplicating it here would only make one of the two rot unnoticed.
+      // facts.
       {
-        auto makeResult = [](uint32_t objs, bool complete, uint32_t tooSlow, uint32_t buildFailed) {
+        auto makeResult = [](uint32_t objs, bool complete, uint32_t buildFailed) {
           vk_tune_probe_result r {};
           r.st = VK_TUNE_PROBE_OK;
           r.shapes = 3;
           r.objects = objs;
           r.pairs_legal = 12;
           r.pairs_illegal = 2;
-          r.dropped_too_slow = tooSlow;
+
           r.dropped_build_failed = buildFailed;
           r.pairs_complete = complete;
           return r;
@@ -4083,11 +4001,10 @@ namespace VulkanTuner {
         a.deviceName = "self-test";
         // The measured-candidate count is the CALLER's statement (the object count includes the two
         // arms), which is why it is passed explicitly rather than read off `r.objects`.
-        noteMeasurementAccounting(a, makeResult(6u, false, 3u, 2u), 9u, 6u);
-        const bool accountedOk = !a.pairsComplete && a.droppedTooSlow == 3u
-                              && a.droppedBuildFailed == 2u && a.candidatesMeasured == 6u
-                              && a.candidatesEnumerated == 9u && a.pairsLegal == 12u
-                              && a.shapesCount == 3u;
+        noteMeasurementAccounting(a, makeResult(6u, false, 2u), 9u, 6u);
+        const bool accountedOk = !a.pairsComplete && a.droppedBuildFailed == 2u
+                              && a.candidatesMeasured == 6u && a.candidatesEnumerated == 9u
+                              && a.pairsLegal == 12u && a.shapesCount == 3u;
         const bool firedA = noGainSuppressedOnIncompleteSet(a);
         // ... and the FINALIZER must leave that verdict alone on an empty-install decision, which is the
         // ordering claim this case can execute (the protocol half is registered, not claimed).
@@ -4100,11 +4017,11 @@ namespace VulkanTuner {
         // project refuses for outcomes (unlike reasons, which may be reserved).
         Decision b;
         b.deviceName = "self-test";
-        noteMeasurementAccounting(b, makeResult(6u, true, 0u, 0u), 9u, 6u);
+        noteMeasurementAccounting(b, makeResult(6u, true, 0u), 9u, 6u);
         const bool firedB = noGainSuppressedOnIncompleteSet(b);
         const bool untouchedB = (b.outcome == "running");
         // (C) incomplete + A WINNER -> the ROW SET STANDS.  This is the direction section 2.6(a) calls
-        // out: what was dropped was an ALTERNATIVE, so one too-slow candidate must not void a safe row.
+        // out: what was dropped was an ALTERNATIVE, so one dropped candidate must not void a safe row.
         Decision c;
         c.deviceName = "self-test";
         c.install.declared = 1;
@@ -4119,7 +4036,7 @@ namespace VulkanTuner {
         c.rows[0].geom.pad = -1; c.rows[0].geom.reshape = -1; c.rows[0].geom.smaller = -1;
         c.rowInstalledSeen = true;
         c.rowInstalled.push_back(1);
-        noteMeasurementAccounting(c, makeResult(6u, false, 1u, 0u), 9u, 6u);
+        noteMeasurementAccounting(c, makeResult(6u, false, 0u), 9u, 6u);
         c.outcome = "measured";
         const bool firedC = noGainSuppressedOnIncompleteSet(c);
         const bool rowsStand = (c.outcome == "measured") && !rowsForWrite(c).empty();
@@ -4437,8 +4354,8 @@ namespace VulkanTuner {
   //      slots stay NaN, and the summary reports pairs_complete.
   //
   //   4. WHAT IT DOES NOT VERIFY.  The gate comparison itself (interval upper bound vs 0.15), the
-  //      interval-vs-tolerance decisions, the `too-slow` drop, `coverage_complete`, and whether the
-  //      numbers are any GOOD -- that last one needs the calibration window, not a self-test.  The gate
+  //      interval-vs-tolerance decisions, `coverage_complete`, and whether the numbers are any GOOD --
+  //      that last one needs the calibration window, not a self-test.  The gate
   //      is the shell's decision path and the numbers are the calibration batch's business (R-10).
   //      The fixture is synthetic and the line says so: it exercises the (rowIndex, aligned) memo and
   //      the A/A sentinel exactly as a real candidate would, and it is evidence about NO catalogue row.
@@ -4570,11 +4487,6 @@ namespace VulkanTuner {
     base.seed = TuneStats::PROBE_ROTATION_SEED;
     base.spikeBandLo = TuneStats::SPIKE_BAND_LO;
     base.spikeBandHi = TuneStats::SPIKE_BAND_HI;
-    // The `too-slow` drop ratio, declared in the judgement layer and HANDED IN (the backend holds no copy
-    // of it).  The primary device run below inherits exactly this value, and the control run repeats the
-    // same grid with a W that cannot fire -- one run with one W could not tell a criterion that reads its
-    // input from one that carries the number internally.
-    base.tooSlowW = TuneStats::TOO_SLOW_W;
 
     int refused = 0;
     int refusalCases = 0;
@@ -4621,7 +4533,7 @@ namespace VulkanTuner {
       q = base;
       q.spikeBandLo = 0.0; refusedBy(q, dbuf.size(), "not a usable amplitude band");
       q = base;
-      q.tooSlowW = 1.0;    refusedBy(q, dbuf.size(), "not a usable drop ratio");
+
       q = base;
       refusedBy(q, 4, "the sample buffer holds");   // the grid needs 1*2*3 = 6 slots
     }
@@ -4643,13 +4555,7 @@ namespace VulkanTuner {
     uint32_t devicePairsLegal = 0;
     double deviceHot = 0.0;
     bool devicePairsComplete = false;
-    uint32_t deviceDroppedTooSlow = 0;
-    // The positive control: the same grid with a W that cannot fire (see the block after R-13).
-    bool controlRan = false;
-    bool controlComplete = false;
-    uint32_t controlDroppedTooSlow = 0;
-    uint32_t controlBlocks = 0;
-    uint32_t controlSamples = 0;
+
     bool deviceAnchorNaN = false;
     bool deviceSamplesFinite = true;
     {
@@ -4705,7 +4611,7 @@ namespace VulkanTuner {
           devicePairsLegal = r.pairs_legal;
           deviceHot = r.t_block_hot_us;
           devicePairsComplete = r.pairs_complete;
-          deviceDroppedTooSlow = r.dropped_too_slow;
+
           // The NaN discipline, checked rather than assumed: the anchor's three slots were never
           // written (there is no difference to take against itself), and every other slot IS finite --
           // a NaN among them would poison an interval the caller believes it measured.
@@ -4726,12 +4632,12 @@ namespace VulkanTuner {
         want(deviceBlocks == 12, "the probe timed a different number of blocks than the measured grid");
         want(deviceSamples == 9, "the probe wrote a different number of paired samples than 3 x 3");
         want(devicePairsLegal == 4, "the legal-pair count of the synthetic grid changed");
-        // The declared W must exclude EXACTLY the two candidate entries: objects 1 and 2 are the same row
-        // (the memo twin) and on this fixture both measure several times the anchor's median, while the
-        // third non-anchor object is the stock A/A sentinel -- an arm, never a candidate.
-        want(!devicePairsComplete && deviceDroppedTooSlow == 2,
-             "too-slow: the declared W did not exclude exactly the two candidate pairs, or pairs_complete "
-             "did not follow the exclusion (judgeable = measured - dropped)");
+        // With no drop rule left, every legal pair of this fixture is measured: the flag is the plain
+        // count equality (`pairs_measured == pairs_legal`), so it must HOLD here (all four pairs are
+        // measured, blocks=12 samples=9).
+        want(devicePairsComplete,
+             "pairs_complete is false on a fixture where every legal pair was measured: the flag no "
+             "longer follows the measured/legal count equality");
         want(deviceHot > 0.0, "t_block_hot_us is not a positive median over hot blocks");
         want(deviceSpikes <= deviceBlocks, "more spike marks than measured blocks");
         want(deviceAnchorNaN, "an anchor slot was written instead of staying NaN");
@@ -4792,37 +4698,6 @@ namespace VulkanTuner {
                "by its own name (and leave the samples NaN)");
         }
       }
-      // ---- the POSITIVE CONTROL: the SAME grid, only the W changed --------------------------------
-      //
-      // W is an input (the declared copy lives in cpp/neuralnet/tunestats.h), and this pair of runs is
-      // what pins that mechanically: the grid must NOT move (blocks and samples identical) while only the
-      // judgeable set does (dropped 2 -> 0, pairs_complete false -> true).  A criterion that ignores its
-      // input would leave the first run's numbers on the second; one that SHORTENS the grid instead of
-      // excluding after the fact would move the block count.
-      if (deviceRan) {
-        vk_tune_row_spec ctrlCand = rows[workedRow];
-        vk_tune_probe_params qc = q;
-        qc.tooSlowW = 10.0;   // no fixture candidate is 10x the anchor, so nothing may be excluded
-        std::vector<double> csamp((size_t) 1 * nObjects * base.reps, 0.0);
-        vk_tune_probe_result rc {};
-        // NOT named after the standard stream: R10e-shell greps for that NAME across the shell file, and a
-        // local buffer called `cerr` would read as a second write site (the neighbours are `derr`/`rerr`).
-        char qerr[1024];
-        qerr[0] = '\0';
-        controlRan = ::ggml_backend_vk_tune_probe_candidate(backend, &ctrlCand, 1, &qc, csamp.data(),
-                                                           csamp.size(), &rc, qerr, sizeof(qerr))
-                     && rc.st == VK_TUNE_PROBE_OK;
-        controlDroppedTooSlow = rc.dropped_too_slow;
-        controlComplete = rc.pairs_complete;
-        controlBlocks = rc.blocks;
-        controlSamples = rc.samples;
-        want(controlRan, "the too-slow control run (W = 10) did not complete on this device");
-        want(controlRan && controlDroppedTooSlow == 0 && controlComplete && controlBlocks == deviceBlocks
-             && controlSamples == deviceSamples,
-             "the too-slow control: with W = 10 nothing may be excluded, pairs_complete must hold again, "
-             "and the grid must be the one the declared W measured (a criterion that ignores its input, or "
-             "one that shortens the grid, would move one of these numbers)");
-      }
       if (!deviceRan && !note.empty()) {
         firstBad = firstBad.empty() ? ("device run: " + note) : firstBad;
       }
@@ -4845,21 +4720,11 @@ namespace VulkanTuner {
        << " refusals=" << refused << "/" << refusalCases
        << " device[synthetic=1 shapes=1 objects=4 blocks=" << deviceBlocks << " samples=" << deviceSamples
        << " pairs_legal=" << devicePairsLegal << " pairs_complete=" << (devicePairsComplete ? 1 : 0)
-       << " dropped_too_slow=" << deviceDroppedTooSlow << " too_slow_w=" << setprecision(2)
-       << TuneStats::TOO_SLOW_W
        << " spikes=" << deviceSpikes << " t_block_hot_us=" << setprecision(1) << deviceHot
-       << setprecision(4) << " nan_anchor=" << (deviceAnchorNaN ? "ok" : "FAIL")
-       << " samples_finite=" << (deviceSamplesFinite ? "ok" : "FAIL") << "]"
-       // The control is its own bracketed section rather than extra fields inside `device[...]`: the two
-       // runs are two readings, and a reader must not have to guess which run a `pairs_complete` belongs
-       // to.  `blocks`/`samples` are repeated on purpose -- "only W changed" is the claim being pinned.
-       << " too_slow_control[too_slow_w=" << setprecision(2) << 10.0 << " dropped_too_slow="
-       << controlDroppedTooSlow << " pairs_complete=" << (controlComplete ? 1 : 0) << " blocks="
-       << controlBlocks << " samples=" << controlSamples << "]"
        << " verifies[override_consumed anchor_hits=0 raii_restore samples+pairs detector_identity "
-       << "coverage_complete_echo shots_shape_honoured too_slow_drop]"
+       << "coverage_complete_echo shots_shape_honoured]"
        << " not_verified[gate_0.15 vs_tolerance coverage_complete number_quality "
-       << "r13_without_coopmat2 shots_shape_multi too_slow_magnitude probe_call_window]"
+       << "r13_without_coopmat2 shots_shape_multi probe_call_window]"
        << " checks=" << checks << " [" << (ok ? "ok" : "FAIL") << "]"
        << (ok ? "" : " first problem: " + firstBad);
     logLine(os.str());
@@ -5680,7 +5545,6 @@ namespace VulkanTuner {
         pp.seed = TuneStats::PROBE_ROTATION_SEED;
         pp.spikeBandLo = TuneStats::SPIKE_BAND_LO;
         pp.spikeBandHi = TuneStats::SPIKE_BAND_HI;
-        pp.tooSlowW = TuneStats::TOO_SLOW_W;
         std::vector<double> preD((size_t) 2 * (size_t) preReps, 0.0);
         vk_tune_probe_result preRes {};
         char preErr[512];
@@ -5917,7 +5781,6 @@ namespace VulkanTuner {
         mp.seed = TuneStats::PROBE_ROTATION_SEED;
         mp.spikeBandLo = TuneStats::SPIKE_BAND_LO;
         mp.spikeBandHi = TuneStats::SPIKE_BAND_HI;
-        mp.tooSlowW = TuneStats::TOO_SLOW_W;
         const size_t mSlots = coverage.size() * mObjects.size();
         std::vector<double> mSamples(mSlots * (size_t) mp.reps, 0.0);
         vk_tune_probe_result mRes {};
@@ -6023,7 +5886,7 @@ namespace VulkanTuner {
           decision->measurement.samplesWritten = mRes.samples;
           decision->measurement.pairsIllegal = mRes.pairs_illegal;
           decision->measurement.spikes = mRes.spikes;
-          decision->measurement.droppedTooSlow = mRes.dropped_too_slow;
+
           decision->measurement.droppedBuildFailed = mRes.dropped_build_failed;
           decision->measurement.pairsComplete = mRes.pairs_complete;
           decision->measurement.coverageEcho = mRes.coverage_complete;
@@ -6128,7 +5991,7 @@ namespace VulkanTuner {
             << " spikes=" << decision->measurement.spikes
             << " pairs_complete=" << (decision->measurement.pairsComplete ? 1 : 0)
             << " coverage=" << (decision->measurement.coverageEcho ? 1 : 0)
-            << " dropped_too_slow=" << decision->measurement.droppedTooSlow
+
             << " dropped_build_failed=" << decision->measurement.droppedBuildFailed
             << " shots=[" << decision->measurement.shotsMin << "," << decision->measurement.shotsMax << "]"
             << " elapsed_us=" << decision->measurement.elapsedUs;

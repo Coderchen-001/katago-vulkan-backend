@@ -298,22 +298,6 @@ namespace VulkanTuner {
     // The tokens come from TUNE_KINDS[] (the ONE kind registry); empty = "no scope stated", which
     // the writer refuses on the durable channel rather than reading it as "all kinds".
     std::vector<std::string> negativeScope;
-    // W4b (⑤ first cut): THE PRUNE LEDGER -- the names of the candidate-table rules that REALLY
-    // excluded a candidate from the set this run searched.  Why a ledger and not a flag: `MUST` and
-    // `PRUNE` are not the same claim.  A MUST rule names a configuration already proven unusable
-    // (it does not build, or it computes the wrong answer), so excluding it cannot make "nothing in
-    // this domain works" false.  A PRUNE rule is "legal but slow / not worth trying", so every one
-    // that BITES weakens a negative verdict -- and the refusal sentence has to be able to NAME which
-    // one (the W3b lesson: a refusal must point at the right clause).
-    // 🔴 EMPTY IS THE NORMAL STATE, and the condition reads the LEDGER, not the table: the table
-    // always contains PRUNE entries (declaring a sampling surface is itself a PRUNE decision), so
-    // "the table lists a PRUNE clause" would be permanently true and the gate would be welded shut.
-    // The mapping is therefore: `no-prune-in-effect` holds <=> pruneExcluded.empty().
-    // What does NOT belong here: a value that was never declared at all (BK=16/32 on cm2 are legal
-    // but absent from the stock literals).  That is a COVERAGE matter -- a narrower domain, which is
-    // exactly what `candidateCoverage == "sampled"` already reports -- not a rule that excluded
-    // something.  Counting it here would be the mirror image of "listed but never wired".
-    std::vector<std::string> pruneExcluded;
     // What the decision line prints for "which mode is running" (auto(cfg) / off(cfg)): without
     // it the log cannot prove which mode was in effect, and "auto" vs "off" is exactly the
     // difference between "we tried to tune" and "we deliberately did not".
@@ -369,11 +353,10 @@ namespace VulkanTuner {
     // enumerator -- that is a different batch, and it is a different question from `candidateCoverage`.
     // 🔴 DEFAULT FALSE is the fail-closed direction, for the same reason as the line above.
     bool coverageComplete = false;
-    // The DECLARED drop accounting (R-28 step (3)): the reasons a candidate LEFT the judgeable set,
-    // counted separately per reason.  `CANDIDATE_DROPS[]` in vulkantuner.cpp is the ONE place the names
-    // and these fields are paired, and it is READ (the suppression loud is built from it), so a new
-    // reason cannot be added in one place and forgotten in the other.
-    uint32_t droppedTooSlow = 0;
+    // The DECLARED drop accounting (R-28 step (3)): the reason a candidate LEFT the judgeable set.
+    // `CANDIDATE_DROPS[]` in vulkantuner.cpp is the ONE place the name and this field are paired, and it
+    // is READ (the suppression loud is built from it), so the name cannot move in one place and be
+    // forgotten in the other.
     uint32_t droppedBuildFailed = 0;
     // The decision line's TWO denominators, named so they cannot be confused (section 2.6 requires
     // different names because they have different denominators): `cands=` = candidates MEASURED over
@@ -458,7 +441,7 @@ namespace VulkanTuner {
       uint32_t samplesWritten = 0;
       uint32_t pairsIllegal = 0;
       uint32_t spikes = 0;
-      uint32_t droppedTooSlow = 0;
+
       uint32_t droppedBuildFailed = 0;
       bool pairsComplete = false;
       bool coverageEcho = false;   // the enumerator's flag, echoed back by the primitive

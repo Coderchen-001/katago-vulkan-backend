@@ -262,13 +262,6 @@ struct vk_tune_probe_params {
     // a reader could see.
     double spikeBandLo;
     double spikeBandHi;
-    // `tooSlowW`: the `too-slow` drop ratio, handed in for the same one-source reason as the band above.
-    // A CANDIDATE whose median block on a shape is more than `tooSlowW` times that shape's own stock
-    // anchor median leaves the JUDGEABLE set (see `dropped_too_slow` below).  The declared value lives in
-    // cpp/neuralnet/tunestats.h (TOO_SLOW_W, the same number and meaning as the estimate's `W_cand`), and
-    // the probe REFUSES anything <= 1: "not slower than the anchor" would discard nearly every candidate,
-    // and the exclusion rather than the measurement would decide the comparison.
-    double tooSlowW;
 };
 
 // The runtime spike rate is the fraction of blocks the amplitude-band detector marks.  The band is the
@@ -303,21 +296,8 @@ struct vk_tune_probe_result {
     uint32_t pairs_legal;
     uint32_t pairs_illegal;
     uint32_t spikes;         // blocks the amplitude-band detector marked
-    // Pairs the POST-HOC `too-slow` exclusion removed from the judgeable set (w4e-preview.md R-27):
-    // every legal pair ran its full budget FIRST -- the grid is never shortened, which is what separates
-    // this from section 2.6's early-stop form -- and this count is subtracted exactly once:
-    // judgeable = pairs_measured - dropped_too_slow, which is what `pairs_complete` compares against
-    // `pairs_legal`.  Each dropped pair also prints its own line carrying the two medians and their
-    // ratio: a READING, so that the decision can be re-derived from the log, while the decision itself
-    // stays the bare comparison.  It is a THIRD bucket alongside `dropped_build_failed`, and it is
-    // reported instead of being folded into the flag, so "nothing was slow" cannot be confused with
-    // "pairs were excluded and the run therefore cannot claim no-gain".
-    // The dropped pair's cells in the caller's buffer are deliberately NOT re-accounted, and that is
-    // what keeps the pinned grid intact (blocks and samples do not move).  Section 2.6's "the dropped
-    // candidate's measured blocks enter only the log" was written for the early-stop form, where it
-    // means "do not keep the PARTIAL blocks measured before the drop"; post hoc there are no partial
-    // blocks -- the whole grid was paid for and measured -- so what changes is which pairs may be judged.
-    uint32_t dropped_too_slow;
+    // Pairs a build failure removed from the measured set (section 2.6's fourth bucket: in the
+    // denominator, gates).  Counted rather than folded into `pairs_complete`.
     uint32_t dropped_build_failed;
     bool pairs_complete;     // every legal pair of every covered shape has a full budget
     // ⚠️ This is the CALLER's own statement, passed through UNCHANGED: the primitive never verifies
@@ -500,8 +480,9 @@ static inline const char * vk_tile_candidate_reason(int path, const vk_tile_geom
     if (path == VK_TILE_PATH_CM2) {
         // cm2's spec is {BLOCK_SIZE, BM, BN, BK, enable_smaller_matrices}
         // (mul_mm_cm2.comp:31-36).  The scalar warptile clauses below do NOT describe
-        // it, so this branch stands alone.  Bounds beyond these sanity checks (BK
-        // sweep verdict, bucket membership) belong to the candidate table, not here.
+        // it, so this branch stands alone.  Bounds beyond these sanity checks (bucket membership)
+        // belong to the candidate table, not here; the BK verdict is no longer a candidate-table
+        // rule -- it is the DECLARED cm2 BK axis (vulkantuner.cpp CM2_BK_VALUES = {64}).
         if (g.BM == 0 || g.BN == 0 || g.BK == 0 || g.BS == 0) {
             return "cm2: zero dimension (BM/BN/BK/BLOCK_SIZE must be > 0)";
         }
@@ -808,8 +789,8 @@ static inline constexpr int vk_tile_axis_class(int path, int axis) {
 // WHY THIS LIVES IN THE SHARED HEADER RATHER THAN IN EITHER READER.  It has two readers and they must
 // not be able to disagree:
 //   * the SHELL's candidate table (vulkantuner.cpp, CANDIDATE_RULES -> rule "E1-blacklist"), which
-//     keeps the configuration out of the enumerated set -- a MUST rule, so it is not even a ledger
-//     entry;
+//     keeps the configuration out of the enumerated set -- a MUST rule, so it is not an exclusion and is
+//     not recorded as one;
 //   * the BACKEND's install firewall (ggml_vk_tuned_row_capability_reason), which must refuse it as a
 //     NAMED reason, because the enumerator is not the only door: a row arriving from the cache or from
 //     KATAGO_VK_TUNE_IMPORT never passes through enumeration at all.
