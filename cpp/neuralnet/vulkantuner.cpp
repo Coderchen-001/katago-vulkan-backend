@@ -5497,7 +5497,15 @@ namespace VulkanTuner {
       // line (which is printed before the install) -- they need a counted line of their own.
       // The flag is explicit rather than commented out so that the block stays compiled and reviewed:
       // what is parked is the CALL, not the derivation.
-      if (!decision->precheckAttempted && !decision->graphShapes.empty() && decision->rows.empty() && !decision->negative) {
+      // 🔴 B1 (2026-09-30, ONE cache form): a file that was ACCEPTED is this key's durable answer, and
+      // an EMPTY row set is one of its two shapes ("use the stock configuration everywhere").  A loaded
+      // answer must therefore NOT be re-measured: `cacheState == "loaded"` is exactly "the file was taken
+      // as the answer" (a negative marker spells it "negative", a refused file "rejected", no file
+      // "absent"), so the pre-check -- and with it the measurement -- is skipped for a hit and still runs
+      // otherwise.  Without this the second run paid for the measurement it had already written down
+      // (measured: the two-run acceptance showed `cache_state=loaded` AND a `measure:` line).
+      if (!decision->precheckAttempted && !decision->graphShapes.empty() && decision->rows.empty()
+          && !decision->negative && decision->cacheState != "loaded") {
         decision->precheckAttempted = true;
         const vk_tune_probe_shape* heaviest = &decision->graphShapes[0];
         unsigned long long bestVolume = 0;
@@ -5688,7 +5696,9 @@ namespace VulkanTuner {
           && decision->graphShapeCounts.size() == decision->graphShapes.size()
           && !decision->graphShapes.empty()
           && !decision->candidateGeoms.empty()
-          && decision->rows.empty() && !decision->negative) {
+          && decision->rows.empty() && !decision->negative
+          // B1: an ACCEPTED answer (the empty row set included) is not re-measured -- see the pre-check gate.
+          && decision->cacheState != "loaded") {
         decision->measurement.attempted = true;
         // (a) THE COVERAGE SET: counts descending, accumulate until 95% of the total weight is covered.
         //     The tie-break is the graph's own order (a STABLE sort), so two runs over one graph choose the
