@@ -1641,6 +1641,13 @@ namespace VulkanTuner {
       // An earlier draft filtered the whole vector list by the family's declared values, which put
       // `s_warptile_mmq` (BK=128) into the non-quant family -- a wrong answer that only showed up as an
       // off-by-one in the catalogue's counts.
+      // 🆕 (7f), 2026-09-29: WHAT CHANGED IS THE ROLE, NOT THE DATA.  The search no longer walks these
+      // indices -- it enumerates `axes` above -- because the ruling defines `swept-here` as the declared
+      // domain rather than as this family's stock surface.  The membership stays DECLARED because it is
+      // still the transcription R44 compares against ggml-vulkan.cpp (`the preset table equals the stock
+      // tuples`), and deleting it would delete that comparison rather than move it.  A reader looking for
+      // "what was searched" wants the walk in `runCandidateCatalog`; this table answers "what does stock
+      // build for this family", which is a different question with the same subject.
       const size_t* presetIndices;
       size_t presetCount;
       bool applicable;       // per THIS binary: a fixed predicate (policy), never a runtime sample
@@ -1912,27 +1919,29 @@ namespace VulkanTuner {
         // SEARCH, which is the one thing `no-prune-in-effect` exists to measure.  A rule "bites" exactly
         // when it removes a candidate from the set this run considered -- and then that candidate is
         // skipped, which is what the `continue` below encodes.
-        for (size_t pk = 0; pk < fam.presetCount; pk++) {
-          // 🔴 THE SEARCH DOMAIN IS THIS FAMILY'S OWN STOCK VECTORS, NOT THE CARTESIAN PRODUCT AND NOT the
-          // whole vector list.  An earlier draft walked the product here and reported `presets=72` (the
-          // two-answers failure this batch is about: the product is what the count-only probe reports as
-          // `declared`), and the draft after that filtered the WHOLE list by the family's axis values,
-          // which silently pulled the quant family's `s_warptile_mmq` into the non-quant search.  The
-          // membership is declared data now (see CM2_PRESETS_*), so neither mistake can recur.
-          const uint32_t* pv = CM2_PRESET_VECTORS[fam.presetIndices[pk]];
-          vk_tile_geometry g = cm2BaseGeometry();
-          g.BS      = pv[0];
-          g.BM      = pv[1];
-          g.BN      = pv[2];
-          g.BK      = pv[3];
-          g.smaller = (int) pv[4];
+        // 🔴 THE SEARCH DOMAIN IS THE DECLARED DOMAIN -- (7f), 2026-09-29.  This walk used to enumerate
+        // this family's three STOCK PRESET VECTORS (`CM2_PRESETS_*`), and the comment that stood here
+        // argued that the Cartesian product was the wrong thing to search.  The ruling that changed it is
+        // tune-measurement.md's 2026-09-29 `swept` decision: "`swept-here` means the DECLARED PRESET
+        // DOMAIN, fully enumerated", priced at 3 -> 36 candidate pairs.  The two mistakes that comment
+        // warned about are still guarded, by construction rather than by argument:
+        //   * `presets=72` (the two-answers failure) cannot recur because no declared number is read here
+        //     at all -- `declared`/`postRule` are re-walked by `formatCandidateCatalog` FROM THIS SAME AXIS
+        //     TABLE, so the search and the count are one set with three readers;
+        //   * pulling the quant family's vectors in cannot recur because the axes walked are `fam.axes`
+        //     (this family's own declaration), never a filter over some shared list.
+        // 🔴 THREE READERS OF THIS ONE SET, and they must stay one set: this walk (what was searched),
+        // `formatCandidateCatalog`'s re-walk (`declared`/`postRule`), and `enumerateCandidateCounts` (the
+        // count-only probe with the predicate's kill distribution).  A second way to enumerate the domain
+        // is the defect R27's "one set for count / edit / judge" rule exists to prevent.
+        const auto considerGeometry = [&](const vk_tile_geometry& g) {
           Candidate c;
           c.geom = g;
           c.legal = false;
           string pruneName, pruneDetail, mustName;
           const RuleResolution verdict = candidateRuleVerdict(path, g, pruneName, pruneDetail, mustName);
           if (verdict == RuleResolution::RejectedByMust) {
-            continue;   // unusable: it belongs in neither the ledger nor the set this run searched
+            return;   // unusable: it belongs in neither the ledger nor the set this run searched
           }
           if (verdict == RuleResolution::ExcludedByPrune) {
             // 🔴 THE LEDGER, and the candidate is SKIPPED in the same breath.  A rule "bites" exactly when
@@ -1948,14 +1957,33 @@ namespace VulkanTuner {
                 d->pruneExcluded.push_back(pruneName);
               }
             }
-            continue;
+            return;
           }
           if (vk_tile_candidate_reason(path, g, vk_tile_wave_for(32)) != nullptr) {
-            continue;
+            return;
           }
           c.legal = true;
           c.exclusion = pruneDetail;
           out.push_back(c);
+        };
+        // The enumerated set, shape for shape, straight off the declared axis table (the same nesting
+        // `formatCandidateCatalog` uses, so the two walks cannot drift apart).
+        for (size_t v0 = 0; v0 < fam.axes[0].count; v0++) {
+          for (size_t v1 = 0; v1 < fam.axes[1].count; v1++) {
+            for (size_t v2 = 0; v2 < fam.axes[2].count; v2++) {
+              for (size_t v3 = 0; v3 < fam.axes[3].count; v3++) {
+                for (size_t v4 = 0; v4 < fam.axes[4].count; v4++) {
+                  vk_tile_geometry g = cm2BaseGeometry();
+                  g.BS      = fam.axes[0].values[v0];
+                  g.BM      = fam.axes[1].values[v1];
+                  g.BN      = fam.axes[2].values[v2];
+                  g.BK      = fam.axes[3].values[v3];
+                  g.smaller = (int) fam.axes[4].values[v4];
+                  considerGeometry(g);
+                }
+              }
+            }
+          }
         }
         // The coverage of THIS run, and the kinds it covered: the stock vector set is a SAMPLING SURFACE,
         // not a sweep of the Cartesian domain the probe counts.  Set here, at the one place that knows what
@@ -1976,7 +2004,13 @@ namespace VulkanTuner {
           // than a bit-8 diagnostic), so "only the enumerator may say it" is REACHABLE rather than merely
           // counted.  R42(d)'s census is unchanged (production 1 / self-test 1); its MEANING changed.
           d->rowSource = "measured";
-          d->candidateCoverage = "sampled";
+          // 🔴 (7f): `swept`, and the claim is the one the write gate reads.  It is TRUE here by
+          // construction rather than by assertion: the walk above enumerates `fam.axes` to exhaustion
+          // (every combination, no early exit), the only way to reach this line is that the M1 audit of
+          // that very domain passed, and a PRUNE that bites is recorded in the ledger instead of silently
+          // narrowing the set (`no-prune-in-effect` is then the second condition, separately checked).
+          // The old value was `sampled`, and it was right while the walk enumerated three stock vectors.
+          d->candidateCoverage = "swept";
           // (7b) step 5: WHICH PATH these geometries belong to, recorded by the one function that knows
           // it (the path is spelled once, at the top of this catalogue).  The measurement builds its
           // candidate rows from that path and must not pick a second one.
@@ -2089,7 +2123,12 @@ namespace VulkanTuner {
            << " declared=" << declaredCount[f]
            << " postRule=" << postRuleCount[f];
       }
-      os << " presets=" << cands.size() << " legal=" << legal
+      // The count's token is `candidates=`, NOT `searched=`.  The DECISION line has owned `searched=`
+      // since (7a) and it prints a BOOLEAN (`candidateSearched` = "this process ran the search"), so
+      // reusing the name here would make one token a count on one line and a flag on the other -- and
+      // the two values (36 vs 1) never collide as strings, so no grep or criterion would report it.
+      // It is the same class as `coverage=` (a string here, a 0/1 echo on the measurement line).
+      os << " candidates=" << cands.size() << " legal=" << legal
          << " excluded=" << d.pruneExcluded.size() << " by-rule:";
       if (d.pruneExcluded.empty()) {
         os << " none";
@@ -2100,7 +2139,9 @@ namespace VulkanTuner {
         }
       }
       os << " coverage=" << d.candidateCoverage
-         << " remaining=unknown (the format carries no coverage field while sampling cannot be remembered)";
+         << " remaining=unknown (the format carries no coverage field; coverage IS remembered now that"
+            " the search enumerates the declared domain, and the file's own conditions decide whether a"
+            " row set or a marker may be written)";
       // The offline cross-check, on the SAME line so the two readings cannot be compared from different
       // runs: `calls` = geometries the candidate table judged, `ruleRefused` = how many it took away, and
       // `inconsistent` = 0 means the rule function's verdict and its out-parameters agreed every time.
