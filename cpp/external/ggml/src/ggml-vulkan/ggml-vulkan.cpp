@@ -22386,7 +22386,7 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
     // alternative (hand over microseconds and let the caller convert) was rejected on evidence: the
     // per-shape anchor median has no other outlet (`t_block_hot_us` is the HEAVIEST shape, and using it
     // as the divisor was rejected because it is far too large on a light shape -- the OPTIMISTIC
-    // shape -- the OPTIMISTIC direction), and a caller dividing by a quantity of its own choosing would be
+    // direction), and a caller dividing by a quantity of its own choosing would be
     // a second spelling of the scale.
     for (uint32_t s = 0; s < params->nShapes; s++) {
         const size_t anchor_slot = (size_t) s * params->nObjects + anchor_index;
@@ -22395,8 +22395,7 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
                         // safer than reading uninitialised block times if it ever does
         }
         // The one place a scale's existence is decided: "may this shape's difference be EXPRESSED in
-        // units of its own stock block".
-        // "may this shape's difference be EXPRESSED in units of its own stock block".  What they must not
+        // units of its own stock block".  What they must not
         // do is disagree about when a scale exists -- so the predicate is the same two conditions, and an
         // anchor without one leaves the shape's slots at NaN (the caller's `ci_missing` counts it) with a
         // loud saying why: a zero denominator or a single block is not a scale.

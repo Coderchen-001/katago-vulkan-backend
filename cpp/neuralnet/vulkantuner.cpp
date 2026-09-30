@@ -1071,7 +1071,6 @@ namespace VulkanTuner {
       uint32_t Decision::*count;
     };
     const CandidateDropSpec CANDIDATE_DROPS[] = {
-
       { "build-failed", &Decision::droppedBuildFailed },
     };
 
@@ -1101,7 +1100,6 @@ namespace VulkanTuner {
     void noteMeasurementAccounting(Decision & d, const vk_tune_probe_result & r,
                                    uint32_t enumeratedCandidates, uint32_t measuredCandidates) {
       d.pairsComplete = r.pairs_complete;
-
       d.droppedBuildFailed = r.dropped_build_failed;
       d.candidatesMeasured = measuredCandidates;
       d.candidatesEnumerated = enumeratedCandidates;
@@ -1270,7 +1268,6 @@ namespace VulkanTuner {
           cp.seed = TuneStats::PROBE_ROTATION_SEED;
           cp.spikeBandLo = TuneStats::SPIKE_BAND_LO;
           cp.spikeBandHi = TuneStats::SPIKE_BAND_HI;
-
           std::vector<double> confD((size_t) cp.nObjects * (size_t) cp.reps, 0.0);
           vk_tune_probe_result cres {};
           // ⚠️ NOT named `cerr`: the guardrail that pins "the shell writes its lines through `logLine`"
@@ -1905,7 +1902,6 @@ namespace VulkanTuner {
             return;
           }
           c.legal = true;
-
           out.push_back(c);
         };
         // The enumerated set, shape for shape, straight off the declared axis table (the same nesting
@@ -2196,7 +2192,6 @@ namespace VulkanTuner {
       { "spike_rate_gate", std::to_string(TuneStats::SPIKE_RATE_GATE) },
       { "spike_band_lo",   std::to_string(TuneStats::SPIKE_BAND_LO)   },
       { "spike_band_hi",   std::to_string(TuneStats::SPIKE_BAND_HI)   },
-
       { "alpha",           std::to_string(TuneStats::ALPHA)           },
       { "tolerance",       std::to_string(TuneStats::TOLERANCE)       },
       { "min_block_ms",    std::to_string(TuneStats::MIN_BLOCK_TIME_MS) },
@@ -3990,7 +3985,6 @@ namespace VulkanTuner {
           r.objects = objs;
           r.pairs_legal = 12;
           r.pairs_illegal = 2;
-
           r.dropped_build_failed = buildFailed;
           r.pairs_complete = complete;
           return r;
@@ -4611,7 +4605,6 @@ namespace VulkanTuner {
           devicePairsLegal = r.pairs_legal;
           deviceHot = r.t_block_hot_us;
           devicePairsComplete = r.pairs_complete;
-
           // The NaN discipline, checked rather than assumed: the anchor's three slots were never
           // written (there is no difference to take against itself), and every other slot IS finite --
           // a NaN among them would poison an interval the caller believes it measured.
@@ -5886,7 +5879,6 @@ namespace VulkanTuner {
           decision->measurement.samplesWritten = mRes.samples;
           decision->measurement.pairsIllegal = mRes.pairs_illegal;
           decision->measurement.spikes = mRes.spikes;
-
           decision->measurement.droppedBuildFailed = mRes.dropped_build_failed;
           decision->measurement.pairsComplete = mRes.pairs_complete;
           decision->measurement.coverageEcho = mRes.coverage_complete;
@@ -5991,7 +5983,6 @@ namespace VulkanTuner {
             << " spikes=" << decision->measurement.spikes
             << " pairs_complete=" << (decision->measurement.pairsComplete ? 1 : 0)
             << " coverage=" << (decision->measurement.coverageEcho ? 1 : 0)
-
             << " dropped_build_failed=" << decision->measurement.droppedBuildFailed
             << " shots=[" << decision->measurement.shotsMin << "," << decision->measurement.shotsMax << "]"
             << " elapsed_us=" << decision->measurement.elapsedUs;

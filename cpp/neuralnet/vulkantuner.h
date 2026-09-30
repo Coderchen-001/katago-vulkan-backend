@@ -441,7 +441,6 @@ namespace VulkanTuner {
       uint32_t samplesWritten = 0;
       uint32_t pairsIllegal = 0;
       uint32_t spikes = 0;
-
       uint32_t droppedBuildFailed = 0;
       bool pairsComplete = false;
       bool coverageEcho = false;   // the enumerator's flag, echoed back by the primitive
