@@ -341,6 +341,27 @@ namespace TuneStats {
     return b;
   }
 
+  // 🔴 P3 (2026-10-01): the wide-band recovery's arithmetic (declaration and rationale in the header).
+  // Pure: two numbers in, one number out -- so the recovery's PRICE is auditable without a device, and
+  // the failure mode "it silently shrank the budget" is impossible by the two clamps below.
+  long repsForWideBand(long reps, double band, double tolerance, long maxReps) {
+    if (reps < 1) reps = 1;
+    long need = reps;
+    if (tolerance > 0.0 && band > 0.0) {
+      const double bandRel = band / tolerance;
+      // `bandRel <= 1` is NOT this rule's case: a band inside the tolerance is what the bounded-interval
+      // rule (R51) is for, and growing the budget for it would pay for a verdict that already exists.
+      if (bandRel > 1.0) {
+        const double want = (double) reps * bandRel * bandRel;
+        need = (long) ceil(want);
+        if (need < reps) need = reps;   // overflow / rounding: the recovery never shrinks the budget
+      }
+    }
+    if (maxReps > 0 && need > maxReps) need = maxReps;
+    if (need < 1) need = 1;
+    return need;
+  }
+
   unsigned long long devSeed() {
     const unsigned long long kDefault = PROBE_ROTATION_SEED;   // ONE source: the rotation's declared seed
     const char* v = getenv("KATAGO_VK_TUNE_STATS_SEED");

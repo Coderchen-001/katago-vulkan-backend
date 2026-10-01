@@ -97,6 +97,35 @@ namespace TuneStats {
   //   "median" of 2 is just the mean (zero rejection).  Cost = K blocks = 3 x ~2 ms, so the value that
   //   buys the property is also the cheap one.  RULED 2026-09-27 (the one number N4 left open).
   constexpr long HOT_BLOCKS_K = 3;
+  //   CALIB_PAIRS_FLOOR -- the PRE-CHECK's OWN sample count: how many paired differences the scale
+  //   estimate (`1.4826 x MAD`) is computed from.  It is NOT `HOT_BLOCKS_K` and must never borrow it
+  //   again: that constant's declared job is a MEDIAN's window ("big enough for a median to reject one
+  //   spike"), and a SCALE estimator's sample count is a different question with a different answer --
+  //   at n = 3 one spike IS a third of the sample (past the MAD's own 25% breakdown point), and two
+  //   nearly-equal differences return sigma = 0 outright.  Measured before this cut: the same binary,
+  //   machine and shape set reported sigma in {0, 0.024, 0.052, 0.072, 0.098, 0.14, 0.21, 1.31, 1.55}
+  //   and `reps` followed sigma^2 to the cap, because that estimate was three points wide.
+  //   DECLARED, inside two bounds that are PINNED rather than restated (smoke A30 pins the printed
+  //   `calib_pairs=` and the criterion pins both inequalities):
+  //     LOWER: >= HOT_BLOCKS_K.  The same probe call's `reps` IS that median's window (its
+  //            `t_block_hot_us` is the median over the reps it ran), so a smaller value here would
+  //            quietly downgrade a constant that is in the policy fingerprint for its own reason.
+  //     UPPER: <= PAIRS_FLOOR.  This calibration carries NO claim: by the ruling of 2026-10-01 sigma and
+  //            its Gaussian answer are REPORTED, and (iii) above is this header's own record that no
+  //            practical assertion separates n = 16 from n = 25 (the measured gap needs ~20000 trials
+  //            for 4 sigma).  Paying 25 here would buy a difference the project itself could not measure.
+  //   Cost: `reps` blocks once per startup (~16 x ~2 ms), against the main measurement's 5700.
+  constexpr long CALIB_PAIRS_FLOOR = 16;
+  // The two bounds above are ENFORCED, not just written down (the header's own idiom, cf. the ENV_CASES
+  // assert in tunestats.cpp): a later edit that makes the calibration cheaper by breaking either property
+  // fails the BUILD, which is the only place this constant is read before a device is involved.
+  static_assert(CALIB_PAIRS_FLOOR >= HOT_BLOCKS_K,
+                "the calibration's `reps` IS the same call's median window: a value below HOT_BLOCKS_K "
+                "would silently downgrade a property that constant is in the policy fingerprint for");
+  static_assert(CALIB_PAIRS_FLOOR <= PAIRS_FLOOR,
+                "the calibration carries no claim (ruling 2026-10-01: sigma is REPORTED), and this "
+                "header records that no practical assertion separates n=16 from n=25 -- paying the "
+                "declared CLAIM floor here would buy a difference the project itself could not measure");
   //   STALL_BLOCKS -- section 2.6's ruling detects a stall at SECOND granularity, and the only honest
   //   unit to convert that with is the block the protocol defines by TIME (MIN_BLOCK_TIME_MS).  Written
   //   as an expression rather than 500 so that if that block length ever moves this moves with it,
@@ -241,6 +270,22 @@ namespace TuneStats {
   // per-dispatch-relative figure benchgemm prints is NOT the right normalisation.
   Budget allocateReps(const std::vector<double>& sigmaRel, double tolerance, double alpha,
                       long floorReps, long maxReps);
+
+  // 🔴 P3 (2026-10-01): THE WIDE-BAND RECOVERY -- "buy resolution, do not give up".  The judgement's
+  // interval needs at least FOUR non-zero paired differences (`pairedSignedRank` leaves `ciOk` false
+  // below that), so a pair whose differences are mostly exact zeros with a few entries WIDER than the
+  // tolerance ends in `ciMissingWide`: no interval at all, and the branches can neither claim a win nor
+  // honestly declare "nothing won".  The old answer was to write nothing and pay for the measurement
+  // again at the next startup -- a shape the ruling forbids.  The recovery instead reads the band the
+  // run ACTUALLY observed: the interval half-width falls as 1/sqrt(n), so the pair count that would
+  // bring an observed band `band` down to `tolerance` is `n' = ceil(n * (band / tolerance)^2)`.
+  //   * It GROWS the budget or does nothing: a band at or below the tolerance is not this rule's case
+  //     (that is what the bounded-interval rule is for), and the answer is never below `reps`.
+  //   * It is clamped at `maxReps` -- the declared cap -- and the caller REPORTS both numbers; hitting
+  //     the cap is an alarm about the device, never a reason to refuse to write (`REPS_MAX` is an
+  //     alarm-only reading by ruling).
+  //   * It is arithmetic, not a policy knob: the two inputs come from this run's own measurement.
+  long repsForWideBand(long reps, double band, double tolerance, long maxReps);
 
   // The DEV knob: the self-test's trial count (default DEV_TRIALS_DEFAULT, clamped to [10, 20000]).
   // Logging/flow only -- it cannot change what the tuner may select, so it is NOT a policy knob and

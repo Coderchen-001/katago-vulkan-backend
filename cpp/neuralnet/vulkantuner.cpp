@@ -116,7 +116,14 @@ namespace VulkanTuner {
     // rule is not a `POLICY_CONSTANTS` row, so the fingerprint does not move by itself, and a row set
     // measured under "the formula may vote" is not the same article as one measured under "the floor is
     // the budget" -- which is exactly what this counter exists to say.
-    const int TUNER_POLICY_VERSION = 2;
+    // 🔴 2 -> 3 (2026-10-01): the SAME class as 1 -> 2, one layer out, and a PROTOCOL change for the same
+    // reason.  (a) P1: the pre-check's scale estimate gets its OWN declared sample count
+    // (`CALIB_PAIRS_FLOOR`) instead of borrowing the median window's `HOT_BLOCKS_K` -- and because that
+    // call's `reps` is ALSO its median window, the block the judgement is calibrated from moves with it.
+    // (b) P3: when the judgement's own observed band is wider than the tolerance, the measurement is
+    // re-run ONCE at `n' = n*(band/tol)^2` instead of the run writing nothing at all.  Both change what a
+    // durable row set was measured UNDER, and neither is a constant the revision alone would expose.
+    const int TUNER_POLICY_VERSION = 3;
 
     // Which header keys are required depends on the CHANNEL, and the split follows what each
     // key GUARANTEES.  These two arrays are the single source of truth: the parser builds its
@@ -989,6 +996,14 @@ namespace VulkanTuner {
           }
           else {
             j.ciMissingWide++;
+            // P3 (2026-10-01): the MAGNITUDE that the recovery's arithmetic reads.  This pair produced no
+            // interval because its non-zero differences are too few to rank (n < 4) while the band is
+            // (by the else-chain above) too wide to bound -- so the band IS the run's own observation of
+            // how far outside the tolerance this comparison still sits.  Keeping the widest one is what
+            // turns "ci_wide=3" into a price the next pass can be sized from.
+            if (maxAbs > j.wideBandMax) {
+              j.wideBandMax = maxAbs;
+            }
           }
         }
       };
@@ -1166,7 +1181,9 @@ namespace VulkanTuner {
     //      the `no-winner` class, never a sticky negative entry": a confirmation that did not happen is
     //      NO EVIDENCE, not evidence of equality).
     //   ② no candidate is not-worse AND the pair set is complete => `measured-no-gain`, whose durable
-    //      effect (declared in the outcome table) is the `NEGATIVE no-gain` entry.
+    //      effect (declared in the outcome table) is the EMPTY ROW SET (`ROWS 0`).  STALE TEXT FIXED
+    //      (2026-10-01): this line used to name a `NEGATIVE no-gain` entry as that effect -- since B1's
+    //      ONE cache form (2026-09-30) there is no negative-entry writer left for it to name.
     //   ③ otherwise => `no-winner`, and `noGainSuppressedOnIncompleteSet` is the ONE owner of that
     //      sentence and of its loud (re-implementing it here would give one rule two spellings).
     //
@@ -2208,6 +2225,10 @@ namespace VulkanTuner {
       // to them in tunestats.h, because a value in this string is only auditable if its origin is.
       { "warmup_blocks",   std::to_string(TuneStats::WARMUP_BLOCKS)   },
       { "hot_blocks_k",    std::to_string(TuneStats::HOT_BLOCKS_K)    },
+      // P1 (2026-10-01): the calibration's own sample count, registered beside K because it is exactly the
+      // confusion between the two that this constant was introduced to end: K is a MEDIAN's window, this
+      // is a SCALE estimate's sample count, and they used to be one number (R38: one name, one meaning).
+      { "calib_pairs_floor", std::to_string(TuneStats::CALIB_PAIRS_FLOOR) },
       { "stall_blocks",    std::to_string(TuneStats::STALL_BLOCKS)    },
     };
 
@@ -3345,12 +3366,14 @@ namespace VulkanTuner {
           d.rows.push_back(r);
         }
         else {
-          // THE NEGATIVE-ENTRY SHAPE, and it is the THIRD BRANCH own executor (section 2.6(a) asks for an
-          // executor per branch): a complete pair set (so branch ③ must NOT fire) with no candidate
-          // not-worse on every covered shape (so branch ① must NOT fire) => branch ②, whose durable
-          // effect the table declares as `negative:no-gain`.  The verdict below then checks that the
-          // decision holds exactly that effect, which is what makes this fixture prove the function
-          // rather than the table.
+          // BRANCH ②'S OWN EXECUTOR (section 2.6(a) asks for an executor per branch): a complete pair set
+          // (so branch ③ must NOT fire) with no candidate not-worse on every covered shape (so branch ①
+          // must NOT fire) => branch ②, whose durable effect the table declares as `rows` -- the EMPTY ROW
+          // SET (`ROWS 0`), "use the stock configuration everywhere".  STALE TEXT FIXED (2026-10-01): this
+          // comment used to call the shape `NEGATIVE-ENTRY` and to name `negative:no-gain` as its effect;
+          // since B1's ONE cache form (2026-09-30) there is no negative-entry writer left to name.  The
+          // verdict below then checks that the decision holds exactly that effect, which is what makes
+          // this fixture prove the function rather than the table.
           d.deviceName = "self-test";
           // The fixture stands AFTER a successful measurement -- that is the state the branch selection
           // reads, and forgetting it is what the first version of this fixture did: the loop then reported
@@ -5533,7 +5556,13 @@ namespace VulkanTuner {
         // The SEED of the inversion, not a protocol constant: it only sets the first block's length, and
         // the inversion below is what decides `shots`.  It is deliberately kept out of POLICY_CONSTANTS.
         const uint32_t preShots = 1;
-        const uint32_t preReps = (uint32_t) TuneStats::HOT_BLOCKS_K;
+        // P1 (2026-10-01): the CALIBRATION's own sample count, and no longer the median window's
+        // constant.  `HOT_BLOCKS_K`'s declared job is "a median of K blocks rejects one spike"; the
+        // scale estimate below is a different question, and three points is not an answer to it (see
+        // `CALIB_PAIRS_FLOOR`'s derivation in tunestats.h: one name, one meaning -- R38).  The same
+        // `reps` is still this call's median window, which is why the declaration's LOWER bound is
+        // `HOT_BLOCKS_K`.
+        const uint32_t preReps = (uint32_t) TuneStats::CALIB_PAIRS_FLOOR;
         vk_tune_probe_params pp {};
         pp.shapes = &preShape;
         pp.nShapes = 1;
@@ -5663,6 +5692,11 @@ namespace VulkanTuner {
               << " reps_formula=" << decision->precheckRepsFormula
               << " clamped=" << (decision->precheckClampedAtMax ? 1 : 0)
               << " sigma=" << decision->precheckSigmaRel
+              // P1 (2026-10-01): the calibration's sample count is a DECLARED constant, so it is printed
+              // beside the reading it produced -- that is what makes "the scale estimate got its own
+              // sample count" falsifiable from the log alone (the old line printed only the median's K,
+              // which is exactly the confusion the constant was introduced to end).
+              << " calib_pairs=" << TuneStats::CALIB_PAIRS_FLOOR
               << " (K=" << TuneStats::HOT_BLOCKS_K << " warmup=" << TuneStats::WARMUP_BLOCKS << ")";
         logLine(preOs.str());
       }
@@ -5705,6 +5739,31 @@ namespace VulkanTuner {
       // it is not repeated here.  The gate names the doors the primitive itself refuses on, so the call is
       // not made only to be refused: no pre-check reading, no per-shape weights, no candidates, rows
       // installed, or a negative entry.
+      //
+      // 🔴 P3 (2026-10-01): THE WIDE-BAND RECOVERY -- at most TWO passes over (measurement, judgement).
+      // THE DEFECT THIS CLOSES: `pairedSignedRank` needs FOUR non-zero paired differences to form an
+      // interval, so a pair whose differences are mostly exact zeros with a few entries wider than the
+      // tolerance lands in `ciMissingWide` -- no interval, and `concludeBranches` then writes NOTHING
+      // ("no-gain suppressed ... no durable verdict is written") while the next startup pays for the
+      // whole measurement again.  The ruling forbids exactly that shape: the noisy machine's price must
+      // be a BIGGER MEASUREMENT, never a missing cache.  So after the first judgement, if any pair came
+      // out wide, the band the run ACTUALLY observed sizes a second pass (`repsForWideBand`, declared and
+      // derived in tunestats.h) and the measurement is re-run ONCE at that budget.
+      //   * THE SECOND PASS IS THE MEASUREMENT: both the measurement and the judgement are RESET, not
+      //     merged -- every interval has to come from ONE block set, or "this comparison is comparable"
+      //     would be a statement about two runs.
+      //   * THE ONCE-FLAGS STILL HOLD: `measurement.attempted` and `judgement.attempted` are cleared by
+      //     the same reset that makes this legal, so no third pass and no re-entry can happen.
+      //   * NOT RE-INDENTED ON PURPOSE: the body below is unchanged, so this batch's diff is exactly the
+      //     recovery's delta rather than two hundred lines of whitespace (the reviewer reads the change).
+      //   * A REFUSED SECOND PASS IS NOT A REGRESSION, and that is a MEASURED equivalence rather than a
+      //     hope: if the enlarged call fails (the primitive's refusal is loud on stderr with its own
+      //     marker), the decision is left with no verdicts -- which lands in exactly the place the first
+      //     pass's wide verdicts would have, "nothing written, no durable claim".  Restoring the first
+      //     pass's state would NOT change that (its wide pairs still have no interval to decide on), which
+      //     is why no such copy is taken: untested machinery that cannot change an outcome is not added.
+      uint32_t measReps = decision->precheckReps;
+      for (int pass = 0; pass < 2; pass++) {
       if (!decision->measurement.attempted
           && decision->precheckMeasured
           && decision->precheckReps >= 2 && decision->precheckShots >= 1
@@ -5791,7 +5850,7 @@ namespace VulkanTuner {
         mp.nObjects = (uint32_t) mObjects.size();
         mp.shots = decision->precheckShots;
         mp.warmupBlocks = (uint32_t) TuneStats::WARMUP_BLOCKS;
-        mp.reps = decision->precheckReps;
+        mp.reps = measReps;
         mp.stallBlocks = (uint32_t) TuneStats::STALL_BLOCKS;
         mp.coverageComplete = decision->coverageComplete;
         mp.shotsPerShape = nullptr;
@@ -5922,6 +5981,39 @@ namespace VulkanTuner {
       if (decision->measurement.ok && !decision->judgement.attempted) {
         judgeMeasurement(*decision);
       }
+      // 🔴 P3 (2026-10-01): THE TRIGGER IS THE JUDGEMENT'S OWN OBSERVED BAND, never the pre-check's
+      // sigma.  Measured 2026-10-01: the pre-check's sigma is taken on 1-dispatch blocks (hot_us 56-157)
+      // while the judgement's blocks are ~2 ms, i.e. 100-1000x the scale the decision actually uses, so
+      // that sigma cannot speak for this question.  `wideBandMax` is what the interval layer itself saw,
+      // in the tolerance's own unit -- which is why the price below can be READ instead of guessed.
+      if (pass == 0 && decision->measurement.ok && decision->judgement.ciMissingWide > 0) {
+        const long nextReps = TuneStats::repsForWideBand((long) decision->measurement.reps,
+                                                         decision->judgement.wideBandMax,
+                                                         TuneStats::TOLERANCE,
+                                                         TuneStats::REPS_MAX);
+        if (nextReps > (long) decision->measurement.reps) {
+          // ONE line per recovery, carrying BOTH passes' numbers: what was paid, what is being bought,
+          // and the reading the price came from.  Without it the second pass would be invisible (the
+          // judge line below prints the SECOND run's verdicts) and "did buying resolution pay off?"
+          // would be unanswerable from the log -- the failure mode these counted lines exist to prevent.
+          logLine("NOTICE: " + decision->deviceName + ": wide-band recovery: "
+                  + to_string(decision->judgement.ciMissingWide) + " of "
+                  + to_string(decision->judgement.candidatePairs) + " candidate pair(s) had no interval"
+                  " while their observed band (" + to_string(decision->judgement.wideBandMax)
+                  + ") was outside the tolerance (" + to_string(TuneStats::TOLERANCE)
+                  + "), so the measurement is re-run ONCE with reps "
+                  + to_string((long) decision->measurement.reps) + " -> " + to_string(nextReps)
+                  + " (n' = n*(band/tol)^2, clamped at " + to_string((long) TuneStats::REPS_MAX)
+                  + "): resolution is BOUGHT here rather than the cache left unwritten");
+          decision->wideBandRemeasure = (uint32_t) nextReps;
+          measReps = (uint32_t) nextReps;
+          decision->measurement = Decision::Measurement {};
+          decision->judgement = Decision::Judgement {};
+          continue;
+        }
+      }
+      break;
+      }
       // (7d) THE THREE BRANCHES, ONCE PER DECISION (tune-measurement.md section 2.6(a)).  The order is
       // the ruling order: the gate judged the measurement, the judgement produced the verdicts, and
       // this turns them into an outcome.  It runs at the END of the install path because that is where
@@ -5960,6 +6052,14 @@ namespace VulkanTuner {
             << ":" << decision->judgement.firstMissingObject
             << " ci_coarse=" << decision->judgement.ciMissingCoarse
             << " ci_wide=" << decision->judgement.ciMissingWide
+            // P3 (2026-10-01): the two numbers the recovery reads and the one it writes.  `band_max` is
+            // the WIDEST observed band among the wide pairs (0 = none), `remeasure` is the budget the
+            // second pass was given (0 = the intervals all formed on the first pass).  Both are readings
+            // with no threshold: they make the trigger falsifiable when it fires and its absence explicit
+            // when it does not, which is what "registered, not faked" has to mean for a branch this
+            // machine cannot reach (`ci_wide=0` on every leg measured so far).
+            << " band_max=" << decision->judgement.wideBandMax
+            << " remeasure=" << decision->wideBandRemeasure
             << " winner=" << decision->judgement.winner
             << " winner_unstable=" << (decision->judgement.winnerUnstable ? 1 : 0)
             << " winner_margin=" << decision->judgement.winnerMargin

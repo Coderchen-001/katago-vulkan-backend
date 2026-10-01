@@ -466,6 +466,13 @@ namespace VulkanTuner {
       std::vector<double> samples;
     };
     Measurement measurement;
+    // P3 (2026-10-01): the SECOND measurement's budget, when the wide-band recovery ran -- 0 means the
+    // judgement's intervals all formed on the first pass, which is the only case this machine has
+    // produced.  The field exists so that the price of the recovery is on the line a reader greps, and
+    // so the outer code can tell "re-measured once, at n'" from "never had to" without re-deriving it
+    // from `measurement.reps` (which the second pass overwrites).  Consumer: the judge line's
+    // `remeasure=` reading; producer: the recovery block in `installForHandle` (R-12, same batch).
+    uint32_t wideBandRemeasure = 0;
     // (7c) THE JUDGEMENT LAYER'S RESULT.  It answers the two questions the decision needs -- "is this
     // comparison trustworthy at all" (the A/A sentinel's EQUIVALENCE test + the spike-rate gate) and
     // "which candidate is not worse than stock on EVERY covered shape" -- and it DECIDES NOTHING about
@@ -511,6 +518,12 @@ namespace VulkanTuner {
       int firstMissingShape = -1;
       int firstMissingObject = -1;
       uint32_t ciMissingWide = 0;
+      // P3 (2026-10-01): the WIDEST band observed among those wide pairs, in the same block-relative unit
+      // as the tolerance.  `ciMissingWide` says the cause fired; this says HOW FAR outside the tolerance
+      // the run's own data was -- and it is the only input of the recovery's `n' = n*(band/tol)^2` that
+      // does not come from the pre-check's sample-count-limited sigma.  It stays 0 whenever no pair is
+      // wide, which is what this machine has measured so far (`ci_wide=0` on every leg, 2026-10-01).
+      double wideBandMax = 0.0;
       // The shapes whose own block is below `MIN_BLOCK_TIME_MS`, and the lightest ruler seen: the floor as
       // a reading rather than a silent gate.
       uint32_t shapesBelowFloor = 0;
