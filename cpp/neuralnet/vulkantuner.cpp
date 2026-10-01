@@ -87,7 +87,21 @@ namespace VulkanTuner {
     // TUNER_VERSION = the ENUMERATOR's version: it changes when the way candidates are
     // enumerated/measured changes.  This cut is the ENUMERATOR ITSELF (its first writer: the
     // stock-preset catalogue and the measured row source), so it moves with SCHEMA_VERSION.
-    const int TUNER_VERSION = 3;
+    // 🔴 3 -> 4 (2026-10-01): THE DEFERRED B1.5 EVENT, PAID NOW.  B1.5 (`ef7af123`, 2026-09-17) made the
+    // installer build the ALIGNED TWIN of every row beside its unaligned pipeline (`ggml-vulkan.cpp`'s
+    // paired build at `:22740`/`:22756` + `ggml_vk_tuned_row_pick`), so since that commit ONE geometry
+    // has TWO dispatchable variants and the align rule takes part in "which pipeline serves this shape"
+    // -- measured and applied by the SAME rule (K1's same-source discipline).  A row set written before
+    // it was PRICED and MEASURED under the unaligned-only path, i.e. what one row MEANS changed, which is
+    // this counter's subject.  The event was deferred ON PURPOSE while ⑤ (the shell-side protocol) had no
+    // landed writer -- `t3-shell-plan.md` section 6.9.1 item 6 says so in as many words ("本批排在 ⑤ 之前
+    // ⇒ 不付") -- and ⑤ has landed since (real row sets are written and read back today), so it is due.
+    // Measured witness that the two variants are really there: `install (ctx=0): 1 declared, 1 installed
+    // ... pipes=4` (= 1 row x 2 variants x 2 acc targets, the declared ceiling) AND two dispatch lines on
+    // the same leg, `..._cm2_tuned_row` (aligned=0 align=1) and `..._cm2_tuned_row_aligned` (aligned=1).
+    // `TUNER_VERSION` sits in `REQUIRED_FOR_CACHE` and is compared by VALUE (`:5004`), so raising it
+    // invalidates every older file structurally -- which is the point, not a side effect.
+    const int TUNER_VERSION = 4;
 
     // The policy baseline counter (t1-schema.md section 4, "baselineVersion").
     //
