@@ -120,7 +120,8 @@ namespace VulkanTuner {
   //
   //   Auto -- read the cache; on a miss, tune and save (today: nothing to tune yet).
   //   Off  -- READ-ONLY: read the cache, use a hit, fall back to stock on a miss, never tune,
-  //           never write the cache and never write a negative entry.
+  //           never write the cache (since the ONE-cache-form ruling there is no other durable
+  //           artifact for it to write).
   //
   // ⚠️ Off is NOT a reference arm: it may install tuned rows, so "bit-identical to stock"
   // acceptance may only ever use KATAGO_VK_TUNE=0.
@@ -171,7 +172,15 @@ namespace VulkanTuner {
     // handle.  Default 0 = "not injected"; 0 is refused downstream (both here and by
     // vk_tile_candidate_reason's wave == 0 clause) rather than silently standing in for wave 32.
     uint32_t deviceSubgroupSize = 0;
-    bool negative = false;        // this key's row set is a "deterministically all-rejected" marker
+    // 🔴 B3.5 (2026-10-01): `bool negative` USED TO SIT HERE, and so did `negativeReason`,
+    // `NegativeOrigin` and `negativeOrigin` -- the in-memory half of the cache's SECOND form ("this key
+    // is deterministically all-rejected").  B3 deleted that form from the wire (SCHEMA_VERSION 5 -> 6),
+    // which left every one of those fields UNWRITABLE and UNREADABLE (nothing could put one on a file or
+    // get one off a file), and B3.5 removed the fields themselves.  What a decision can say is now
+    // exactly ONE thing -- the row set below, possibly the EMPTY one -- and `outcome` says how it was
+    // reached.  The consequences that used to be carried by those fields are recorded where they
+    // mattered: the gate refusal in `setGateRejectMarker` / `rejectBySpikeGate`, the self-falsification
+    // guard's changed carrier in `finalizeOutcome`, and the provenance condition in `CONDITION_SPECS`.
     // HOW THIS DECISION WAS REACHED, as one string from the closed set in vulkantuner.cpp
     // (step "3-4").  The default is NOT writable, deliberately: a decision nobody gave an outcome
     // to has by definition not finished, and the failure this field exists to prevent is
@@ -179,42 +188,6 @@ namespace VulkanTuner {
     // property of the device ("we ran out of time" must never become "this device cannot be
     // tuned").  Only a COMPLETED measurement or a STRUCTURAL all-reject may be written.
     std::string outcome = "running";
-    // Why the reason is a CLOSED SET and not free text (t3-shell-plan.md section 6.4 item 2): a
-    // NEGATIVE entry is a claim that OUTLIVES the process -- it suppresses tuning until something
-    // invalidates it -- so it has to be mechanically comparable, and a file carrying a reason this
-    // tuner cannot interpret must not load (the same rule that refuses an unknown header key).
-    // The set is NEGATIVE_REASONS[] in vulkantuner.cpp; class (b) (every candidate rejected by the
-    // validation gate) and class (c) (timeout / IO failure / device lost / no winner) are
-    // deliberately absent from it, so they cannot be written at all.
-    std::string negativeReason;
-    // W2 (post-review): WHO put the marker above there, which is what decides who may take it away.
-    //   None      -- no marker.
-    //   FromFile  -- the LOADER read it from a file at this device's cache path (one entry point,
-    //                vulkantuner.cpp load path).  It is load-bearing: the writer must be able to tell a
-    //                marker it owns from one the loader handed it, and the read-side legs assert
-    //                "nothing to do means nothing written" byte for byte, so the FINALIZER never
-    //                touches it -- except for the ONE transition that makes it false
-    //                by this process's own account (a durable row was installed for this key), which it
-    //                retires loudly.
-    //   AllReject -- THIS process concluded "deterministically all-rejected" from the install
-    //                accounting.  The finalizer owns this one and recomputes it from scratch on every
-    //                call, so calling it twice can never leave a stale marker behind.
-    // The distinction is not cosmetic: one field with two writers and no record of who wrote it is
-    // exactly the silent sharing this project refuses, and the two markers are removed for different
-    // reasons (a loader's marker is superseded by a measurement; ours is retracted by our own rules).
-    //   SpikeGate -- THIS process's spike-rate gate refused the measurement (R-28 step (2)).  A
-    //                FOURTH value rather than a reuse of AllReject, and the reason is the paragraph
-    //                above: the finalizer recomputes ITS OWN marker from the install accounting on every
-    //                call, so it has to be able to tell "mine" from "not mine" -- sharing one value would
-    //                let its reset wipe a verdict it never reached, and the gate's verdict is not the
-    //                accounting's to retitle (it judges the MEASUREMENT, which is upstream of it).
-    enum class NegativeOrigin { None, FromFile, AllReject, SpikeGate, NoGain };
-  // 🆕 (7d) `NoGain`: the branch selection is the producer of the `no-gain` marker, and a marker with no
-  // provenance would be the "one field, two writers, no record of who wrote it" shape this enum exists
-  // to prevent.  By construction the finalizer only ever takes away ITS OWN marker (`AllReject`) and the
-  // loader only the file one (`FromFile`), so a new value needs no change there -- it is automatically
-  // left alone, and the self-test (k) case is what holds that claim for the values that exist.
-    NegativeOrigin negativeOrigin = NegativeOrigin::None;
 
     // G-D20 (t3-shell-plan.md 6.9): "deterministically all-rejected" is a claim about the DEVICE
     // only when every rejection reason is a device property.  A rejection caused by OUR
@@ -242,14 +215,21 @@ namespace VulkanTuner {
     // W3-P1: WHERE THE CANDIDATE SET CAME FROM.  Three states, and the third is the one the write
     // side reads: "none" (nothing was loaded -- the declared set is empty, or the self-test
     // synthesized it), "cache" (a FILE produced the candidates), "measured" (THIS process's
-    // own enumeration produced them).  The value is what `negativeProvable` tests, so the initial
-    // value is the fail-closed one: a decision nobody marked can never mint a durable verdict.
+    // own enumeration produced them).  The value is what the `measured-here` condition tests, so the
+    // initial value is the fail-closed one: a decision nobody marked can never claim its own set.
     // 🔴 (7a): the third state IS reachable now.  The enumerator left the probe block and became part of
-    // the decision point, so `runCandidateCatalog` mints "measured" on every run; and the three loader
+    // the decision point, so `runCandidateCatalog` mints "measured" on every run; and the loader
     // branches below that leave this key with no row set write it too -- there is no file-supplied set,
     // so the FINAL source of the candidate set is this process's own enumeration.  R42(d) counts the
-    // setters rather than trusting this sentence: production 1 (the enumerator) + the loader's 3
-    // recording sites, self-test 1.
+    // setters rather than trusting this sentence: production 1 (the enumerator) + the loader's recording
+    // sites + self-test 1.
+    // 🔴 B3.5 (2026-10-01): THE LOADER HAD THREE RECORDING SITES AND NOW HAS TWO.  The third was the
+    // marker-scope refusal's fallback ("the file's marker does not speak for this build, so its rows are
+    // dropped and what is left is this process's own enumeration") -- a branch that could only be reached
+    // while a file could carry a marker, and which is deleted with the rest of the read-side marker path.
+    // The two that remain are the two the loader really has: no file at all ("absent"), and a file the
+    // operator's KATAGO_VK_TUNE_RETUNE threw away whole.  R42's own expectation moved with it (it is a
+    // COUNT, so the tool face has to be told -- this is not a site that can be kept for the count's sake).
     //
     // 🔴 THE SEMANTIC, and it is the one thing a reader gets wrong here: this field is the FINAL source
     // ("where the set this decision used came from"), NOT "where it ever came from".  The loader
@@ -270,12 +250,12 @@ namespace VulkanTuner {
     bool candidateSearched = false;
     // W4b (⑤ first cut): WHICH SUBSET of the declared domain this process actually looked at, as THREE
     // states rather than a bool.  "who measured it" (rowSource above) and "how much of the domain was
-    // covered" are ORTHOGONAL questions -- both must be answered before a NEGATIVE entry may be
+    // covered" are ORTHOGONAL questions -- both must be answered before a durable conclusion may be
     // remembered, because "we sampled 6 presets and none worked" is not "this device has no injectable
     // slot".  The third state is what makes this a three-state field and not a flag: a W3-P1 lesson --
     // a bool here would create the illegal combination "not swept and not sampled" with nobody to refuse.
     //   unknown -- nobody said.  The initial value is the FAIL-CLOSED one: `swept-here` tests for the
-    //              string "swept", so a decision nobody marked can never mint a durable verdict.
+    //              string "swept", so a decision nobody marked can never claim a sweep.
     //   sampled -- a sampling surface: the enumerator walked the declared STOCK VECTOR SET (a strict
     //              subset of the Cartesian domain the count-only probe reports), or any other proper
     //              subset.  A legitimate way to search, and NOT a complete one -- which is all this
@@ -284,25 +264,30 @@ namespace VulkanTuner {
     //   swept   -- every point of the declared domain was put through the predicate (nothing tonight
     //              produces this: 72 > any sane N_max, which w4b-preview section 9 pre-registers as
     //              "sample it").  It exists so the condition has a satisfying direction to test.
-    // It is NOT written into the file and does NOT enter the key on purpose: while sampling cannot
-    // produce a NEGATIVE entry, "a file carries NEGATIVE" already implies "swept", so a coverage
-    // header key would be a format event that says nothing.  🔴 THE TRIGGER: the day a sampled
-    // negative entry is allowed to land, a coverage field MUST be added in the same batch
-    // (t3-shell-plan.md F17).
+    // It is NOT written into the file and does NOT enter the key on purpose: it is a READING about the
+    // search, and (7f) made the honest value `swept` by walking the declared domain to exhaustion -- so a
+    // coverage header key would be a format event that says nothing.  🔴 THE TRIGGER: the day a run can
+    // conclude on a SAMPLING SURFACE and have that conclusion remembered, a coverage field MUST be added
+    // in the same batch (t3-shell-plan.md F17).
     std::string candidateCoverage = "unknown";   // "unknown" / "sampled" / "swept"
-    // W4b: WHAT the enumerated candidate set covered -- the kind TOKENS a NEGATIVE entry speaks for.
-    // It is the third axis of the same honesty question: `measured-here` says WHO produced the set,
-    // `candidateCoverage` says HOW MUCH of the domain it looked at, and this says WHICH KINDS the
-    // conclusion is about.  One file = one key, and a key can carry several kinds (mm today, fa
-    // later), so a bare `NEGATIVE <reason>` would assert a kind it never measured.
-    // The tokens come from TUNE_KINDS[] (the ONE kind registry); empty = "no scope stated", which
-    // the writer refuses on the durable channel rather than reading it as "all kinds".
-    std::vector<std::string> negativeScope;
+    // 🔴 B3.5 (2026-10-01): `std::vector<std::string> negativeScope` USED TO SIT HERE -- the kind TOKENS
+    // a durable entry spoke for, the third axis of the same honesty question (`measured-here` said WHO
+    // produced the set, `candidateCoverage` says HOW MUCH of the domain it looked at, and the scope said
+    // WHICH KINDS the conclusion was about).  One file = one key, and a key can carry several kinds (mm
+    // today, fa later), so a bare `<reason>` line would have asserted a kind it never measured -- which is
+    // why the writer refused an unscoped one.  B3 deleted the line (SCHEMA_VERSION 5 -> 6) and B3.5
+    // deleted the field with it.  The KIND REGISTRY itself (`TUNE_KINDS` / `tuneKindKnown`) STAYS: the
+    // parser and the candidate catalogue still need it, and the completeness gate still asks it.
     // What the decision line prints for "which mode is running" (auto(cfg) / off(cfg)): without
     // it the log cannot prove which mode was in effect, and "auto" vs "off" is exactly the
     // difference between "we tried to tune" and "we deliberately did not".
     std::string tuneModeText = "auto(cfg)";
-    // "absent" / "loaded" / "negative" / "rejected"
+    // The loader chain's state: "absent" (no file at this key's path) / "loaded" (the file was accepted
+    // and its rows are the answer) / "rejected" (the file was refused -- by the parser or by one of the
+    // key comparisons -- so nothing of it is used).  Those are the THREE states the chain can leave.
+    // ("retune-ignored" is the branch that never enters the chain: KATAGO_VK_TUNE_RETUNE makes the loader
+    // skip the file entirely.  "negative" was a fourth value until B3/B3.5 deleted the second cache form
+    // and the field that carried it -- the value is no longer producible and is not named here.)
     std::string cacheState = "absent";
     // Cache-growth accounting (t1-schema.md section 1, "pipeline cache growth"): the
     // bytes this process loaded from the persistent pipeline cache.  The "after" reading
@@ -333,8 +318,8 @@ namespace VulkanTuner {
     // "nothing was better" claim may be written, so "nobody told us" must not read as "we measured
     // everything".  It is NOT the same flag as `coverageComplete` (tune-measurement.md section 2.6,
     // "两个旗标别混进一个名字"): that one is the CALLER's statement about the shape set (an input, R-25)
-    // and decides whether a whole-slot row is admissible, while this one decides whether the NEGATIVE
-    // claim is.
+    // and decides whether a whole-slot row is admissible, while this one decides whether the
+    // "no gain" claim is.
     bool pairsComplete = false;
     // (7a) / R-25: THE CALLER'S STATEMENT ABOUT THE SHAPE SET -- an INPUT to the measurement primitive
     // (the primitive ECHOES it; it may not derive it, because "looks complete" is the false green the flag
@@ -345,7 +330,7 @@ namespace VulkanTuner {
     //    coverageComplete  -- is the set I handed over the COMPLETE shape set of this slot?
     //                         (an INPUT, R-25; decides whether a whole-slot row is admissible)
     //    candidateCoverage -- HOW MUCH of the DECLARED DOMAIN the search walked
-    //                         ("unknown"/"sampled"/"swept"; decides whether a NEGATIVE entry may be minted)
+    //                         ("unknown"/"sampled"/"swept"; decides whether the claim covers a sweep)
     //    pairsComplete     -- did the MEASUREMENT conclude every legal pair?
     //                         (decides whether a "nothing was better" claim may be written)
     // None of the three may be derived from another: different components answer them, at different
@@ -557,11 +542,16 @@ namespace VulkanTuner {
     std::vector<uint32_t> ctxOrdinals;
     // W2 (post-review, 2026-09-20): did ANY context of this device install at least one row?
     // DELIBERATELY an OR fold, NOT the AND fold `install.installed` uses: this answers "does this KEY
-    // have an injection slot at all", and ONE context proving that it does is enough.  It gates the
-    // NEGATIVE entry, because writing "no-injection-slot" for a key into which this very process
-    // installed rows (and hit them) is a self-refuting, sticky, key-scoped verdict -- measured in the
-    // first smoke run with the write live, where one key got `wrote 1 row(s)` from one leg and a
+    // have an injection slot at all", and ONE context proving that it does is enough.  It is the input
+    // of the finalizer's SELF-FALSIFICATION guard: writing "no-injection-slot" for a key into which this
+    // very process installed rows (and hit them) is a self-refuting, sticky, key-scoped claim -- measured
+    // in the first smoke run with the write live, where one key got `wrote 1 row(s)` from one leg and a
     // `NEGATIVE no-injection-slot` from another.  Set in installForHandle; only ever turned ON.
+    // ⚠️ B3.5 (2026-10-01): the guard it feeds is now a REPORTED verdict only.  While the second cache
+    // form existed, `cacheEntryWritable`'s last arm read the marker this field's verdict suppressed, so
+    // the guard also REFUSED the write; B3 moved `structural-all-reject`'s effect to `rows`, so that arm
+    // no longer decides anything for that row and `anyRowInstalled` does not reach the write gate.  See
+    // the consequence note on `finalizeOutcome` -- the field and the verdict stay, the carrier changed.
     bool anyRowInstalled = false;
     // W2 (decision E, AMENDED to 2' after source review): the once hook.  Its body lives entirely in
     // vulkantuner.cpp, so this stays DATA: no fifth interface name (R1), no control surface in the
@@ -603,13 +593,17 @@ namespace VulkanTuner {
     //                                   form of step 1b-2b, and never a loud line.
     //   Measured                     -- at least one row is durable; the file (if any) carries rows.
     //   AnyRowInstalled              -- every declared row was rejected HERE, but some context of this
-    //                                   device installed a row for this SAME key: (b) the key-scoped
-    //                                   marker would be false by our own account.
+    //                                   device installed a row for this SAME key: the key-scoped claim
+    //                                   would be false by our own account (self-falsification guard).
     //   OurGap                       -- all rejected, but not every reason is a device property (G-D20).
-    //   DeviceOnlyAllReject          -- all rejected, every reason a device property: the marker stands.
-    //   StaleFromFileNegativeRetired -- a row is durable, so a marker READ FROM A FILE was retired.
+    //   DeviceOnlyAllReject          -- all rejected, every reason a device property: the claim stands.
+    // 🔴 B3.5 (2026-10-01): `StaleFromFileNegativeRetired` USED TO BE THE SIXTH VALUE -- "a row is
+    // durable, so a marker READ FROM A FILE was retired".  A from-file marker cannot be born any more
+    // (B3 made the parser refuse a `NEGATIVE` line; B3.5 deleted the field it was carried in), so the
+    // verdict had no producer and is gone.  The switch in `reportVerdict` has no `default:`, which is
+    // what made removing the enumerator and its case a COMPILE-time pair rather than a silent drift.
     enum class FinalizeVerdict { Nothing, Measured, AnyRowInstalled, OurGap,
-                                 DeviceOnlyAllReject, StaleFromFileNegativeRetired };
+                                 DeviceOnlyAllReject };
     // The last verdict REPORTED for this decision.  The finalizer runs more than once (once per context
     // install, then once at the once point) and its answer may legitimately CHANGE between those calls,
     // so "report only on a transition" is what makes a repeated line impossible WITHOUT also silencing
@@ -671,12 +665,16 @@ namespace VulkanTuner {
   //   ROWS <n>               DECLARED row count: a file that lost rows in transit is
   //                          refused instead of being read as a shorter row set
   //   ROW <path> <src0> <src1> <key_m> <key_k> <BM> <BN> <BK> <WM> <WN> <WMITER> <TM> <TN> <BS> <pad> <reshape> <smaller>
-  //   NEGATIVE <reason>      this (device, model, S, mb) was DETERMINISTICALLY all-rejected;
-  //                          no tuning is attempted.  Never written on a timeout, and never
-  //                          written for a partial result.  `<reason>` is one of the CLOSED
-  //                          SET declared in vulkantuner.cpp -- a reason outside it refuses the
-  //                          file, because the reason is the part of the claim
-  //                          that has to stay comparable across releases.
+  //
+  // 🔴 THERE IS NO SECOND FORM (B1's ONE-cache-form ruling, completed by B3/B3.5).  A `NEGATIVE <reason>
+  // <kind>[,<kind>...]` line used to be here: "this (device, model, S, mb) was DETERMINISTICALLY
+  // all-rejected; no tuning is attempted", whose reason came from a CLOSED SET so it stayed comparable
+  // across releases.  That form is gone -- the statement it made ("use the stock configuration
+  // everywhere") is now written the only way this file writes anything, as the row set, EMPTY when that
+  // is the answer: `ROWS 0` plus its ROWSET_HASH.  A file carrying a `NEGATIVE` line is REFUSED BY NAME
+  // (the parser names the removal), which is the same fail-open landing point as any other refusal: the
+  // whole key is re-tuned.  SCHEMA_VERSION moved 5 -> 6 for exactly this, and the loader's `cacheState`
+  // therefore has no `negative` value to print.
   //
   // WHICH HEADER KEYS ARE REQUIRED (2026-09-13 review; ONE channel left since R-29):
   //   POLICY, BASELINE -- they carry "the policy changed, so this row set is void".  A missing
@@ -701,9 +699,12 @@ namespace VulkanTuner {
   // `benchmark -threads 1,2,4` sweep keep every bucket's rows instead of only the last
   // one's.  Precedent: OpenCLTuner::defaultFileName, which the plan says to mirror.
   //
-  // Because one file = one key, ROWS and NEGATIVE are mutually exclusive STATEMENTS about
-  // that key: the writer refuses to emit both (see formatRowsFileImpl).  The reader still
-  // handles a hand-edited file containing both by preferring the rows and saying so loudly.
+  // Because one file = one key, the file carried two mutually exclusive STATEMENTS about that key while
+  // the NEGATIVE form existed (`ROWS` / `NEGATIVE`), and the writer refused to emit both.  🔴 B3.5
+  // (2026-10-01): with that form deleted there is only ONE statement left to make -- the row set, which
+  // may be EMPTY -- so the exclusion, the reader's "prefer the rows and say so loudly" branch for a
+  // hand-edited file carrying both, and the fields behind them are all gone.  What remains is what the
+  // name already says: `formatRowsFile` emits the durable row set and nothing else.
   std::string formatRowsFile(const Decision& decision);
 
 }  // namespace VulkanTuner

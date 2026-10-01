@@ -300,68 +300,28 @@ namespace VulkanTuner {
       return !readOnlyMode(policy);
     }
 
-    // The CLOSED SET of NEGATIVE reasons (t3-shell-plan.md section 6.4 item 2).  A file-level
-    // reason is a claim about the DEVICE that outlives this process, so it must be comparable by
-    // machine and interpretable by the NEXT release that reads it -- which is exactly why the set
-    // is declared data rather than "whatever string the deciding code happens to produce".
-    //
-    // What may be in here: class (a) only, i.e. the device STRUCTURALLY cannot be tuned (there is
-    // no injectable slot, or the row lookup is unreachable by construction).  Class (a) does not
-    // depend on any gate / tau / soft-gate parameter, so a policy change can never invalidate it.
-    //
-    // What must NOT be in here: class (b) (every candidate rejected by the validation gate) and
-    // class (c) (timeout / IO failure / DEVICE_LOST / no winner).  (b) is only sound to write once
-    // the gate parameters are part of policyFingerprint -- which they now ARE (POLICY_CONSTANTS, read
-    // by policyFingerprint; R-28 step (1), 2026-09-26) -- because otherwise changing a gate parameter
-    // would leave the key permanently skipped -- and (c) is not a property of the device at all
-    // (t1-schema.md section 1 discipline (b): "we ran out of time" must never be remembered as
-    // "this device cannot be tuned").  Adding a name here is therefore a deliberate act, and both
-    // the re-evaluation trigger (section 6.4 item 5) and R17 point at this array.
-    //
-    // WHY EACH REASON ALSO DECLARES ITS INVALIDATION RULE (2026-09-13 review): a reason alone is
-    // not enough.  "This device cannot be tuned" is a claim that OUTLIVES the process, and a claim
-    // is only sound if something is guaranteed to void it -- otherwise the file becomes "this key
-    // is permanently skipped", which is the worst outcome the negative cache can produce.  So the
-    // rule is DATA here (pinned by R17), not a sentence in a comment.
-    //
-    //   `full-key-set` = the ONLY rule implemented today, and the strongest one available: the
-    //   loader refuses the file unless FINGERPRINT, TUNER_VERSION, POLICY, BASELINE and (on the
-    //   cache channel) MODEL, BOARD, MAXBATCH and ROWSET_HASH all match, so a change of device,
-    //   driver, capability, tuner code, policy, model, board or batch voids the claim.  Every
-    //   reason therefore has the SHORTEST possible lifetime, and over-invalidation is the safe
-    //   direction (the cost is one re-decision, not a stale skip).
-    //
-    // A reason that needs anything else is a FORMAT-LEVEL act, not an edit here: a SHORTER
-    // lifetime means a new invalidation condition, which means a new key in the header and the
-    // file name (R12 forces that decision too); a LONGER lifetime -- surviving a key change -- is
-    // not expressible at all, because the file name carries the whole key.  The practical reason
-    // the rule is per-reason: the reasons are not obviously equal (no-injection-slot is a hard
-    // fact about the device, no-entry leans on the model/family), so "they happen to share a rule
-    // today" has to be written down instead of being assumed.
-    //
-    // WHERE `full-key-set` IS REDEEMED (a declared rule that nothing redeems is a comment in
-    // disguise, and this struct carries no runtime weight at all): the LOADER's key comparisons --
-    // makeDecision()'s refusal chain (fingerprint, VERSION/TUNER_VERSION, POLICY, BASELINE, MODE,
-    // then the outer key item by item, then ROWSET_HASH on the cache channel) together with
-    // parseRowsFile()'s required-key loop, which is fed by REQUIRED_ANY_CHANNEL/REQUIRED_FOR_CACHE.
-    // Nothing mechanically ties the value to those lines: R17 pins the value AND pins that each
-    // named comparison still exists somewhere in this file, and the behavioural half is the
-    // smoke's refusal legs (S6, A5/A6, A14/A15/A16, A18, A31/A32).  Change either side and both
-    // have to be revisited.
-    //
-    // ✅ GAP CLOSED (C2, 2026-09-18): VERSION / TUNER_VERSION are now IN REQUIRED_FOR_CACHE, which
-    // is the fix this note recommended -- absence is refused on the cache channel.  The comparisons
-    // below still keep their `found*` guard, and that is not redundant: they answer "is it the
-    // RIGHT version", while
-    // REQUIRED_FOR_CACHE answers "did it say at all".  Dropping the guard would make an absent key
-    // read as a mismatching one and would name the wrong cause in the refusal line.
-    // The closed set of negative-entry REASONS used to live here (struct NegativeReasonSpec,
-    // NEGATIVE_REASONS[], negativeReasonKnown()).  It was deleted together with the wire segment it
-    // served (SCHEMA_VERSION 5 -> 6): with no `NEGATIVE` line to read or write there is no reason
-    // token to keep closed.  The `Decision` fields it validated (`negative` / `negativeReason`) still
-    // exist and are still set by the in-memory decision path -- their removal is a separate step, and
-    // deleting this set here does not widen anything: the only checks that disappeared were checks on
-    // a string that can no longer reach the disk or arrive from it.
+    // The CLOSED SET of negative-entry REASONS used to live here (struct NegativeReasonSpec,
+    // NEGATIVE_REASONS[], negativeReasonKnown(), each entry declaring its own invalidation rule), and
+    // so did the reason it existed: a file-level reason WAS a claim about the DEVICE that outlives the
+    // process, so it had to be comparable by machine and interpretable by the NEXT release that read
+    // it, and it was only sound if something was guaranteed to void it -- otherwise the file said
+    // "this key is permanently skipped", the worst outcome that cache could produce.  The rule was
+    // DATA (`full-key-set`: the loader refuses the file unless FINGERPRINT, TUNER_VERSION, POLICY,
+    // BASELINE and, on the cache channel, MODEL, BOARD, MAXBATCH and ROWSET_HASH all match), and it
+    // was redeemed by makeDecision()'s refusal chain plus parseRowsFile()'s required-key loop, which is
+    // fed by REQUIRED_ANY_CHANNEL / REQUIRED_FOR_CACHE below.
+    // It could all go because the thing it guarded went FIRST: B3 removed the `NEGATIVE` wire segment
+    // (SCHEMA_VERSION 5 -> 6), so a cache file can no longer carry a reason token -- there is nothing
+    // left for a closed set to keep closed and nothing left for an invalidation rule to void.  B3.5
+    // removed the last of it: the in-memory `Decision::negative` / `negativeReason` fields, the kind
+    // scope, the provenance origin and the durable-effect plumbing.  Neither cut widened anything: the
+    // only checks that disappeared were checks on strings and states that could no longer reach the
+    // disk or arrive from it.
+    // ✅ STILL TRUE AND STILL LOAD-BEARING, one level over (C2, 2026-09-18): VERSION / TUNER_VERSION
+    // are IN REQUIRED_FOR_CACHE -- absence is refused on the cache channel -- and the comparisons in
+    // the loader keep their `found*` guard anyway.  That is not redundant: the guard answers "is it the
+    // RIGHT version", while REQUIRED_FOR_CACHE answers "did it say at all".  Dropping the guard would
+    // make an absent key read as a mismatching one and would name the wrong cause in the refusal line.
 
     // W4b: is this a kind this build knows?  The registry and its membership test live HERE because
     // they are the closed set the file format depends on: the parser (which reads a ROW line's kind)
@@ -389,28 +349,26 @@ namespace VulkanTuner {
     }
 
     // ── W3-P1: PROVENANCE -- "this candidate set is THIS process's own measurement" ────────────────
-    // "This key has no injection slot" is a KEY-SCOPED and STICKY claim: once it is in the cache the
-    // key is skipped until the file's invalidation rule voids it.  It may therefore only be concluded
-    // from a candidate set this process produced ITSELF -- a set read from a file (the cache)
-    // says what SOME OTHER run saw, and a hand-made or dev-reflowed file says nothing at all.  This is
-    // the ONE predicate that answers that question, and it is named and printable because the write
-    // path has to cite it (R42 pins the citation).
-    //
-    // Fail-closed by construction: the tested value is the string "measured", and nothing but the
-    // enumerator (step 5) ever writes it.  So today the durable negative entry is UNREACHABLE, which
-    // is the intended state until that writer exists -- no writer, no verdict.  The older guard
-    // (`anyRowInstalled`) stays in place: it answers "did anything install here", which is a
-    // different question from "may a durable verdict be minted from this decision".
-    bool negativeProvable(const Decision & d) {
-      return d.rowSource == "measured";
-    }
+    // "This key has no injection slot" WAS a KEY-SCOPED and STICKY claim: once it was in the cache the
+    // key was skipped until the file's invalidation rule voided it.  It could therefore only be
+    // concluded from a candidate set this process produced ITSELF -- a set read from a file (the cache)
+    // says what SOME OTHER run saw, and a hand-made or dev-reflowed file says nothing at all.
+    // 🔴 B3.5 (2026-10-01): THE DURABLE CLAIM IS GONE -- B3 deleted the `NEGATIVE` wire segment, so there
+    // is no sticky entry left to gate.  The QUESTION is still live for the `measured-here` condition below
+    // ("may this decision's conclusion be remembered?"), so the CONDITION and its SENTENCE both stay; what
+    // is retired is the `negativeProvable` wrapper and the marker that sentence was written for.  The test
+    // itself lives in the named one-liner `measuredHere()` below.
+    // (`anyRowInstalled` is the older guard and answers a different question: "did anything install".)
 
-    // The registered marker of the provenance refusal, as its OWN literal (W3b).  Why a named constant
-    // rather than a literal inside the sentence: the acceptance leg (A36) greps exactly this string, the
-    // self-test asserts against the same string the writer prints, and R42(e) pins that the two
-    // spellings are EQUAL -- all three only work if the marker is one literal in one place.  The refusal
-    // sentence below starts with it, so a reader who greps the marker finds the clause that owns it.
-    const char* const MEASURED_MARKER = "not this process's own measurement";
+    // 🔴 B3.5 (2026-10-01): THE REGISTERED CONSTANT IS GONE; THE SENTENCE IS NOT.  `MEASURED_MARKER` held
+    // the literal "not this process's own measurement" (W3b) so that the acceptance leg's grep, the
+    // self-test's assertion and the writer's own text were provably ONE spelling (R42(e)).  The subject
+    // those pins were about was the DURABLE MARKER, and it died with the `NEGATIVE` wire segment in B3, so
+    // the constant goes here with it.  What is NOT retired is the refusal TEXT: R10s' SHELL_INVENTORY
+    // counts that literal at exactly ONE non-comment line, and the smoke's own leg parses it, so the
+    // sentence keeps its wording and the literal is inlined as its prefix -- still spelled once.
+    // The `measured-here` CONDITION also stays (its survival is a separate ruling, and
+    // `DecisionOutcomeSpec::condition` is untouched).
 
     // The EXTRA conditions a table row may name: a CLOSED SET, each entry owning the WHOLE sentence it
     // refuses with.  Why the sentence lives here and not in the writer: the generic state-gate message
@@ -424,6 +382,17 @@ namespace VulkanTuner {
     // `refusal == nullptr` stays as the fail-closed default a new entry gets until somebody decides
     // what it should say (the writer then uses the generic sentence, which is why an entry may only be
     // left null when that sentence is TRUE for it).
+    //   ⚠️ B3.5 (2026-10-01): EVERY ENTRY KEEPS TWO LAMBDAS, and that is a criterion rather than a style
+    // -- R42 counts the lambdas per entry and demands exactly two (`holds` and `refusal`).  `measured-here`
+    // therefore calls the named one-line `measuredHere()` from its `holds` half instead of inlining the
+    // comparison, which is what kept the count at two when the `negativeProvable` wrapper was deleted.
+    //
+    // The `measured-here` condition's body, as a NAMED function: the wrapper it used to live in is gone and
+    // the comparison needed a home that is not one of the entry's two lambdas.  Fail-closed in the same
+    // direction as ever: the tested value is the string "measured", and only the enumerator writes it.
+    bool measuredHere(const Decision & d) {
+      return d.rowSource == "measured";
+    }
     struct ConditionSpec {
       const char* name;
       bool (*holds)(const Decision &);
@@ -439,9 +408,13 @@ namespace VulkanTuner {
                  "property of this device -- so the coarse outcome 'structural-all-reject' is recorded "
                  "WITHOUT a durable verdict (G-D20)";
         } },
-      { "measured-here", [](const Decision & x) { return negativeProvable(x); },
+      { "measured-here", [](const Decision & x) { return measuredHere(x); },
         [](const Decision & x) {
-          return string(MEASURED_MARKER) + ": this decision concluded '" + x.outcome
+          // W3-P1/W3b, text UNCHANGED by B3.5: this is the sentence the smoke's provenance leg parses, and
+          // the literal R10s' SHELL_INVENTORY counts at exactly ONE non-comment line.  The retired
+          // `MEASURED_MARKER` constant's literal is inlined here as the prefix, so the file still spells
+          // it exactly once.
+          return string("not this process's own measurement") + ": this decision concluded '" + x.outcome
                + "' from a candidate set it did not produce itself (row source '" + x.rowSource
                + "'), and only a candidate set THIS process measured may be remembered as a durable "
                  "verdict -- a file says what some other run saw, and a hand-made or reflowed file says "
@@ -499,15 +472,17 @@ namespace VulkanTuner {
     // `cacheWriteAllowed(policy)` answers "may this process touch the cache at all" (the user's
     // mode); this answers "does this decision say anything" (the decision's state), and they are
     // separate because they fail for different reasons and are fixed by different people.  The
-    // state it rejects is real: a file carrying neither ROW nor NEGATIVE loads without complaint
-    // and reads as "this key is already decided" (see the writer comment in formatRowsFileImpl),
-    // so the CACHE write path must refuse to create one -- it is the only writer left, and a
-    // decision that says nothing may not become "this key is already decided".
+    // state it rejects is real: a file carrying no ROW line (B1's ONE-cache-form ruling retired the
+    // second form and B3 deleted it from the wire) loads without complaint and reads as "this key is
+    // already decided", so the CACHE write path must refuse to create one -- it is the only writer
+    // left, and a decision that says nothing may not become "this key is already decided".
     // W2: THE effective row set this process may write down -- ONE spelling, used by BOTH the write
     // gate below and the formatter.  Why one spelling and not two: the gate answers "is there anything
-    // to write?" and the formatter emits it, so if they disagreed about a set whose rows were all
-    // dropped, the gate would say yes and the file would carry `ROWS 0` with no NEGATIVE -- which the
-    // reader treats as "this key is already decided", i.e. tuning suppressed for ever.
+    // to write?" and the formatter emits it, so a disagreement about a set whose rows were all dropped
+    // would publish a `ROWS 0` this decision never concluded -- and since the ONE-cache-form ruling
+    // (2026-09-30) `ROWS 0` is a COMPLETE statement ("this key was measured and the stock
+    // configuration is the best this device has"), i.e. a wrong one is a durable lie rather than the
+    // empty file it used to be.
     //
     // 🔴 THREE states, and the third one is why this is not a two-line predicate:
     //   Absent       (no install recorded)         -> the DECLARED rows.  The self-test's synthetic
@@ -592,18 +567,23 @@ namespace VulkanTuner {
     //
     // Class (b) -- a run the RUNTIME GATE refused -- was declared NOT writable until the gate / tau /
     // soft-gate parameters entered policyFingerprint, because changing a gate parameter would
-    // otherwise leave the key permanently skipped (section 6.4 items 1/5 -- the same argument R17 makes
-    // for the file's reason).  🔴 ONE MEANING FOR THE DEPLOYED NAME: this comment used to say "every
-    // candidate rejected by the validation gate", which is a DIFFERENT claim; the name's carrier is
-    // settled by the ruling row in tune-gaps.md A1-A (the P12 runtime spike-rate gate), and
-    // `rejectBySpikeGate` below is the only thing that mints it.
-    // THAT CONDITION IS NOW MET: the gate/statistics constants are rows of POLICY_CONSTANTS and
-    // policyFingerprint() appends them, so a gate change changes the key by construction instead of by
-    // trusting that the revision moved (R-28 step (1), 2026-09-26).  The writable flag is TRUE and the
-    // same-spelling NEGATIVE reason is in NEGATIVE_REASONS in THIS batch (R-28 step (2)) -- the two are
-    // indivisible: a same-spelling reason whose outcome row stayed unwritable would be a name the cache
-    // writer can never emit, and a writable row with nothing that produces it would be a state with no
-    // producer.
+    // otherwise leave the key permanently skipped (section 6.4 items 1/5).  🔴 ONE MEANING FOR THE
+    // DEPLOYED NAME: this comment used to say "every candidate rejected by the validation gate", which
+    // is a DIFFERENT claim; the name's carrier is settled by the ruling row in tune-gaps.md A1-A (the
+    // P12 runtime spike-rate gate), and `rejectBySpikeGate` below is the only thing that mints it.
+    // THAT CONDITION WAS MET (R-28 step (1), 2026-09-26: the gate/statistics constants are rows of
+    // POLICY_CONSTANTS and policyFingerprint() appends them, so a gate change changes the key by
+    // construction instead of by trusting that the revision moved), and it was met in the same batch
+    // that gave the row a reason to be writable -- a same-spelling reason in the closed set.
+    // 🔴 TODAY THE ROW IS `writable = false` WITH EFFECT `nothing:rerun` (B3, SCHEMA_VERSION 5 -> 6),
+    // and this is the reading of that state rather than a leftover: `rejectBySpikeGate` still mints the
+    // outcome and still clears the row set (a refusal is a verdict about the MEASUREMENT, which
+    // produced no usable answer), but the gate refusal now leaves NOTHING durable -- the
+    // `NEGATIVE gate-reject` entry it used to write died with the wire segment, and the closed reason
+    // set that had to carry the same spelling died with it (B3 deleted both, and B3.5 deleted the
+    // in-memory fields behind them).  The row therefore has an EMPTY `condition` column: `measured-here`
+    // was removed from it in B3 because a condition on a row that can never be written has no subject.
+    // The price of the flips is recorded at the row itself and in `rejectBySpikeGate`'s NOTICE.
     //
     // The lookup is FAIL-CLOSED (see outcomeWritable): an outcome this build does not know is not
     // writable, so a caller that invents a state cannot write by accident.
@@ -727,10 +707,11 @@ namespace VulkanTuner {
       // the stability step of the decision path, which lands with the measurement primitive in this
       // batch, and until it does this row is a WINDOW ITEM -- tracked as a ledger row in tune-gaps.md
       // section A1-A (the list of names the spec declares before their carrier exists).  An OUTCOME name
-      // may not precede its producer, unlike a NEGATIVE reason whose reserved class above exists
-      // precisely because the parser must accept names no writer has produced yet; registering these
-      // two in the SAME batch as their producers is what keeps the row from being reverse drift, and the
-      // ledger is what makes that an obligation someone can check instead of prose.
+      // may not precede its producer -- the old contrast was a NEGATIVE reason's reserved class, which
+      // existed precisely because the parser had to accept names no writer had produced yet; that class
+      // and its parser branch are both gone (B3/B3.5), so this is now the ONLY place in the format where
+      // a declared name can outrun its producer, and the ledger is what makes it an obligation someone
+      // can check instead of prose.
       { "unstable",              "measurement", false, "",                                                       "nothing:rerun" },
     };
 
@@ -778,56 +759,56 @@ namespace VulkanTuner {
       return v;
     }
 
-    // Turn a rejected measurement into the durable verdict.  THE one production writer of the
-    // `gate-reject` state and of its same-spelling reason: R17 counts this assignment site, and R42
-    // counts the marker it sets alongside `finalizeOutcome`'s.
+    // Turn a rejected measurement into the state the decision carries.  THE one production setter of
+    // the `gate-reject` state: that is the outcome the table declares with effect `nothing:rerun`, and
+    // `klass = "gate"` is the class token the guardrail's whitelist and the self-test's fixture
+    // selector read.
     //
-    // Four things this function owns, in the order they matter:
+    // 🔴 WHAT IT NO LONGER DOES, AND WHY THAT IS THE POINT (B3 + B3.5): it used to write the DURABLE
+    // `gate-reject` entry -- a same-spelling reason in the closed set -- and that second cache form was
+    // deleted by B3 (SCHEMA_VERSION 5 -> 6), with the in-memory marker fields behind it following in
+    // B3.5.  The function is therefore exactly TWO statements now, and the name it keeps
+    // (`setGateRejectMarker`) is a historical one: there is no marker left in the format for it to set.
+    //
+    // Two things this function owns, in the order they matter:
     //   (1) IT CLEARS THE ROW SET.  A gate refusal says "this run's measurement quality cannot support
     //       ANY durable claim", so rows measured in the same run must not survive it; the verdict is
     //       about the measurement, not about which candidate happened to look fast.
-    //   (2) IT SETS THE MARKER WITH ITS OWN ORIGIN.  `negativeOrigin` records WHO may take a marker away,
-    //       and the finalizer recomputes only its own (AllReject).  Leaving this one at `None` would be
-    //       the "one field, two writers, no record of who wrote it" sharing that field exists to
-    //       prevent, and would let the finalizer's reset wipe a verdict it never reached.
-    //   (3) IT SETS THE OUTCOME, so the state gate and the file agree by construction rather than by the
-    //       caller remembering to set two fields that must match.
-    //   (4) IT SAYS THE READING OUT LOUD -- interval AND bound AND the counting inputs.  R-28 requires
-    //       the loud to name the measured interval and the bound; `nObjects` rides along because it is
-    //       the missing ingredient of the registered clustering-aware interval.
+    //   (2) IT SETS THE OUTCOME, so the state gate and the file agree by construction rather than by the
+    //       caller remembering to set two fields that must match -- `outcomeWritable` plus the row's
+    //       EMPTY `condition` column are what make the write refuse, and they read THIS field.
     //
-    // NOT SET HERE, deliberately: `allRejectReasonsAreDevice` (the row's condition is `measured-here`;
-    // inventing a second satisfied condition would make the fixture pass for the wrong reason) and
-    // `rowInstalledSeen`/`rowInstalled` (the gate judges the measurement, which is upstream of every
-    // install, so there is no mask to reconcile -- and if a caller ever ran this after an install,
-    // `rowsForWrite`'s size mismatch is the fail-closed, LOUD answer rather than a silent guess).
+    // NOT SET HERE, deliberately: `allRejectReasonsAreDevice` (the structural row's condition is
+    // `device-only,measured-here,swept-here`; inventing satisfied conditions would make a fixture pass
+    // for the wrong reason) and `rowInstalledSeen`/`rowInstalled` (the gate judges the measurement,
+    // which is upstream of every install, so there is no mask to reconcile -- and if a caller ever ran
+    // this after an install, `rowsForWrite`'s size mismatch is the fail-closed, LOUD answer rather than
+    // a silent guess).
+    // The NOTICE is deliberately NOT part of this function (it lives in `rejectBySpikeGate` below): the
+    // STATE and the EVENT are two responsibilities, split in R-29's close-out, and that split is what
+    // keeps the sentence to ONE production site.
     //
     // ⚠️ WHAT THIS FUNCTION DOES NOT SETTLE, split by which half has a CARRIER (R-28 step (3) tightened
     // this note, because a half that can be executed must not be left as a sentence):
     //   * the order against the THREE-BRANCH decision is FIXED by the ruling -- the gate judges the
     //     MEASUREMENT, which is upstream of the install accounting, so it runs FIRST and a gate-rejected
     //     run never reaches the three branches.
-    //   * the order against the FINALIZER on an EMPTY-INSTALL decision is now EXECUTED by the self-test's
-    //     (k) case: the finalizer must return Nothing and leave this verdict and its marker alone.
+    //   * the order against the FINALIZER on an EMPTY-INSTALL decision is EXECUTED by the self-test's
+    //     (k) case: the finalizer must return Nothing and leave this verdict alone.
     //   * what still has NO carrier is the protocol side (⑤): a row that installs AFTER a gate rejection.
     //     That half stays a registered window obligation, not an implied guarantee.
-    // 🔴 THE MARKER AND THE LOUD ARE TWO RESPONSIBILITIES (split 2026-09-26, R-29 close-out).
-    // The marker is the STATE a gate rejection leaves; the NOTICE is the EVENT it reports.  They were
-    // one function, and the self-test's POLICY-row probe -- which needs a decision the FORMATTER can
-    // write and therefore installs this marker -- ended up reporting a gate event for a measurement it
-    // never made: `NOTICE: : spike-rate gate: ...` with an EMPTY device name (the synthetic decision has
-    // none), a third copy of the sentence the smoke pins at exactly two, and the last red leg of the
-    // close-out run.  The literal stays in ONE production site (this setter); the census that used to
-    // count it (`WANT_REASON_WRITERS`, guardrail R17) was RETIRED with the negative-entry family in B3,
-    // because the closed reason set it counted no longer exists -- so splitting costs no rule anything
-    // today, and the one-site property is now held by this comment and by the smoke's own leg counts.
+    // 🔴 WHY THE LOUD IS A SEPARATE FUNCTION (split 2026-09-26, R-29 close-out): the self-test's
+    // POLICY-row probe -- which needs a decision the FORMATTER can write -- USED to call this setter (it
+    // was the way to make a decision the formatter accepted), and it ended up reporting a gate event for
+    // a measurement it never made: `NOTICE: : spike-rate gate: ...` with an EMPTY device name (the
+    // synthetic decision has none), a third copy of the sentence the smoke pins at exactly two, and the
+    // last red leg of the close-out run.  B3 gave that probe a legal row instead, so the call is gone;
+    // the literal stays in ONE production site (`rejectBySpikeGate`), and the census that used to count
+    // it (`WANT_REASON_WRITERS`, guardrail R17) was RETIRED with the negative-entry family in B3, because
+    // the closed reason set it counted no longer exists -- so splitting costs no rule anything today, and
+    // the one-site property is now held by this comment and by the smoke's own leg counts.
     void setGateRejectMarker(Decision & d) {
       d.rows.clear();
-      d.negative = true;
-      d.negativeReason = "gate-reject";
-      d.negativeScope.clear();
-      d.negativeScope.push_back("mm");
-      d.negativeOrigin = Decision::NegativeOrigin::SpikeGate;
       d.outcome = "gate-reject";
     }
     void rejectBySpikeGate(Decision & d, const SpikeGateVerdict & v) {
@@ -852,7 +833,7 @@ namespace VulkanTuner {
     // decision needs -- "is this comparison trustworthy at all" and "which candidate is not worse than
     // stock on EVERY covered shape" (tune-measurement.md section 2.3.1's live criteria).  It DECIDES
     // NOTHING about what is written: the three branches and the write are (7d)'s, which is why this
-    // function neither calls the write path nor assigns an outcome -- the spike gate's marker is minted
+    // function neither calls the write path nor assigns an outcome -- the `gate-reject` outcome is set
     // by `rejectBySpikeGate`, the ONE setter that owns it.
     //
     // WHERE EVERY CRITERION COMES FROM (no new statistics and no second spelling of any of them):
@@ -1151,10 +1132,12 @@ namespace VulkanTuner {
     //   * BRANCH ① IS NOT AFFECTED BY INCOMPLETENESS: a candidate that won may still be written, because
     //     what was dropped was an ALTERNATIVE (section 2.6(a) states this explicitly -- reading the flag
     //     as "suppress the whole write" would let one slow candidate void a safe row set).
-    //   * BRANCH ② (a complete measurement with no winner) is NOT this function's business and is not in
-    //     this build: its outcome (`measured-no-gain`) and its writer (`NEGATIVE no-gain`) land with the
-    //     protocol that produces them, and R17 pins `no-gain`'s writer count at 0 until then.  So a
-    //     decision whose set is complete is left EXACTLY as it was found, not re-labelled here.
+    //   * BRANCH ② (a complete measurement with no winner) is STILL NOT this function's business: the
+    //     outcome (`measured-no-gain`) is produced by `concludeBranches` below, and what this function
+    //     answers is only the INCOMPLETE case.  So a decision whose set is complete is left EXACTLY as it
+    //     was found, not re-labelled here.  (The `NEGATIVE no-gain` writer this sentence used to wait for
+    //     is gone: the row exists, it is writable, and its durable effect is `rows` -- the EMPTY row set
+    //     -- since B1's ONE-cache-form ruling of 2026-09-30.)
     //   * BRANCH ③'s outcome is `no-winner` -- an already DECLARED, unwritable outcome -- so this branch
     //     adds no state and no gate, and "we could not finish the comparison" can never be written down
     //     as a property of the device.
@@ -1420,7 +1403,13 @@ namespace VulkanTuner {
         // the EMPTY set (`ROWS 0`: measured, and stock is the best this device has).  So the question is
         // whether the row set may be written at all -- the write gate's own question, ASKED rather than
         // re-spelled, so the column and the writer cannot disagree.
-        return !d.negative && cacheEntryWritable(d);
+        // 🔴 B3.5 (2026-10-01): this read `!d.negative && cacheEntryWritable(d)`.  The `!d.negative`
+        // operand said "a decision carrying a durable marker does not hold the effect `rows`", i.e. the
+        // two cache forms were mutually exclusive; with ONE form and no marker field, the operand has no
+        // subject and is gone.  That is a SUBTRACTION, not a relaxation: the clause it guarded can no
+        // longer be true of anything (nothing can set a marker), so no decision that used to answer
+        // "false" here answers "true" now.
+        return cacheEntryWritable(d);
       }
       // The `negative:<reason>` arm was deleted with the NEGATIVE wire segment (SCHEMA_VERSION 5 -> 6)
       // and MUST NOT come back: there is no durable marker left for it to route, so a table row naming
@@ -1429,7 +1418,14 @@ namespace VulkanTuner {
       // iterates the table through here, so a `negative:` string reappearing in `DECISION_OUTCOMES`
       // reddens instead of silently refusing.
       if (e.rfind("nothing:", 0) == 0) {
-        return !d.negative && rowsForWrite(d).empty();
+        // 🔴 B3.5 (2026-10-01): this read `!d.negative && rowsForWrite(d).empty()`.  The deleted operand
+        // said "a decision carrying a durable marker cannot also claim that nothing was left behind" --
+        // a real impossibility while two cache forms coexisted (the marker WAS something left behind).
+        // The concept is gone, so the clause has NO SUBJECT and only the content half survives: the
+        // effect `nothing:<why>` means exactly "this decision has no row set to write", which is what
+        // the writer's own gate asks next.  Nothing is widened -- the operand could not be false for a
+        // decision that reaches here (no field can carry a marker any more).
+        return rowsForWrite(d).empty();
       }
       return false;
     }
@@ -1801,7 +1797,7 @@ namespace VulkanTuner {
     };
     const size_t CANDIDATE_RULE_COUNT = sizeof(CANDIDATE_RULES) / sizeof(CANDIDATE_RULES[0]);
 
-    // The geometry + the rule outcome of ONE candidate.  `ok` is exactly `negativeProvable`'s input: a
+    // The geometry + the rule outcome of ONE candidate.  `ok` is exactly the `measured-here` condition's input: a
     // candidate the rules rejected may not be measured, so it is neither legal nor excluded.
     struct Candidate {
       vk_tile_geometry geom;
@@ -1909,10 +1905,6 @@ namespace VulkanTuner {
           }
           continue;
         }
-        vector<string> scopeHere;
-        for (size_t k = 0; k < sizeof(TUNE_KINDS) / sizeof(TUNE_KINDS[0]); k++) {
-          scopeHere.push_back(TUNE_KINDS[k].name);
-        }
         // 🔴 THE SEARCH DOMAIN IS THE DECLARED DOMAIN -- (7f), 2026-09-29.  This walk used to enumerate
         // this family's three STOCK PRESET VECTORS (`CM2_PRESETS_*`), and the comment that stood here
         // argued that the Cartesian product was the wrong thing to search.  The ruling that changed it is
@@ -1962,15 +1954,14 @@ namespace VulkanTuner {
             }
           }
         }
-        // The coverage of THIS run, and the kinds it covered: the stock vector set is a SAMPLING SURFACE,
-        // not a sweep of the Cartesian domain the probe counts.  Set here, at the one place that knows what
-        // was searched -- and OUTSIDE the `if (d != nullptr)` guard's subject, because the guard belongs on
+        // The coverage of THIS run: the stock vector set is a SAMPLING SURFACE, not a sweep of the
+        // Cartesian domain the probe counts.  It is set here, at the one place that knows what was
+        // searched -- and OUTSIDE the `if (d != nullptr)` guard's subject, because the guard belongs on
         // the WRITE to the Decision, not on the walk that decides what was searched.
-        // ⚠️ `negativeScope` is latent tonight and that is stated rather than hidden: no write path can
-        // emit a marker yet (the conditions refuse one, and the completeness gate refuses the file), so
-        // this value is not read by anything today.  It is set because it is a FACT ABOUT THE SEARCH, and
-        // because the writer refuses an unscoped marker -- when a marker does become reachable, the scope
-        // it needs is already the truthful one instead of a literal somebody picks.
+        // 🔴 B3.5 (2026-10-01): THE KIND SCOPE (`negativeScope`) THAT WAS ALSO BUILT HERE IS GONE.  Its
+        // job was to say WHICH KINDS a durable marker spoke for; the marker is gone (B3), so there is no
+        // field to carry the scope, no writer that refuses an unscoped one and no reader that could use
+        // it.  `candidateCoverage` below is a DIFFERENT fact about the same search and STAYS.
         if (d != nullptr) {
           // 🔴 THE PRODUCTION SETTER OF `rowSource = "measured"` (W4b commit 2).  It is the whole point of
           // this batch's write side: the enumerator is the ONLY thing that may say "these candidates are
@@ -2003,9 +1994,6 @@ namespace VulkanTuner {
           // writing `false` here is a measurement of that fact rather than a default nobody filled in.
           // (vulkantuner.h: it is NOT `candidateCoverage` and NOT `pairsComplete`.)
           d->coverageComplete = false;
-          if (d->negativeScope.empty()) {
-            d->negativeScope = scopeHere;
-          }
         }
         break;   // ONE live family today; a second one joins with its own kind and its own coverage rule
       }
@@ -2124,8 +2112,10 @@ namespace VulkanTuner {
     // that adding one cannot be done without a rule here.  A kind with no arm below is an INTERNAL
     // error and refuses the write loudly -- "treat it as concluded" is the one behaviour that
     // would turn the whole rule into a decoration.
-    // The KIND registry itself (TUNE_KINDS + tuneKindKnown) is declared next to NEGATIVE_REASONS at the
-    // top of this namespace: the parser and the candidate catalogue both need it, and it must be ONE list.
+    // The KIND registry itself (TUNE_KINDS + tuneKindKnown) is declared at the top of this namespace --
+    // where the closed set of negative-entry reasons used to sit, which is why the comment above it now
+    // opens with "used to live here": the parser and the candidate catalogue both need TUNE_KINDS, and it
+    // must be ONE list.
     // The name of the first declared kind that has NO conclusion, or nullptr when complete.
     // `internal` separates "this measurement is partial" (a legitimate state, and the caller says
     // so) from "this build has no rule for that kind" (a defect): both refuse the write.
@@ -2425,32 +2415,19 @@ namespace VulkanTuner {
       bool foundDeclaredRows = false;
       long declaredRows = -1;
       vector<vk_tune_row_spec> rows;
-      bool negative = false;
-      string negativeReason;
-      // W4b: WHICH KINDS the NEGATIVE line speaks for, from the closed set of TUNE_KINDS[] names.  It is
-      // REQUIRED on the line (an unscoped marker would have to be read as "some kind", the fail-open
-      // default the closed set refuses), so an empty vector here can only mean "no NEGATIVE line".
-      vector<string> negativeScope;
       // Human-readable keys that were ABSENT.  The loader REFUSES a file carrying any (a
       // machine-written cache has no excuse), and the refusal NAMES them, so "missing" is
       // never read as "verified".
       vector<string> absentKeys;
     };
 
-    // ── W3b: MAY THE LOADER BELIEVE A FILE'S NEGATIVE ENTRY? ─────────────────────────────────────────
-    // The read side of the same rule W3-P1 closed on the write side.  There is ONE channel left (the
-    // cache), and it is not the same kind of statement as a set THIS process measured:
-    //   cache  -- this device's own MEMORY.  It is key-checked (fingerprint, version, policy, baseline,
-    //             the outer keys, ROWSET_HASH), it is the file the writer maintains, and the operator's
-    //             "I do not trust this" switch is KATAGO_VK_TUNE_RETUNE.  Believing it is the DESIGN.
-    //   a file whose rows this process did not measure -- the write side refuses to mint a verdict from
-    //             one ("a set that came from a FILE is not evidence that we measured this key"), so a
-    //             file that ASSERTS a marker does not make the write side re-assert it.
-    // Named and printable for the same reason `negativeProvable` is: R43 pins that the ONE adoption site
-    // CITES this predicate instead of re-deriving the rule from a boolean expression in place.
-    bool negativeAdoptable(const RowsFile& file) {
-      return file.negative && file.rows.empty();
-    }
+    // 🔴 B3.5 (2026-10-01): `negativeAdoptable()` AND THE WHOLE READ-SIDE MARKER PATH ARE GONE.
+    // W3b put a named predicate here -- `file.negative && file.rows.empty()` -- so that the ONE adoption
+    // site cited it instead of re-deriving the rule, and R43 pinned the citation.  The wire segment it
+    // read died in B3 (SCHEMA_VERSION 5 -> 6: the parser now REFUSES a `NEGATIVE` line by name, so
+    // `RowsFile::negative` could never be set again), which left the predicate unreachable, and B3.5
+    // removed the `RowsFile` fields it read.  What the read side says about a file is therefore exactly
+    // one thing -- the parsed row set, key-checked -- and `cacheState` says whether that load happened.
 
     // Read the whole file rather than using FileUtils::readFile: that helper throws on failure
     // and this path must return an error string instead (every load failure here is fail-open +
@@ -2933,12 +2910,13 @@ namespace VulkanTuner {
       // W3-P1/W3b: when a NAMED condition is what refused, the message IS that condition's own sentence
       // (it lives in CONDITION_SPECS), because the generic one says the opposite here ("a structural
       // all-reject may be remembered" while refusing exactly one) and would send the next reader to the
-      // wrong code.  The provenance sentence is deliberately INDEPENDENT of the content refusal below
-      // ("nothing to write: no rows and no negative entry"): in this state that sentence is FALSE -- the
-      // negative entry IS there, it is simply not provable -- and the acceptance leg greps for THIS one
-      // by its registered marker, so a writer that fell through to the other sentence must not look green.
-      // The third case is an unknown condition name (W3b): `unknownCondition` comes back non-empty, and
-      // the generic sentence is false there too (same reason as provenance), so it gets the internal one.
+      // wrong code.  The `measured-here` sentence is deliberately INDEPENDENT of the content refusal below
+      // ("nothing to write: ..."): with a candidate set this process did not measure, the CONTENT gate is
+      // satisfied and the STATE gate is the only thing that can refuse -- and the acceptance leg greps for
+      // THAT sentence by its registered literal, so a writer that fell through to the other one must not
+      // look green.  The third case is an unknown condition name (W3b): `unknownCondition` comes back
+      // non-empty, and the generic sentence is false there too (same reason as provenance), so it gets the
+      // internal one.
       string unknownCondition;
       const ConditionSpec * bad = firstUnsatisfiedCondition(d, &unknownCondition);
       if (!unknownCondition.empty()) {
@@ -2957,15 +2935,17 @@ namespace VulkanTuner {
       return false;
     }
     if (!cacheEntryWritable(d)) {
-      // 🔴 ONE CACHE FORM (2026-09-30): "nothing to write" NO LONGER means "no rows and no negative
-      // entry" -- an EMPTY ROW SET is a durable artifact (`ROWS 0`), and `cacheEntryWritable` admits it
-      // for every outcome whose row declares the effect `rows`.  So this gate now fires only for an
-      // outcome whose declared effect is NOT a row set and which carries no provable negative entry:
-      // a state the table itself says cannot produce a file.  The predicate stays in this body on
-      // purpose (R16: the writer states its gates where it writes).
-      err = "nothing to write: this outcome's declared durable effect is not a row set and no provable "
-            "negative entry is carried (a file that says neither would load as 'this key is already "
-            "decided')";
+      // 🔴 ONE CACHE FORM (2026-09-30): "nothing to write" NO LONGER means "no rows and no second form"
+      // -- an EMPTY ROW SET is a durable artifact (`ROWS 0`), and `cacheEntryWritable` admits it for every
+      // outcome whose row declares the effect `rows`.  So this gate fires only for an outcome whose
+      // declared effect is NOT a row set: a state the table itself says cannot produce a file.  The
+      // predicate stays in this body on purpose (R16: the writer states its gates where it writes).
+      // 🔴 B3.5 (2026-10-01): THE MESSAGE LOST ITS SECOND HALF.  It used to end
+      // "... and no provable negative entry is carried" -- true while a `negative:`-declaring row existed,
+      // and meaningless now that `rows` is the ONLY durable effect a row may declare and the marker fields
+      // are gone.  What the refusal says now is the whole truth: this outcome has no row set to write.
+      err = "nothing to write: this outcome's declared durable effect is not a row set, and there is no "
+            "row set to write (a file that says nothing would load as 'this key is already decided')";
       return false;
     }
     if (!allKindsConcluded(d)) {
@@ -3199,33 +3179,45 @@ namespace VulkanTuner {
       }
       else if (o.writable && string(o.klass) == "gate") {
         // The `gate` class's writable shape, MINTED BY THE REAL GATE rather than assembled here.  A
-        // fixture that set `negative` / `negativeReason` by hand would prove the TABLE is self-consistent
-        // while proving nothing about the function that has to produce that state -- and the two would
-        // be free to drift apart, which is the whole failure mode of a fixture.
+        // fixture that hand-assembled the state would prove the TABLE is self-consistent while proving
+        // nothing about the function that has to produce it -- and the two would be free to drift apart,
+        // which is the whole failure mode of a fixture.
         //
-        // `aMeasuredSet` is required and that is the row's own condition doing its job: a gate refusal
-        // concluded from a candidate set this process did not measure is not a device fact (W3-P1).
+        // ⚠️ B3.5 (2026-10-01): NO ROW OF THIS CLASS IS WRITABLE TODAY -- B3 made `gate-reject`
+        // (`writable = false`, effect `nothing:rerun`, empty `condition` column) the only `gate` row there
+        // is -- so this branch is LATENT: it is held for the next writable gate row, and it is not the
+        // `gate-reject` fixture (that row is exercised by the loop's unwritable direction, with no fixture
+        // at all).  Its two setup lines are stated as what such a row would need rather than as a claim
+        // about a row that exists:
+        // `aMeasuredSet` is what a row naming `measured-here` requires (a gate refusal concluded from a
+        // candidate set this process did not measure is not a device fact, W3-P1).
         // The numbers carry MARGIN on purpose -- 25 spikes in 100 blocks is a rate whose whole interval
         // sits ABOVE the bound, so this is not a coin flip at the boundary (the (k) case below points the
         // same judgement at a calm reading and requires the other answer).
-        // The device name is set because THIS fixture prints (its loud names the device): leaving it
+        // The device name is set because THIS fixture would print (its loud names the device): leaving it
         // empty produces "NOTICE: : spike-rate gate: ...", which reads as a formatting bug rather than
-        // as a synthetic decision.  No other fixture in this loop prints anything, so none of them has
-        // ever needed this line -- which is exactly why it is easy to forget here.
+        // as a synthetic decision.
         d.deviceName = "self-test";
         aMeasuredSet(d);
         rejectBySpikeGate(d, judgeSpikeRate(25u, 100u, 6u));
       }
       else if (o.writable && string(o.klass) == "completed") {
         // 🔴 (7d): THE COMPLETED CLASS IS NO LONGER ONE SHAPE.  The rows-file fixture below is right for a
-        // row whose durable effect is `rows`, and WRONG for one whose effect is a NEGATIVE entry: the
+        // row whose durable effect is `rows`, and WRONG for one whose effect WAS a durable MARKER: the
         // first version of this loop selected by CLASS alone, so `measured-no-gain` would have been
         // exercised by a rows fixture and the loop would have gone green while asserting the wrong
         // durable effect -- "a green self-test row that asserts the wrong durable effect is worse than a
-        // missing row" (section 2.3 of the plan).  So the fixture is now selected by (class, effect), and
-        // the negative shape is MINTED BY THE REAL PRODUCER (`concludeBranches`), for the same reason the
-        // gate fixture above is minted by the real gate: a hand-assembled state proves the table is
-        // self-consistent and nothing about the function that has to produce it.
+        // missing row" (section 2.3 of the plan).  So the fixture is selected by (class, effect), and the
+        // (then-)marker shape was MINTED BY THE REAL PRODUCER (`concludeBranches`) rather than assembled
+        // here, for the same reason the gate fixture above is minted by the real gate.
+        // ⚠️ B3.5 (2026-10-01): WHAT THAT SELECTOR READS TODAY.  B3 made `rows` the ONLY durable effect a
+        // row may declare, so the `else` arm below is now UNREACHABLE from this table and every writable
+        // `completed` row (`measured`, `measured-no-gain`) takes the rows-file shape -- the last red leg
+        // of the effect-column change, and it is registered in the guardrail's own note
+        // (t3-guardrails.py: the self-test leg builds a ROW-SET fixture for that outcome, while branch
+        // (2)'s loud is carried by the production leg `A30_auto_writes_rows0`).  Neither the selector nor
+        // the arm is deleted here: `concludeBranches` is still executed by this loop's `else` for any
+        // future row whose effect is not a row set, and the smoke leg above is what holds the branch.
         aMeasuredSet(d);
         aSweptSet(d);
         if (string(o.effect) == "rows") {
@@ -3283,8 +3275,8 @@ namespace VulkanTuner {
       const bool stateOk = (outcomeWritable(d) == o.writable);   // the table agrees with itself
       // (7d) and the decision really HOLDS the durable effect its row declares: the column is read here,
       // which is what keeps it from being a label that drifts from what the writer does.  The effect
-      // string also DROVE the fixture above (a negative row is minted by the real branch selection), so
-      // this assertion is the positive half of "the self-test does not assert the wrong effect".
+      // string also DROVE the fixture above, so this assertion is the positive half of "the self-test
+      // does not assert the wrong effect".
       const bool effectOk = effectMatches(d, o.effect);
       // The condition's OTHER direction, per row (G-D20): a row that names an extra condition must
       // be REFUSED when that condition does not hold.  Asserting only the satisfying direction would
@@ -3353,6 +3345,10 @@ namespace VulkanTuner {
     // gap must be refused by the state gate even though the declared table says the outcome is
     // writable.  This is the RULE's execution body, and it needs no write side: the plumbing that
     // fills `allRejectReasonsAreDevice` from the install accounting is what waits for B5/B6.
+    // 🔴 B3.5 (2026-10-01): this leg used to hand-set the marker fields (`negative` + a
+    // `no-injection-slot` reason) as part of its fixture.  It never needed them -- the subject here is
+    // `outcomeWritable`, which reads the table's `device-only` condition and nothing else -- so they are
+    // gone with the fields, and the leg is unchanged in what it proves.
     {
       Decision d;
       d.cachePath = probePath;
@@ -3364,8 +3360,6 @@ namespace VulkanTuner {
       d.baselineVersion = "1";
       d.modelIdentity = "self-test";
       d.outcome = "structural-all-reject";
-      d.negative = true;
-      d.negativeReason = "no-injection-slot";
       // W3-P1: provenance is satisfied for BOTH readings, so the only thing they differ in is
       // `device-only` -- which is what makes this leg a test of G-D20 rather than of the table as a
       // whole (with the candidates unmet, both readings would be false and the leg would prove nothing).
@@ -3453,47 +3447,51 @@ namespace VulkanTuner {
 
     // ── W2 (post-review): the finalizer's rules, asserted as JUDGEMENTS ────────────────────────────────
     //
-    // Why these live here and not in a smoke leg: (b) needs an install to land between one context's
-    // first eval and a later context's install (timing-dependent), and the from-file retirement needs
-    // DECLARED rows on a key that also carries a from-file marker (only the enumerator can produce that
-    // today).  Neither is deterministically constructible, so both are registered as "no deterministic
-    // trigger" in t3-shell-plan.md section 4 rather than faked with a leg that would pass for the wrong
-    // reason.  Here the judgement is driven directly -- AND through the real writer, so a deleted branch
-    // shows up as a FAIL in this line instead of as a missing NOTICE in some future leg.
+    // Why these live here and not in a smoke leg: the verdicts are driven from a HAND-BUILT install
+    // accounting, and the transitions that used to matter (an install landing between two finalize calls,
+    // a from-file marker being retired by a durable row) are not deterministically constructible from a
+    // real device -- so they are registered as "no deterministic trigger" in t3-shell-plan.md section 4
+    // rather than faked with a leg that would pass for the wrong reason.  Here the judgement is driven
+    // directly -- AND, where a refusal is the subject, through the real writer, so a deleted branch shows
+    // up as a FAIL in this line instead of as a missing NOTICE in some future leg.
     //
-    // The cases are the closed set of "what may happen to the marker": (a) a file-sourced set may not create one,
-    // (b) one is not created when our own account refutes it, (c) a from-file marker is retired by a
-    // durable row, (d) a device-only all-reject DOES create one, (e) our-gap creates none.  (d) is the
-    // CONTROL: without it, a finalizer that simply never set a marker would pass all the others.
+    // 🔴 B3.5 (2026-10-01): THE CASES THAT WERE ABOUT THE MARKER ARE DELETED, and this note says so
+    // rather than leaving the reader to work out which letters vanished.  Gone with their subject:
+    // `(a)`/`(b)` (a file-sourced set may not create one / our own account refutes it), `(c)` (a from-file
+    // marker is retired by a durable row -- the `StaleFromFileNegativeRetired` verdict has no producer any
+    // more), `(d)` (the CONTROL: a device-only all-reject really does create one) and `(f)` (the race: the
+    // second call must RETRACT what the first one set).  Their whole subject was "what may happen to the
+    // marker", and there is no marker left for anything to happen to.
+    // What SURVIVES is (e), the G-D20 half, which never needed a marker to be true: a
+    // `structural-all-reject` whose reasons came from OUR implementation gap is refused by the table's own
+    // `device-only` condition.  (The other surviving finalizer case is the (k) half further down: the
+    // finalizer must leave a gate-rejected, empty-install decision alone.)  The letters are NOT
+    // renumbered -- the self-test line's own note says why.
     bool verdictOk = true;
     string verdictBad;
     auto verdictName = [](Decision::FinalizeVerdict v) -> const char * {
       switch (v) {
         case Decision::FinalizeVerdict::Nothing: return "Nothing";
         case Decision::FinalizeVerdict::Measured: return "Measured";
-          case Decision::FinalizeVerdict::AnyRowInstalled: return "AnyRowInstalled";
+        case Decision::FinalizeVerdict::AnyRowInstalled: return "AnyRowInstalled";
         case Decision::FinalizeVerdict::OurGap: return "OurGap";
         case Decision::FinalizeVerdict::DeviceOnlyAllReject: return "DeviceOnlyAllReject";
-        case Decision::FinalizeVerdict::StaleFromFileNegativeRetired: return "StaleFromFileNegativeRetired";
       }
       return "?";
     };
-    // `wantRefusal == nullptr` means "do not call the writer at all" -- used by the two cases in which a
-    // write would really produce a file (a durable row, or a legitimate marker): a self-test must not
-    // create state, and the `absent` assertion below is what proves it did not.
+    // `wantRefusal == nullptr` means "do not call the writer at all" -- used where a write would really
+    // produce a file: a self-test must not create state, and the `absent` assertion below is what proves
+    // it did not.
     auto verdictCase = [&](const char * what, Decision & d, Decision::FinalizeVerdict want,
-                           Decision::FinalizeVerdict wantSecond, bool wantNegative,
+                           Decision::FinalizeVerdict wantSecond,
                            const char * wantRefusal) {
       const Decision::FinalizeVerdict got = finalizeOutcome(d);
-      const bool negFirst = d.negative;
       const Decision::FinalizeVerdict again = finalizeOutcome(d);   // idempotence, one call later
-      if (got != want || again != wantSecond || negFirst != wantNegative || d.negative != wantNegative) {
+      if (got != want || again != wantSecond) {
         verdictOk = false;
         if (verdictBad.empty()) {
           verdictBad = string(what) + ": verdict " + verdictName(got) + "/" + verdictName(again)
-                     + " (want " + verdictName(want) + "/" + verdictName(wantSecond) + "), negative "
-                     + (negFirst ? "true" : "false") + "/" + (d.negative ? "true" : "false")
-                     + " (want " + (wantNegative ? "true" : "false") + " both times)";
+                     + " (want " + verdictName(want) + "/" + verdictName(wantSecond) + ")";
         }
       }
       if (wantRefusal != nullptr) {
@@ -3509,80 +3507,26 @@ namespace VulkanTuner {
         }
       }
     };
-    // The registered marker, READ OUT OF THE TABLE rather than spelled a second time here: the
-    // self-test must assert the sentence the writer actually prints, so a rename cannot leave it
-    // testing a string nobody prints -- and the .cpp keeps ONE occurrence of the literal, which is
-    // also what section 9.4 counts.  🔴 W3b: the marker is now a NAMED CONSTANT, because each condition's
-    // sentence is a whole sentence this table owns; "the table lost its sentence" can no longer happen
-    // silently (the constant is compile-time non-empty), and the checks that the TABLE still carries the
-    // condition and that its sentence equals the one the harness greps are R42's (b) and (e).
-    const char * measuredMarker = MEASURED_MARKER;
+    // 🔴 B3.5 (2026-10-01): `const char * measuredMarker = MEASURED_MARKER;` USED TO SIT HERE.  It
+    // existed so the self-test asserted the sentence the writer ACTUALLY prints instead of spelling it a
+    // second time -- but both of its consumers were the (b)/(i) marker cases deleted in this batch, and
+    // the constant is gone (its literal now lives inline in the `measured-here` refusal, spelled once).
+    // The smoke leg that greps that sentence reads the PRODUCT's output, not this file, so nothing is
+    // lost by the self-test no longer quoting it.
 
-    { // (b) our own account refutes the marker
-      Decision d;
-      d.deviceName = "self-test";
-      d.cachePath = probePath;
-      d.anyRowInstalled = true;
-      d.install.declared = 1;
-      d.install.installed = 0;
-      d.allRejectReasonsAreDevice = true;
-      // Same shift as (a): the durable channel is closed by provenance before the self-falsification
-      // guard can be the thing the WRITER reports; the guard's own effect is the missing marker.
-      verdictCase("(b) self-falsified all-reject", d, Decision::FinalizeVerdict::AnyRowInstalled,
-                  Decision::FinalizeVerdict::AnyRowInstalled, false, measuredMarker);
-    }
-    { // (c) a from-file marker is retired by a durable row (one-way: the second call is `Measured`)
-      Decision d;
-      d.deviceName = "self-test";
-      d.cachePath = probePath;
-      d.negative = true;
-      d.negativeReason = "no-injection-slot";
-      d.negativeOrigin = Decision::NegativeOrigin::FromFile;
-      d.install.declared = 1;
-      d.install.installed = 1;
-      vk_tune_row_spec r {};
-      r.path = VK_TILE_PATH_SCALAR;
-      r.src0_type = 1;
-      r.src1_type = 0;
-      r.geom.BM = 64; r.geom.BN = 64; r.geom.BK = 0;
-      r.geom.WM = 32; r.geom.WN = 32; r.geom.WMITER = 1;
-      r.geom.TM = 4; r.geom.TN = 4; r.geom.BS = 128;
-      r.geom.pad = -1; r.geom.reshape = -1; r.geom.smaller = -1;
-      d.rows.push_back(r);
-      verdictCase("(c) from-file marker retired", d, Decision::FinalizeVerdict::StaleFromFileNegativeRetired,
-                  Decision::FinalizeVerdict::Measured, false, nullptr);
-      // The retirement has to be FOR a durable row, not for "nothing to write": this is that difference.
-      if (!cacheEntryWritable(d)) {
-        verdictOk = false;
-        if (verdictBad.empty()) {
-          verdictBad = "(c) the retirement left nothing to write (want the durable row to remain writable)";
-        }
-      }
-    }
-    { // (d) CONTROL: a device-only all-reject really does create the marker -- and keeps it
-      Decision d;
-      d.deviceName = "self-test";
-      d.cachePath = probePath;
-      d.install.declared = 1;
-      d.install.installed = 0;
-      d.allRejectReasonsAreDevice = true;
-      // W3-P1: the control must satisfy the OTHER conditions, or it would not be a control -- it would be a
-      // second refusal case.  With provenance met, the marker is writable: that is the positive half the
-      // table still has to allow, and (i) below is its mirror image.  W4b raised the count from two to
-      // four, so all four are set here; the scope is what makes the writer accept the marker at all.
-      aMeasuredSet(d);
-      aSweptSet(d);
-      d.negativeScope.clear();
-      d.negativeScope.push_back("mm");
-      verdictCase("(d) device-only all-reject", d, Decision::FinalizeVerdict::DeviceOnlyAllReject,
-                  Decision::FinalizeVerdict::DeviceOnlyAllReject, true, nullptr);
-      if (!outcomeWritable(d) || !cacheEntryWritable(d)) {
-        verdictOk = false;
-        if (verdictBad.empty()) {
-          verdictBad = "(d) a device-only all-reject is not writable (the marker would never be written)";
-        }
-      }
-    }
+    // 🔴 B3.5 (2026-10-01): THE (b), (c), (d) AND (f) CASES STOOD HERE.  (b) asserted that our own
+    // account refutes the marker and that the REAL writer then refuses by the `measured-here` sentence;
+    // (c) drove `StaleFromFileNegativeRetired` (a from-file marker retired by a durable row); (d) was the
+    // CONTROL that made a finalizer which simply never set a marker fail; (f) executed the from-scratch
+    // retraction on ONE decision.  Every one is about the marker, and no marker field is left to set,
+    // keep, retire or retract.  What that costs is stated rather than hidden:
+    //   * `AnyRowInstalled` is still produced in production (`finalizeOutcome`'s self-falsification guard)
+    //     and still reported by `reportVerdict`; what it loses is its self-test case, because the assertion
+    //     that made (b) worth having was the marker's ABSENCE rather than the verdict's name.
+    //   * `DeviceOnlyAllReject` is likewise still `finalizeOutcome`'s answer for a device-only all-reject,
+    //     and the outcome it belongs to (`structural-all-reject`) is still asserted WRITABLE by the
+    //     outcome-table loop above (its `structural` fixture + `outcomeWritable` + `effectMatches`); what
+    //     is gone is the case that reached the verdict THROUGH the finalizer.
     { // (e) our own gap: the coarse outcome is recorded, and the TABLE refuses to write it (G-D20)
       Decision d;
       d.deviceName = "self-test";
@@ -3592,47 +3536,12 @@ namespace VulkanTuner {
       d.install.dropped_unsupported_our_gap = 1;
       d.allRejectReasonsAreDevice = false;
       verdictCase("(e) our-gap all-reject", d, Decision::FinalizeVerdict::OurGap,
-                  Decision::FinalizeVerdict::OurGap, false,
+                  Decision::FinalizeVerdict::OurGap,
                   // W3b: the refusal must be `device-only`'s OWN sentence.  It used to assert the generic
                   // one, which said this outcome "may be remembered" while refusing it -- the same class of
-                  // false sentence the provenance condition was fixed for in W3-P1.
+                  // false sentence the provenance condition was fixed for in W3-P1.  This case is the
+                  // G-D20 rule's execution body and needs no marker field to hold it.
                   "came from OUR implementation gap");
-    }
-    { // (f) THE RACE, on ONE decision: the first call concludes "device-only all-reject" and sets OUR
-      // marker; a row then installs (the (b) window: another context's install lands between the install
-      // path's finalize and the once point's), and the SECOND call must therefore RETRACT that marker --
-      // not merely stop setting it.  This is the only case that executes the from-scratch recompute at
-      // the top of finalizeOutcome: with that block turned off, (a)-(e) all still pass, which is exactly
-      // why this case exists.  The origin is asserted too, because "the marker is gone" and "we still
-      // know where it came from" are two different statements and the second half would be a half-state.
-      // (No writer call here on purpose: after the transition the durable set is empty, so there is
-      // nothing to refuse that (a)/(b)/(e) do not already refuse.)
-      Decision d;
-      d.deviceName = "self-test";
-      d.cachePath = probePath;
-      d.install.declared = 1;
-      d.install.installed = 0;
-      d.allRejectReasonsAreDevice = true;
-      const Decision::FinalizeVerdict first = finalizeOutcome(d);
-      const bool markerFirst = d.negative;
-      const Decision::NegativeOrigin originFirst = d.negativeOrigin;
-      d.install.installed = 1;   // the install that arrives between the two finalize calls
-      const Decision::FinalizeVerdict second = finalizeOutcome(d);
-      if (first != Decision::FinalizeVerdict::DeviceOnlyAllReject || !markerFirst
-          || originFirst != Decision::NegativeOrigin::AllReject
-          || second != Decision::FinalizeVerdict::Measured || d.negative
-          || d.negativeOrigin != Decision::NegativeOrigin::None) {
-        verdictOk = false;
-        if (verdictBad.empty()) {
-          verdictBad = string("(f) all-reject -> measured: verdict ") + verdictName(first) + "/"
-                     + verdictName(second) + " (want DeviceOnlyAllReject/Measured), marker "
-                     + (markerFirst ? "true" : "false") + "/" + (d.negative ? "true" : "false")
-                     + " (want true/false), origin "
-                     + (originFirst == Decision::NegativeOrigin::AllReject ? "AllReject" : "?") + "/"
-                     + (d.negativeOrigin == Decision::NegativeOrigin::None ? "None" : "?")
-                     + " (want AllReject/None)";
-        }
-      }
     }
 
     { // (g)/(h) THE FOLD -- the two rules of the write path that had NO executor anywhere before this
@@ -3688,36 +3597,14 @@ namespace VulkanTuner {
       }
     }
 
-    { // (i) THE MIRROR OF (d), and the shape the acceptance leg (A36) meets in production: the CONTENT
-      // gate says writable -- the marker exists and its reason is in the closed set -- while the STATE
-      // gate refuses it because the candidate set came from a file.  Both halves are asserted, in this
-      // order, because "the write was refused" alone is satisfied by two very different rules, and the
-      // whole point of W3-P1 is that the refusal is for PROVENANCE and not because the file had nothing
-      // in it.  Without this case the provenance condition would only ever be exercised in its
-      // satisfying direction (by the fixtures in the loop above and by (d)).
-      Decision d;
-      d.deviceName = "self-test";
-      d.cachePath = probePath;
-      d.install.declared = 1;
-      d.install.installed = 0;
-      d.allRejectReasonsAreDevice = true;   // the outcome's own condition holds ...
-      d.rowSource = "cache";                // ... and the candidates came from a file
-      verdictCase("(i) unmeasured all-reject", d, Decision::FinalizeVerdict::DeviceOnlyAllReject,
-                  Decision::FinalizeVerdict::DeviceOnlyAllReject, true, measuredMarker);
-      const bool contentWritable = cacheEntryWritable(d);
-      const bool stateWritable = outcomeWritable(d);
-      if (stateWritable || !contentWritable) {
-        verdictOk = false;
-        if (verdictBad.empty()) {
-          verdictBad = string("(i) provenance is not what refused: state-writable=")
-                     + (stateWritable ? "YES (BUG)" : "no") + ", content-writable="
-                     + (contentWritable ? "yes"
-                                        : "NO (BUG: the marker is set and its reason is in the closed "
-                                          "set, so the content gate must allow it -- otherwise the "
-                                          "refusal could be 'nothing to write', which is FALSE here)");
-        }
-      }
-    }
+    // 🔴 B3.5 (2026-10-01): THE (i) CASE STOOD HERE.  It was the mirror of the (d) control: the CONTENT
+    // gate had to say "writable" (a marker existed, and its reason was in the closed set) while the STATE
+    // gate refused because the candidate set came from a FILE -- the shape the acceptance leg (A36) met in
+    // production.  With the marker gone the case has no first half left, so it goes.  ⚠️ That does NOT
+    // leave `measured-here` untested in its REFUSING direction, which is the only thing a deletion here
+    // could cost: the outcome-table loop above drives every named condition in BOTH directions through
+    // `breakCondition` (`rowSource = "none"` for this one, then `!outcomeWritable(dCond)` must hold), and
+    // the SENTENCE the refusal prints is read off the product by the smoke rather than asserted here.
 
     { // (j) D3b: THE WRITE PATH IS EXCEPTION-SAFE, and this case is the only executor that clause has.
       // The shape it builds is one the FORMATTER refuses by THROWING.  🔴 THE TRIGGER MOVED WITH THE
@@ -3830,10 +3717,11 @@ namespace VulkanTuner {
         r.geom.pad = -1; r.geom.reshape = -1; r.geom.smaller = -1;
         g.rows.push_back(r);
         rejectBySpikeGate(g, judgeSpikeRate(25u, 100u, 6u));
-        // 🔴 RE-POINTED BY B3 (SCHEMA_VERSION 5 -> 6): the gate's decision no longer carries a durable
-        // entry, so what this case asserts is the NEGATIVE truth it exists for -- the gate refuses the
-        // measurement, installs nothing, and leaves NOTHING durable behind (the marker fields it used to
-        // assert here belong to the deleted family and go with it in B3.5).
+        // 🔴 RE-POINTED BY B3, TIGHTENED BY B3.5 (SCHEMA_VERSION 5 -> 6): the gate's decision carries no
+        // durable entry, so what this case asserts is the reading it exists for -- the gate refuses the
+        // measurement, installs nothing, and leaves NOTHING durable behind.  The marker fields the
+        // original version asserted here are gone (B3.5), and that is why the assertion is now exactly
+        // these two facts: the coarse outcome + the emptied row set.
         const bool verdictOk0 = g.outcome == "gate-reject" && g.rows.empty();
         // The entry must NOT be writable any more: that IS the ruling's consequence (a gate refusal is
         // "re-tune next time", not a durable claim), and it is the direction this case has to pin -- a
@@ -3860,14 +3748,15 @@ namespace VulkanTuner {
         // 🔴 THE EMPTY-INSTALL HALF OF THE ORDERING QUESTION, now EXECUTED instead of registered
         // (R-28 step (3) tightened this note, and the half that has a carrier must not stay a sentence):
         // the finalizer recomputes the outcome from the INSTALL accounting, so on a decision that
-        // installed nothing it must leave a `SpikeGate`-origin verdict alone -- retitling it, or dropping
-        // the marker, would turn "the measurement was too spiky to trust" into a claim about the device.
+        // installed nothing it must leave the gate's verdict alone -- retitling it would turn "the
+        // measurement was too spiky to trust" into a claim about the device.
         // The OTHER half (a row installing AFTER a gate rejection) still has no carrier and stays
         // registered for ⑤.
         const Decision::FinalizeVerdict vGate = finalizeOutcome(g);
-        // B3 re-point: the marker clauses that used to sit in this condition belonged to the deleted
-        // family (B3.5 removes the fields themselves); what this half must still hold is that the
-        // finalizer leaves a gate-rejected, empty-install decision ALONE.
+        // B3/B3.5 re-point: the marker clauses that used to sit in this condition belonged to the deleted
+        // family, and the `SpikeGate` ORIGIN the note above used to name is gone with it -- what this half
+        // must still hold is the surviving rule: the finalizer leaves a gate-rejected, empty-install
+        // decision ALONE (it returns `Nothing` and does not touch `outcome` or the rows).
         if (vGate != Decision::FinalizeVerdict::Nothing || g.outcome != "gate-reject" || !g.rows.empty()) {
           ok = false;
           if (firstBad.empty()) {
@@ -4085,8 +3974,12 @@ namespace VulkanTuner {
                   && back.foundMaxBatch && back.maxBatch == d.maxBatchSize
                   && back.foundMode && back.mode == d.modeString
                   && back.foundCreated
-                  && back.absentKeys.empty()
-                  && !back.negative && back.negativeScope.empty();
+                  && back.absentKeys.empty();
+          // 🔴 B3.5 (2026-10-01): `&& !back.negative && back.negativeScope.empty()` USED TO CLOSE THIS
+          // CONJUNCTION.  It asserted that the file this writer just produced carries NO marker -- true,
+          // and worth asserting while the writer could produce one.  With ONE cache form and no marker
+          // fields there is nothing for the parse to report and nothing to assert: the file format has a
+          // single form, which the rows check below already covers completely.
           // (2) THE ROWS, field by field, against the DURABLE set the writer announced -- plus the one
           // link that makes the file describe ITSELF: the declared ROWSET_HASH must equal the hash of
           // the rows that came back, which is exactly the check the loader performs.
@@ -4150,7 +4043,8 @@ namespace VulkanTuner {
     // constants, in order" -- must keep a carrier: it is the mechanical witness that a gate parameter
     // cannot leave policyFingerprint unnoticed.  The carrier is the SAME function the cache write path
     // calls (formatRowsFileImpl), driven with the REAL policy string and one LEGAL row.  The row is not
-    // decoration: the formatter refuses a decision carrying neither rows nor a marker.  ⚠️ After
+    // decoration: the row is what gives the formatter something to emit, and the EPHEMERALITY argument
+    // does not apply to it because this probe never writes it anywhere.  ⚠️ After
     // SCHEMA_VERSION 5 -> 6 there is only ONE form to carry those rows (`ROWS n` plus ROW lines), so the
     // probe also holds the post-deletion truth: the LEGAL row is what makes the emit happen.
     // The emitted `POLICY` row is reported VERBATIM so the smoke can hold the declared constants as an
@@ -4172,13 +4066,13 @@ namespace VulkanTuner {
       pr.geom.TM = 4;    pr.geom.TN = 4;       pr.geom.BS = 128;
       pr.geom.pad = -1;  pr.geom.reshape = -1; pr.geom.smaller = -1;
       pd.rows.push_back(pr);
-      // (deleted) the probe used to install the spike gate's marker here, because the formatter was the
-      // thing that refused a decision with neither rows nor a marker and the synthetic decision installs
-      // no row anywhere.  With the NEGATIVE segment deleted (SCHEMA_VERSION 5 -> 6) that marker is not a
-      // form the formatter can write any more -- `setGateRejectMarker` is called by `rejectBySpikeGate`
-      // ONLY, and it stays the ONE production site the census counts -- while the LEGAL row above is what
-      // gives this probe something to emit.  Calling it here would now be the one place that could make a
-      // self-test report a gate event it never measured.
+      // (deleted) the probe used to install the spike gate's state here, because a decision the formatter
+      // would accept needed SOMETHING to carry and the synthetic decision installs no row anywhere.  With
+      // the NEGATIVE segment deleted (SCHEMA_VERSION 5 -> 6) there is no second form for the formatter to
+      // write at all -- and B3.5 removed the marker fields that state was made of -- while the LEGAL row
+      // above is what gives this probe something to emit.  `setGateRejectMarker` is called by
+      // `rejectBySpikeGate` ONLY, and calling it here would be the one place that could make a self-test
+      // report a gate event it never measured.
       string emittedPolicy;
       try {
         emittedPolicy = formatRowsFileImpl(pd);
@@ -4211,22 +4105,28 @@ namespace VulkanTuner {
       if (firstBad.empty()) { firstBad = string("(m) the POLICY row the formatter emits: ") + policyRowText; }
     }
 
-    // 🔴 B3 (SCHEMA_VERSION 5 -> 6): THE CASE LETTERS IN THIS LINE ARE NON-CONTIGUOUS ON PURPOSE.
-    // The marker-shaped cases -- `(a)(b) no marker`, `(d) measured control`, `(e) our-gap`,
-    // `(f) all-reject->measured retracts`, `(i) unmeasured marker refused by name` -- were deleted
-    // together with the NEGATIVE wire segment (their subject was "what the file says about a marker",
-    // and the file can no longer say anything about one).  The surviving letters (c)(g)(h)(j)(k)(l)(m)(n)
-    // are NOT renumbered: a renumbering would silently invalidate every cross-reference in the batch
-    // records, the smoke's own comments and the plan.  The description below therefore spells out the
-    // cases that REALLY run -- which is also why it must not list the deleted ones: a self-test line
-    // that claims a case it no longer executes is the "declared but never run" defect this project
-    // refuses to ship.
+    // 🔴 B3/B3.5 (SCHEMA_VERSION 5 -> 6): THE CASE LETTERS IN THIS LINE ARE NON-CONTIGUOUS ON PURPOSE.
+    // The marker-shaped cases -- `(a)(b) no marker`, `(c) from-file retirement`, `(d) measured control`,
+    // `(f) all-reject->measured retracts`, `(i) unmeasured marker refused by name` -- were deleted with
+    // the NEGATIVE wire segment and the fields behind it (their subject was "what the file says about a
+    // marker", and neither the file nor the decision can carry one any more).
+    // ⚠️ B3's first cut of this note listed `(e) our-gap` as deleted while its body was STILL RUNNING;
+    // B3.5 keeps that case -- it asserts a SURVIVING rule (G-D20: our own implementation gap is not a
+    // device property) and never needed a marker field -- and lists it here, because a self-test line
+    // that does not declare a case it really executes is the same defect as one that declares a case it
+    // does not.  That is why the list below is spelled out and why `verdictOk` reports BOTH surviving
+    // finalizer cases: (e) and the (k) half.
+    // The surviving letters (e)(g)(h)(j)(k)(l)(m)(n) are NOT renumbered: a renumbering would silently
+    // invalidate every cross-reference in the batch records, the smoke's own comments and the plan.  The
+    // description below therefore spells out the cases that REALLY run -- which is also why it must not
+    // list the deleted ones: a self-test line that claims a case it no longer executes is the "declared
+    // but never run" defect this project refuses to ship.
     const bool absent = !FileUtils::exists(probePath);    logLine("cache write self-test: " + to_string(declared) + " outcome(s) declared, "
             + to_string(refused) + " refused by the state gate, " + to_string(allowed)
             + " state-writable; probe file " + (absent ? "absent" : "PRESENT")
             + "; encoding probe (non-ASCII name) written+read-back+removed ["
             + ((encWrote && encReadBack && encRemoved) ? "ok" : "FAIL") + "]"
-            + "; (c) from-file retirement (on a HAND-SET state: a file can no longer carry a marker)"
+            + "; (e) our-gap all-reject refused by device-only's own sentence (G-D20)"
               " / (g)(h) fold AND+mismatch / (j) the formatter's throw is contained"
               " / (k) spike gate: both directions + no-row-set + the refusal that leaves NO durable entry"
               " / (l) third branch: drop accounting + the three directions + the finalizer leaves it alone ["
@@ -4658,10 +4558,10 @@ namespace VulkanTuner {
     const std::vector<vk_tune_probe_shape>& graphShapes,
     const std::vector<uint32_t>& graphShapeCounts
   ) {
-    // KATAGO_VK_TUNE_RETUNE=1: ignore whatever is on disk (rows AND the negative entry) and
-    // decide again.  It is the operator's "I do not trust this file" switch, and it is
-    // deliberately about the whole file rather than about the rows or the negative marker:
-    // one file = one key, so a partial override would leave a half-trusted state.
+    // KATAGO_VK_TUNE_RETUNE=1: ignore whatever is on disk and decide again.  It is the operator's
+    // "I do not trust this file" switch, and it is deliberately about the WHOLE file rather than about
+    // the rows: one file = one key, so a partial override would leave a half-trusted state.  (It used to
+    // say "rows and the negative entry"; with ONE cache form there is nothing else on disk to ignore.)
     const bool retune = getenv("KATAGO_VK_TUNE_RETUNE") != nullptr
                      && getenv("KATAGO_VK_TUNE_RETUNE")[0] != '\0'
                      && !(getenv("KATAGO_VK_TUNE_RETUNE")[0] == '0'
@@ -4867,9 +4767,9 @@ namespace VulkanTuner {
         // hence `source=measured`, and the RETUNE leg's reading flips with it in the same batch (A19).
         d->rowSource = "measured";
         d->note = string("KATAGO_VK_TUNE_RETUNE is set: ") + loadKind
-                + " ignored entirely (rows and negative entry), deciding again";
+                + " ignored entirely (its rows are), deciding again";
         logLine("WARNING: " + string("KATAGO_VK_TUNE_RETUNE is set, so ") + loadKind + " ("
-                + loadPath + ") is IGNORED: neither its rows nor its negative entry are used"
+                + loadPath + ") is IGNORED: its rows are not used"
                 " (delete the env to use it again)");
       }
       else {
@@ -4987,111 +4887,27 @@ namespace VulkanTuner {
             d->note = string(loadKind) + " was edited after it was written";
           }
           else {
-            // W4b: THE SCOPE CHECK, and it is DEEPENED DEFENCE rather than a production guard -- stated
-            // here so nobody strengthens the claim later by accident.  Two INDEPENDENT reasons make a
-            // mismatching file unreachable from our own writer:
-            //   (i) the kind SET is a function of the IDENTITY (KATAGO_VK_FA* is a POLICY knob, and POLICY
-            //       is a header key), so one identity never alternates between "mm only" and "mm+fa" --
-            //       two different identities are two different files;
-            //   (ii) the completeness gate (allKindsConcluded) requires a file to cover EVERY registered
-            //       kind, so the writer cannot produce a subset-scoped one.
-            // It is still checked, because the file is not always ours: a hand-edited or reflowed file can
-            // say anything, and a marker that does not cover a kind this run can select must not suppress
-            // that kind's measurement.  A marker about FEWER kinds than this build has is therefore
-            // refused; one about MORE kinds cannot exist today, since the parser's closed set IS
-            // TUNE_KINDS (the `tuneKindKnown` call above), and the day a kind is removed from the registry
-            // this comparison has to be revisited with it.
-            if (file.negative) {
-              string uncovered;
-              for (size_t k = 0; k < sizeof(TUNE_KINDS) / sizeof(TUNE_KINDS[0]); k++) {
-                bool covered = false;
-                for (size_t i = 0; i < file.negativeScope.size(); i++) {
-                  if (file.negativeScope[i] == TUNE_KINDS[k].name) { covered = true; break; }
-                }
-                if (!covered) {
-                  uncovered = TUNE_KINDS[k].name;
-                  break;
-                }
-              }
-              if (!uncovered.empty()) {
-                string declared;
-                for (size_t i = 0; i < file.negativeScope.size(); i++) {
-                  declared += (i ? "," : "") + file.negativeScope[i];
-                }
-                // The refusal takes the same shape as every other rejection above: NOTE is set, and
-                // nothing about the file reaches the Decision.  In particular the ROWS are dropped too
-                // -- a file whose own marker does not speak for this build is not a file to half-trust,
-                // and "rows win, loudly" is reserved for the ROW+NEGATIVE-SAME-KIND case below, which is
-                // a statement the format itself forbids rather than one this build cannot interpret.
-                refuseLoad(loadKind, "NEGATIVE scope [" + declared + "] does not cover the kind '"
-                                    + uncovered + "' this build can select (the marker does not speak "
-                                      "for it, so it must not suppress it)");
-                d->cacheState = "rejected";
-                d->note = string(loadKind) + " carries a marker that does not speak for this run";
-                d->rows.clear();
-                d->rowCount = 0;
-                d->negative = false;
-                d->negativeScope.clear();
-                d->negativeReason.clear();
-                // (7a): the file's marker is dropped together with its rows, and what is left is this
-                // process's own enumeration -- the same rule as the two branches above (the catalogue ran,
-                // and it ran first).
-                d->rowSource = "measured";
-              }
-            }
-            if (d->cacheState != "rejected") {
+            // 🔴 B3.5 (2026-10-01): THREE BLOCKS USED TO SIT BETWEEN HERE AND THE ASSIGNMENT BELOW, and
+            // every one of them was about the file's durable MARKER rather than about its rows:
+            //   (i) the W4b kind-scope check ("the marker does not cover a kind this build can select");
+            //   (ii) the adoption point -- `negativeAdoptable(file)` feeding `d->negative` and
+            //        `cacheState = "negative"`, i.e. the read half of the second cache form;
+            //   (iii) the "has both ROW and NEGATIVE for this key" loud.
+            // (i) and (iii) were ALREADY unreachable before this batch: B3 made the parser REFUSE a
+            // `NEGATIVE` line by name (SCHEMA_VERSION 5 -> 6), so `RowsFile::negative` could never be set
+            // again -- a dead branch is not a defence, so they are deleted rather than kept.  (ii) died
+            // with the `RowsFile` fields it read.  The `if (d->cacheState != "rejected")` wrapper those
+            // three lived inside collapses with them: nothing between the ROWSET_HASH check above and this
+            // assignment can set `rejected`, so reaching here IS the accept path.  What a file can say is
+            // therefore exactly one thing -- the row set it carries -- and `cacheState` says whether that
+            // load happened.  (The fact that a loaded set is NOT this process's own measurement is
+            // unchanged and still recorded: `rowSource = "cache"` below, while `candidateSearched` was
+            // already set by the enumerator, which ran first.)
             d->rows = file.rows;
             d->rowCount = d->rows.size();
             d->rowSource = "cache";
-            // 🔴 ONE fact, ONE spelling (W3b): `cacheState` and `negative` used to be two independent
-            // expressions of the same question, so limiting only one of them would have printed
-            // `cache_state=negative` next to `d->negative == false` -- two readings of ONE run that
-            // contradict each other.  Both derive from the named predicate now.
-            const bool adoptedNegative = negativeAdoptable(file);
-            d->cacheState = adoptedNegative ? "negative" : "loaded";
-            d->negative = adoptedNegative;
-            if (adoptedNegative) {
-              // W4b: the SCOPE travels with the marker.  The cache writer refuses an unscoped marker,
-              // so dropping it here would make a file that loaded fine become unwritable on the next
-              // write -- the very field this batch added would be lost on the way through.
-              d->negativeScope = file.negativeScope;
-            }
-            if (d->negative) {
-              // Carried onto the Decision, not just into the note: the cache writer checks the
-              // reason against the closed set and writes the marker back out, so it has to be
-              // here.  In the "both ROW and NEGATIVE" case
-              // below the reason is deliberately dropped with the stale entry.
-              d->negativeReason = file.negativeReason;
-              // W2 (post-review): record WHO wrote this marker.  The read-side legs assert that
-              // "nothing to do" means "nothing written", so the finalizer must be able
-              // to tell a marker it owns from one the loader handed it -- see Decision::NegativeOrigin.
-              // (`d->negative` is false on the other branch, where NegativeOrigin::None is already the
-              // value, so this one assignment is the only place a from-file origin can be born.)
-              d->negativeOrigin = Decision::NegativeOrigin::FromFile;
-            }
-            if (file.negative && !file.rows.empty()) {
-              // Reachable only from a hand-edited or merged file: the writer refuses to emit
-              // both (one file = one key makes them exclusive statements about that key).
-              // The rows are the useful thing, so they win -- but saying nothing would turn
-              // "we wrote NEGATIVE and it still installed rows" into a mystery (lesson #46).
-              d->cacheState = "loaded";
-              d->negativeScope.clear();
-              logLine("WARNING: " + string(loadKind) + " has both ROW and NEGATIVE for this key"
-                      " (the writer never emits that); using the " + to_string(d->rowCount)
-                      + " row(s) and treating the negative entry as stale");
-            }
-            if (d->negative) {
-              // A negative entry means "this (device, model, S, mb) was DETERMINISTICALLY
-              // all-rejected": there is nothing to install and nothing to try.  It is never
-              // written on a timeout (t1-schema.md section 1), because "we ran out of time"
-              // is not a property of the device.
-              d->note = string(loadKind) + ": negative entry (" + file.negativeReason
-                       + "), no tuning attempted";
-            }
-            else {
-              d->note = string(loadKind) + " loaded: " + to_string(d->rowCount) + " row(s)";
-            }
-            }
+            d->cacheState = "loaded";
+            d->note = string(loadKind) + " loaded: " + to_string(d->rowCount) + " row(s)";
           }
         }
       }
@@ -5131,56 +4947,47 @@ namespace VulkanTuner {
   // 🔴 The coarse name is recorded EVEN WHEN allRejectReasonsAreDevice is false, and then this prints
   // flag=false + the counts (G-D20).  The write is refused by the table's own `device-only` condition,
   // so no file appears -- and "the file was not written" must never be the only thing the log says.
-  // The NEGATIVE ENTRY (negative + negativeReason) is set ONLY on the device-only branch: that marker
-  // outlives the process, so our own implementation gap must never leave one behind.
+  // ⚠️ B3.5 (2026-10-01): THIS FUNCTION NO LONGER SETS OR CLEARS ANY MARKER.  The `negative` /
+  // `negativeReason` / `negativeOrigin` fields it used to maintain went with the marker they described
+  // (B3 deleted the wire segment; B3.5 deleted the in-memory state).  What survives is the VERDICT --
+  // which is what `reportVerdict` below prints -- and the install accounting it is computed from.
+  //   🔴 ONE CONSEQUENCE IS RECORDED RATHER THAN HIDDEN, because the field that carried it is what left:
+  // `AnyRowInstalled` used to be a WRITE-side refusal as well as a verdict -- `cacheEntryWritable`'s last
+  // arm read `d.negative`, so a self-falsified all-reject could not be written at all.  Since B3 changed
+  // this outcome's declared effect to `rows` (the EMPTY row set), that arm is never consulted for this
+  // row, and `anyRowInstalled` is therefore no longer an input to the write gate: it is a REPORTED
+  // verdict (its NOTICE) and nothing else.  B3.5 removes the FIELD, not the effect -- what may be written
+  // here is a decision of its own and is NOT taken in this batch.
   //
-  // 🔴 POST-REVIEW (2026-09-20): this function COMPUTES and does not PRINT, and it only ever removes a
-  // marker it created itself.  Both halves are load-bearing:
-  //   * SILENT => the loud lines live at ONE reporting site (reportVerdict below), so a second call for
-  //     the same event cannot print the same conclusion twice.  The first smoke run with the write live
-  //     printed every (a)/(b) NOTICE exactly twice -- once from the install path, once from the once
-  //     point -- because this function both computed AND printed.  A finalizer that is not idempotent is
-  //     what made that possible; making it a pure function removes the whole class.
-  //   * NegativeOrigin::AllReject only => a marker READ FROM A FILE belongs to the loader (the
-  //     read-side legs assert "nothing to do means nothing written"), so all this
-  //     function may do to it is RETIRE it on the one transition that makes it false by our own account
-  //     -- a durable row was installed for this key -- and say so as StaleFromFileNegativeRetired.
-  // ⚠️ UPDATED BY B3 (SCHEMA_VERSION 5 -> 6): the "both ROW and NEGATIVE" throw that this sentence
-  // used to call UNREACHABLE from the write path NO LONGER EXISTS -- it went away with the NEGATIVE
-  // wire segment, and the unreachability argument went with it.  What survives in this function is the
-  // RETIREMENT rule itself (the one transition the finalizer still owns); the formatter's surviving
-  // refusal is the row-count cap, and the self-test drives it through the write path (case (j)).
+  // 🔴 POST-REVIEW (2026-09-20): this function COMPUTES and does not PRINT.  The silence is load-bearing:
+  // the loud lines live at ONE reporting site (reportVerdict below), so a second call for the same event
+  // cannot print the same conclusion twice.  The first smoke run with the write live printed every
+  // self-falsification NOTICE exactly twice -- once from the install path, once from the once point --
+  // because this function both computed AND printed.
+  // ⚠️ B3.5: the OTHER half of that note (the marker the function used to retract, and the one transition
+  // it owned -- a durable row installed for a key that carried a from-file marker) has no subject left:
+  // nothing can put a from-file marker on a decision any more, so there is nothing to retire and no
+  // `StaleFromFileNegativeRetired` verdict to report.  The `rowsForWrite`-vs-`d.rows` distinction and the
+  // row-count cap are unaffected, and the self-test still drives the cap through the write path (case (j)).
   Decision::FinalizeVerdict finalizeOutcome(Decision& d) {
-    // Recompute OUR marker from scratch: the verdict below is a pure function of the accounting, so the
-    // same call on the same accounting must produce the same fields (and no leftover marker).
-    if (d.negativeOrigin == Decision::NegativeOrigin::AllReject) {
-      d.negative = false;
-      d.negativeReason.clear();
-      d.negativeOrigin = Decision::NegativeOrigin::None;
-    }
+    // The verdict below is a PURE FUNCTION of the install accounting: the same call on the same accounting
+    // must produce the same answer, and since B3.5 there is no marker state left for two calls to disagree
+    // about.
     if (d.install.installed > 0) {
       d.outcome = "measured";
-      if (d.negativeOrigin == Decision::NegativeOrigin::FromFile) {
-        d.negative = false;
-        d.negativeReason.clear();
-        d.negativeOrigin = Decision::NegativeOrigin::None;
-        return Decision::FinalizeVerdict::StaleFromFileNegativeRetired;
-      }
       return Decision::FinalizeVerdict::Measured;
     }
     if (d.install.declared > 0) {
       d.outcome = "structural-all-reject";
       if (d.anyRowInstalled) {
-        // (b) Self-falsification guard.  Some context of this device installed a row for this very key,
-        // so "this key has no injection slot" is false BY THIS PROCESS'S OWN ACCOUNT.  The trigger is
-        // candidate-scoped (that particular row's path, its shared-memory demand) while the negative
-        // entry is key-scoped and STICKY, so it must not be written.
+        // Self-falsification guard.  Some context of this device installed a row for this very key, so
+        // "this key has no injection slot" is false BY THIS PROCESS'S OWN ACCOUNT.  The trigger is
+        // candidate-scoped (that particular row's path, its shared-memory demand) while the claim is
+        // key-scoped and STICKY -- and see the consequence note above: since B3 this verdict no longer
+        // reaches the write gate, so what it produces today is the NOTICE `reportVerdict` prints.
         return Decision::FinalizeVerdict::AnyRowInstalled;
       }
       if (d.allRejectReasonsAreDevice) {
-        d.negative = true;
-        d.negativeReason = "no-injection-slot";
-        d.negativeOrigin = Decision::NegativeOrigin::AllReject;
         return Decision::FinalizeVerdict::DeviceOnlyAllReject;
       }
       return Decision::FinalizeVerdict::OurGap;
@@ -5207,23 +5014,17 @@ namespace VulkanTuner {
         break;
       case Decision::FinalizeVerdict::AnyRowInstalled:
         logLine("NOTICE: " + d.deviceName + ": rows were rejected, but another context of this device "
-                "INSTALLED at least one row for this SAME key, so 'no-injection-slot' would be false: NO "
-                "negative entry is created (a candidate-scoped reason must not become a key-scoped, "
-                "sticky verdict)");
+                "INSTALLED at least one row for this SAME key, so 'no-injection-slot' would be false: the "
+                "coarse outcome is NOT a durable claim about this key (a candidate-scoped reason must not "
+                "become a key-scoped, sticky verdict)");
         break;
       case Decision::FinalizeVerdict::OurGap:
         logLine("NOTICE: " + d.deviceName + ": every declared row was rejected, but NOT every reason "
                 "is a device property (flag=false; our-gap=" + to_string(d.install.dropped_unsupported_our_gap)
                 + " illegal=" + to_string(d.install.dropped_illegal)
                 + " variant-failed=" + to_string(d.install.variant_failed) + "): the coarse outcome "
-                "'structural-all-reject' is recorded WITHOUT a negative entry, because our own "
+                "'structural-all-reject' is recorded WITHOUT a durable verdict, because our own "
                 "implementation gap is not a property of this device (G-D20)");
-        break;
-      case Decision::FinalizeVerdict::StaleFromFileNegativeRetired:
-        logLine("NOTICE: " + d.deviceName + ": a row was installed for this key, so the NEGATIVE entry "
-                "this run READ FROM A FILE is retired before writing (a measurement supersedes a loaded "
-                "verdict: one file = one statement, so the marker is dropped instead of being written "
-                "next to rows)");
         break;
     }
   }
@@ -5422,13 +5223,20 @@ namespace VulkanTuner {
       // what is parked is the CALL, not the derivation.
       // 🔴 B1 (2026-09-30, ONE cache form): a file that was ACCEPTED is this key's durable answer, and
       // an EMPTY row set is one of its two shapes ("use the stock configuration everywhere").  A loaded
-      // answer must therefore NOT be re-measured: `cacheState == "loaded"` is exactly "the file was taken
-      // as the answer" (a negative marker spells it "negative", a refused file "rejected", no file
-      // "absent"), so the pre-check -- and with it the measurement -- is skipped for a hit and still runs
+      // answer must therefore NOT be re-measured: `cacheState` says which of the three states the loader
+      // chain left behind ("loaded" = the file was taken as the answer, "rejected" = it was refused,
+      // "absent" = there was no file; "retune-ignored" is the env-forced branch that never enters the
+      // chain), so the pre-check -- and with it the measurement -- is skipped for a hit and still runs
       // otherwise.  Without this the second run paid for the measurement it had already written down
       // (measured: the two-run acceptance showed `cache_state=loaded` AND a `measure:` line).
+      // 🔴 B3.5 (2026-10-01): the `!decision->negative` operand that used to sit here is gone.  It said
+      // "a decision carrying a durable marker is not re-measured", and no decision can carry one any more;
+      // it was also not load-bearing for the case it named, because the ONLY producer of that marker
+      // (`rejectBySpikeGate`) runs from `judgeMeasurement`, i.e. AFTER the pre-check and the measurement
+      // have both been attempted and their once-flags set.  Removing it therefore changes the reading of
+      // no reachable state.
       if (!decision->precheckAttempted && !decision->graphShapes.empty() && decision->rows.empty()
-          && !decision->negative && decision->cacheState != "loaded") {
+          && decision->cacheState != "loaded") {
         decision->precheckAttempted = true;
         const vk_tune_probe_shape* heaviest = &decision->graphShapes[0];
         unsigned long long bestVolume = 0;
@@ -5633,7 +5441,10 @@ namespace VulkanTuner {
       // measurement of nothing").  The primitive prints its own refusal sentence with its `[T3]` marker, so
       // it is not repeated here.  The gate names the doors the primitive itself refuses on, so the call is
       // not made only to be refused: no pre-check reading, no per-shape weights, no candidates, rows
-      // installed, or a negative entry.
+      // already installed, or a loaded answer.  (B3.5 removed the `!decision->negative` operand this
+      // sentence used to list as "or a negative entry": no decision can carry one any more, and the gate
+      // below is reached only after the measurement's own once-flag is set, so the operand named no
+      // reachable state -- the loaded-answer door beside it is the one that really closes this gate.)
       //
       // 🔴 P3 (2026-10-01): THE WIDE-BAND RECOVERY -- at most TWO passes over (measurement, judgement).
       // THE DEFECT THIS CLOSES: `pairedSignedRank` needs FOUR non-zero paired differences to form an
@@ -5665,7 +5476,7 @@ namespace VulkanTuner {
           && decision->graphShapeCounts.size() == decision->graphShapes.size()
           && !decision->graphShapes.empty()
           && !decision->candidateGeoms.empty()
-          && decision->rows.empty() && !decision->negative
+          && decision->rows.empty()
           // B1: an ACCEPTED answer (the empty row set included) is not re-measured -- see the pre-check gate.
           && decision->cacheState != "loaded") {
         decision->measurement.attempted = true;
