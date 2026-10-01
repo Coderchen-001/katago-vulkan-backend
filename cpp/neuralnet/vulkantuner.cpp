@@ -73,7 +73,18 @@ namespace VulkanTuner {
     // migration and none is needed: no production cache file existed before this (EXPORT was
     // the only writer and only tests asked for it).  A VERSION 1 file is refused loudly,
     // which is right for a file whose rows were not keyed to the name they live under.
-    const int SCHEMA_VERSION = 5;   // was 4: the NEGATIVE LINE gained a required SCOPE token
+    const int SCHEMA_VERSION = 6;   // was 5: the WIRE SEGMENT itself went away -- there is no `NEGATIVE`
+                                    // line any more, so a cache file holds exactly one form: `ROWS n`
+                                    // plus its ROW lines.  This is the SAME AXIS as 4 -> 5, which this
+                                    // file's own record says was "the NEGATIVE LINE gained a required
+                                    // SCOPE token": both bumps change the SHAPE of a line on the wire,
+                                    // not the required header-key set.  The consequence is the intended
+                                    // one: an old file carrying a `NEGATIVE` line now falls into the
+                                    // unknown-key refusal (the final else of the parser), so
+                                    // `cache_state=rejected` and a fail-open empty row set -- that is
+                                    // exactly where "re-tune the whole thing" lands, and it is what makes
+                                    // deleting the concept safe to do in one cut rather than behind a
+                                    // compatibility reader.  was 4: the NEGATIVE LINE gained a required SCOPE token
                                     // (`NEGATIVE <reason> <kind>[,<kind>...]`), so an older file's
                                     // marker does not say which kind it is about -- and under this
                                     // batch's rule an unscoped marker would have to be read as
@@ -344,78 +355,27 @@ namespace VulkanTuner {
     // RIGHT version", while
     // REQUIRED_FOR_CACHE answers "did it say at all".  Dropping the guard would make an absent key
     // read as a mismatching one and would name the wrong cause in the refusal line.
-    struct NegativeReasonSpec {
-      const char* reason;
-      const char* invalidation;
-    };
-    const NegativeReasonSpec NEGATIVE_REASONS[] = {
-      { "no-injection-slot", "full-key-set" },
-      { "no-entry",          "full-key-set" },
-      // A1 (probe batch): `no-gain` -- "the key was swept and nothing beat stock" -- is registered
-      // while NOTHING produces it, which is exactly the status `no-entry` above already has, and for
-      // the same reason: a name in the closed set is not a name something PRODUCES.  Both halves are
-      // needed.  (i) The PARSER must read it -- a hand-written or reflowed file may carry it, and a
-      // format that refuses a name it admits is a format that cannot be interpreted.  (ii) Its
-      // producer does not exist yet and that is written down rather than implied: the writer is
-      // branch (2) of the three-branch decision ("nothing better AND pairsComplete"), which lands
-      // with the measurement primitive's decision path.  R17 pins the writer COUNT per reason, so the
-      // day that branch assigns this literal the guardrail reddens until its author returns and says
-      // what it means -- "reserved" cannot decay into "accidentally live".
-      // (iii) REACHABILITY is a separate question from existence: even with the branch in place this
-      // write cannot fire today, because `swept-here` is false while the catalogue is a sampling
-      // surface.  The first REACHABLE write is therefore step 5 (the first real negative entry).
-      // 🔴 GRANULARITY (pinned here so that `full-key-set` is not read as answering it): the negative
-      // entry is ONE whole-key claim -- every per-shape pair was measured and no candidate was
-      // non-inferior -- and the per-shape readings stay in the report/log.  A reason whose
-      // invalidation differs from `full-key-set` would be a FORMAT-level act (a new header key + a
-      // loader comparison + an R12 update), not an edit to this row; a per-shape LIFETIME is not
-      // expressible at all, because the file name carries the whole key.
-      { "no-gain",           "full-key-set" },
-      // R-28 step (2), 2026-09-26: `gate-reject` is the FOURTH name, and it is the first one whose
-      // producer lands in the SAME batch that declares it.  The reason and the OUTCOME share the
-      // spelling deliberately: they are TWO closed sets (this one is the file's reason token, the other
-      // is the decision's state) that name ONE meaning -- "the runtime spike-rate gate refused this
-      // run's measurement" -- so neither may be read as "there was nothing to measure" (that is the
-      // primitive's own NOT_MEASURED, and R-10 keeps the two names apart).
-      // WHY IT IS DURABLE AT ALL (the ruling, tune-gaps.md A1-A): a fail-closed gate plus the deleted
-      // ceiling (R-1) means a machine whose TRUE spike rate sits near the bound would pay the whole
-      // measurement on every start and never land anything (13-26 s per start on the 5080) -- this
-      // entry IS the backoff that ends that loop, and it is what the writable outcome above is FOR.
-      // SCOPE vs FACT: the fact is device-level (the spike rate follows the device, not the run), while
-      // the entry is key-level, so every key pays its own measurement and records its own entry.  That
-      // is accepted and written down rather than read as "one entry should have been enough".
-      // Its lifetime is `full-key-set` like every other reason here (R17 pins the whole set and the
-      // loader comparisons that redeem that value).
-      { "gate-reject",       "full-key-set" },
-    };
+    // The closed set of negative-entry REASONS used to live here (struct NegativeReasonSpec,
+    // NEGATIVE_REASONS[], negativeReasonKnown()).  It was deleted together with the wire segment it
+    // served (SCHEMA_VERSION 5 -> 6): with no `NEGATIVE` line to read or write there is no reason
+    // token to keep closed.  The `Decision` fields it validated (`negative` / `negativeReason`) still
+    // exist and are still set by the in-memory decision path -- their removal is a separate step, and
+    // deleting this set here does not widen anything: the only checks that disappeared were checks on
+    // a string that can no longer reach the disk or arrive from it.
 
-    // The closed set holds on BOTH sides: the parser (so an uninterpretable file is refused
-    // instead of loading as if it had said nothing) and the cache writer's "is there anything to
-    // write?" predicate below (so free text can never reach the disk).  A set only the reader
-    // checks is a set on paper.
-    bool negativeReasonKnown(const string & reason) {
-      for (const NegativeReasonSpec & r : NEGATIVE_REASONS) {
-        if (reason == r.reason) {
-          return true;
-        }
-      }
-      return false;
-    }
-
-    // W4b: is this a kind this build knows?  The registry and its membership test live HERE, next to
-    // NEGATIVE_REASONS and for the same reason: they are the second closed set the file format depends on
-    // (the first is the reason), and BOTH the parser (which reads a NEGATIVE line's scope) and the
-    // candidate catalogue (which declares the search domain per kind) need them.  Putting the registry
-    // here rather than inside the completeness-gate block below is what keeps those two from growing a
-    // SECOND kind list -- F17's "the value domain comes from declared data" applies to the closed set of
-    // kind names exactly as it does to the axis values.
+    // W4b: is this a kind this build knows?  The registry and its membership test live HERE because
+    // they are the closed set the file format depends on: the parser (which reads a ROW line's kind)
+    // and the candidate catalogue (which declares the search domain per kind) BOTH need them, and the
+    // completeness gate below asks them too.  Putting the registry here rather than inside the
+    // completeness-gate block is what keeps those consumers from growing a SECOND kind list -- F17's
+    // "the value domain comes from declared data" applies to the closed set of kind names exactly as
+    // it does to the axis values.
     struct TuneKindSpec {
       const char* name;
     };
     const TuneKindSpec TUNE_KINDS[] = {
       { "mm" },   // matmul rows: the only kind this tuner can produce so far (FA adds a row)
     };
-    const size_t TUNE_KIND_COUNT = sizeof(TUNE_KINDS) / sizeof(TUNE_KINDS[0]);
 
     // Fail-closed: an unknown kind is never known, so a hand-edited scope cannot name a kind this build
     // would silently accept as "some kind".
@@ -601,14 +561,22 @@ namespace VulkanTuner {
       // 🔴 ONE CACHE FORM (2026-09-30 ruling; option D landed): an EMPTY ROW SET is a durable
       // artifact in its own right -- "this key was measured, and the stock configuration is the best
       // this device has" -- so an outcome whose row declares the effect `rows` may write `ROWS 0`.
-      // The TABLE decides, not this function: a `negative:` row still needs its marker, and a
-      // `nothing:` row is not admitted by this arm.  The completeness gate asks THIS predicate
+      // The TABLE decides, not this function: a `nothing:`-declaring row is not admitted by this arm,
+      // and since SCHEMA_VERSION 5 -> 6 there is no other durable effect for a row to declare.  The
+      // completeness gate asks THIS predicate
       // (firstUnconcludedKind), so "may write" and "is complete" cannot disagree about an empty set.
       const char * effect = declaredEffectFor(d);
       if (effect != nullptr && string(effect) == "rows") {
         return true;
       }
-      return d.negative && negativeReasonKnown(d.negativeReason);
+      // Nothing else may be written.  This used to end with `return d.negative &&
+      // negativeReasonKnown(d.negativeReason)` -- the second cache form, whose closed set was deleted
+      // with the NEGATIVE wire segment (SCHEMA_VERSION 5 -> 6).  The TABLE still decides (the arm above
+      // is the only "yes"), and dropping the arm does not WIDEN anything: a decision that would have
+      // answered "yes" through it now gets the same answer the null- and `nothing:`-declaring rows get,
+      // which is what the ONE-cache-form ruling wants.  `firstUnconcludedKind` asks this predicate, so
+      // "may write" and "is complete" still cannot disagree.
+      return false;
     }
 
     // The CLOSED SET of decision outcomes and whether each one may be REMEMBERED (step "3-4").
@@ -617,9 +585,10 @@ namespace VulkanTuner {
     // the failure modes are not interchangeable -- a timeout, an IO error, a lost device and a run
     // with no winner all mean "this attempt did not produce an answer", while a structural
     // all-reject means "there is no answer to produce" and a completed measurement means "here is
-    // the answer".  Only those last two may be written, and they are different KINDS of writable
-    // (a row set vs a NEGATIVE entry), which is why the class is declared as well -- the class is
-    // what section 6.4's rule table names, and what step 4/5 will branch on.
+    // the answer".  Only those last two may be written, and with ONE CACHE FORM (SCHEMA_VERSION 5 -> 6)
+    // both write the SAME kind of artifact -- a row set, possibly the EMPTY one -- which is why the
+    // class is declared as well: the class is what section 6.4's rule table names, and what step 4/5
+    // will branch on.
     //
     // Class (b) -- a run the RUNTIME GATE refused -- was declared NOT writable until the gate / tau /
     // soft-gate parameters entered policyFingerprint, because changing a gate parameter would
@@ -662,12 +631,15 @@ namespace VulkanTuner {
       const char* condition;
       // 🆕 (7d): THE DURABLE EFFECT, as DECLARED data.  Section 4.5 of the plan requires outcome =>
       // "what lands on disk" to be a TOTAL FUNCTION, and this column is that function:
-      //   `rows`              -- the durable artifact is the row set;
-      //   `negative:<reason>` -- it is a NEGATIVE entry and the reason is named HERE, so a fixture can
-      //                         be driven BY THIS STRING instead of hand-assembling the state (the way
-      //                         a fixture ends up asserting the wrong thing);
-      //   `nothing:<why>`     -- this attempt leaves no durable claim, and the why is the plan table own
-      //                         wording (`in-progress` / `transient` / `rerun`).
+      //   `rows`          -- the durable artifact is the row set (which may be the EMPTY set: `ROWS 0`
+      //                      is a complete statement, "use the default everywhere");
+      //   `nothing:<why>` -- this attempt leaves no durable claim, and the why is the plan table own
+      //                      wording (`in-progress` / `transient` / `rerun`).
+      // 🔴 THE `negative:<reason>` ALTERNATIVE IS GONE (SCHEMA_VERSION 5 -> 6, the NEGATIVE segment
+      // deleted): there is one cache form, so `rows` is the only durable artifact a row may declare.
+      // The bullet used to say the reason is named HERE so a fixture can be driven BY THIS STRING;
+      // with no second form there is no second string, and `effectMatches`' `negative:` arm is deleted
+      // with it (nothing may put the prefix back in this column).
       // 🔴 THE RULE THAT MAKES IT A CRITERION: every `structural` and `completed` row must NOT be
       // `nothing:` -- a finished run that remembers nothing is the "pay for the measurement on every
       // startup" shape this project exists to prevent.  R19 pins the closed set, that rule, and the
@@ -680,7 +652,13 @@ namespace VulkanTuner {
       // be OURS (measured-here), and it must be a SWEEP rather than a sample (swept-here).  The last
       // two are ORTHOGONAL to the first -- who produced the set, and how completely it was searched,
       // are different questions.
-      { "structural-all-reject", "structural",  true,  "device-only,measured-here,swept-here", "negative:no-injection-slot" },
+      // 🔴 ITS DURABLE EFFECT IS `rows` (SCHEMA_VERSION 5 -> 6, the ONE-cache-form ruling): the
+      // statement is the EMPTY row set -- "there is nothing to inject here, so use the default
+      // everywhere" -- which is exactly `ROWS 0` plus its ROWSET_HASH.  The reason token
+      // (`no-injection-slot`) was the OTHER cache form and died with the NEGATIVE segment, so it may
+      // not be named on this row any more: with the closed set gone there is nothing left to keep a
+      // free-text effect honest, and `effectMatches` no longer has a `negative:` arm to route it.
+      { "structural-all-reject", "structural",  true,  "device-only,measured-here,swept-here", "rows" },
       // A completed measurement writes ROWS, not a verdict about what does not exist.  The W4b coverage
       // condition is named here TOO, deliberately: the question is not about the outcome name but about
       // the candidate set, and leaving it off this row would mean an unmarked run could write rows as if
@@ -703,16 +681,34 @@ namespace VulkanTuner {
       // `measured` row carries, because the coverage question belongs to the SET, not to the outcome
       // spelling.  The PRUNE condition that used to be the third is gone with the layer (option D).
       { "measured-no-gain",      "completed",   true,  "measured-here,swept-here",            "rows" },
-      // R-28 step (2): THE ONE ROW WHOSE FLAG IS TRUE AND WHOSE CLASS IS `gate`.  It carries
+      // R-28 step (2): THE ONE ROW WHOSE CLASS IS `gate`.  It carries
       // `measured-here` for the same reason the rows above do (W3-P1): what a gate refusal remembers --
       // "this device's block times spike too often for the comparison to be trusted" -- is a claim
       // about the DEVICE, so only a candidate set THIS process measured may mint it.  A cache file
       // channel cannot even supply the inputs (a file carries no spike count), and the provenance
       // condition is what makes that structural instead of hopeful.
-      // Its durable effect is a NEGATIVE entry and NEVER a row set: `rejectBySpikeGate` clears the rows
-      // for exactly that reason.  Note the class token is unchanged -- the class is the guardrail's
-      // whitelist key and the self-test's fixture selector, not the runtime verdict.
-      { "gate-reject",           "gate",        true,  "measured-here",                                          "negative:gate-reject" },
+      // 🔴 IT IS NOT WRITABLE ANY MORE, AND ITS EFFECT IS `nothing:rerun` (SCHEMA_VERSION 5 -> 6).
+      // What it used to write was the OTHER cache form -- a durable NEGATIVE entry naming the reason
+      // `gate-reject` -- and that form is deleted, so this outcome must now refuse to write exactly
+      // like every other refusal: `rejectBySpikeGate` still clears the rows (the comparison produced
+      // no answer), and the run lands as "nothing durable, decide again next start".
+      // 🔴 THE COST IS KNOWN AND ACCEPTED (this is the evidence the deleted row used to be FOR, and it
+      // is recorded here rather than lost with the deletion): a fail-closed gate plus the deleted
+      // ceiling (R-1) means a machine whose TRUE spike rate sits near the bound pays the WHOLE
+      // measurement on every start and never lands anything -- measured at 13-26 s per start on the
+      // 5080.  The durable entry WAS the backoff that ended that loop.  Removing it is the accepted
+      // ruling of the plan, section 11: "a spike-gate refusal means re-tune next time", i.e. the
+      // machine re-pays its measurement at every start by design; what is NOT accepted by that ruling
+      // is a ceiling that would let a bad measurement through instead.
+      // The class token is unchanged -- the class is the guardrail's whitelist key and the self-test's
+      // fixture selector, not the runtime verdict.
+      // 🔴 B3 (2026-10-01): `measured-here` LEFT THIS ROW TOO, and that is the same ruling one column
+      // over: the condition said "a durable gate entry may only be written when THIS process measured
+      // the set", and there is no durable entry any more -- a condition on a row that can never be
+      // written has no subject, and a declared-but-unreachable rule is exactly the shape this project
+      // refuses to keep (the criterion that mirrors this table is a bidirectional equality, so the two
+      // sides have to agree on it rather than one of them silently tolerating the other).
+      { "gate-reject",           "gate",        false, "",                                                       "nothing:rerun" },
       { "running",               "measurement", false, "",                                                       "nothing:in-progress" },
       { "timeout",               "measurement", false, "",                                                       "nothing:transient" },
       { "io-error",              "measurement", false, "",                                                       "nothing:transient" },
@@ -821,8 +817,10 @@ namespace VulkanTuner {
     // write and therefore installs this marker -- ended up reporting a gate event for a measurement it
     // never made: `NOTICE: : spike-rate gate: ...` with an EMPTY device name (the synthetic decision has
     // none), a third copy of the sentence the smoke pins at exactly two, and the last red leg of the
-    // close-out run.  The literal stays in ONE production site (this setter), which is what the census
-    // counts (`WANT_REASON_WRITERS`), so splitting costs no rule anything.
+    // close-out run.  The literal stays in ONE production site (this setter); the census that used to
+    // count it (`WANT_REASON_WRITERS`, guardrail R17) was RETIRED with the negative-entry family in B3,
+    // because the closed reason set it counted no longer exists -- so splitting costs no rule anything
+    // today, and the one-site property is now held by this comment and by the smoke's own leg counts.
     void setGateRejectMarker(Decision & d) {
       d.rows.clear();
       d.negative = true;
@@ -839,12 +837,14 @@ namespace VulkanTuner {
               + "] has its UPPER bound above the declared bound "
               + to_string(TuneStats::SPIKE_RATE_GATE) + " (spikes=" + to_string(v.spikes)
               + " blocks=" + to_string(v.blocks) + " nObjects=" + to_string(v.nObjects)
-              + "), so NO row set is written for this key; the measurement's quality is a durable "
-                "property of this device+policy, so a NEGATIVE gate-reject entry is written instead -- "
-                "that entry IS the backoff (the next run reads it and does not pay for the measurement "
-                "again).  The interval assumes INDEPENDENT blocks and spikes are clustered, so it is if "
-                "anything too NARROW: the DIRECTION is fail-closed (the upper bound decides), the "
-                "CONSTRUCTION is not conservative");
+              + "), so NOTHING is written for this key: since the ONE-cache-form ruling (SCHEMA_VERSION "
+                "5 -> 6 deleted the NEGATIVE wire segment) a gate refusal leaves NO durable entry, so "
+                "the next startup pays for this measurement again -- measured on the 5080 at 13-26 s per "
+                "startup.  That price is KNOWN AND ACCEPTED (the plan's own exit table says 'spike gate "
+                "refused => re-tune next time'), and it is written down here rather than disappearing "
+                "with the entry this sentence used to describe.  The interval assumes INDEPENDENT blocks "
+                "and spikes are clustered, so it is if anything too NARROW: the DIRECTION is fail-closed "
+                "(the upper bound decides), the CONSTRUCTION is not conservative");
     }
 
     // ── (7c) THE JUDGEMENT LAYER ────────────────────────────────────────────────────────────────────
@@ -1422,9 +1422,12 @@ namespace VulkanTuner {
         // re-spelled, so the column and the writer cannot disagree.
         return !d.negative && cacheEntryWritable(d);
       }
-      if (e.rfind("negative:", 0) == 0) {
-        return d.negative && d.negativeReason == e.substr(string("negative:").size());
-      }
+      // The `negative:<reason>` arm was deleted with the NEGATIVE wire segment (SCHEMA_VERSION 5 -> 6)
+      // and MUST NOT come back: there is no durable marker left for it to route, so a table row naming
+      // one would be an effect this function can never satisfy -- which is the fail-closed direction
+      // (the row would simply never be writable) but also a rule nobody could read.  The self-test
+      // iterates the table through here, so a `negative:` string reappearing in `DECISION_OUTCOMES`
+      // reddens instead of silently refusing.
       if (e.rfind("nothing:", 0) == 0) {
         return !d.negative && rowsForWrite(d).empty();
       }
@@ -2682,70 +2685,18 @@ namespace VulkanTuner {
           }
         }
         else if (line.compare(0, 9, "NEGATIVE ") == 0) {
-          // Same rule as an unknown key (see the final else): a claim this tuner cannot interpret
-          // must not be read as if it had said nothing.  Be precise about WHAT the reason decides
-          // (this comment used to overclaim): every reason currently declares the SAME invalidation
-          // rule (the whole key set -- see NEGATIVE_REASONS), so the reason does not change how
-          // long the claim lives TODAY.  What it changes is what the claim MEANS, and that is
-          // enough to refuse a string we do not know: "this device structurally cannot be tuned"
-          // and an arbitrary sentence are not the same assertion, and only one of them is safe to
-          // act on.  Declaring the rule per reason is what keeps a FUTURE reason with a different
-          // lifetime from being added without saying so (R17 pins both fields).
-          // W4b: the line is `NEGATIVE <reason> <kind>[,<kind>...]` and BOTH tokens are closed sets --
-          // the reason from NEGATIVE_REASONS (what the claim MEANS, and how long it lives) and the scope
-          // from TUNE_KINDS (which kinds it is ABOUT).  The scope is what keeps a key-level marker from
-          // asserting a kind this run never measured; it is REQUIRED rather than optional, because an
-          // absent scope would have to be read as "all kinds" -- a fail-open default with the same shape
-          // as accepting an unknown reason.  A malformed line (missing scope, empty token, repeated kind)
-          // is refused for the same reason an unknown key is: a claim we cannot interpret must not load
-          // as if it had said nothing.
-          const string payload = line.substr(9);
-          const size_t sp = payload.find(' ');
-          const string reason = (sp == string::npos) ? payload : payload.substr(0, sp);
-          const string scopeText = (sp == string::npos) ? string() : payload.substr(sp + 1);
-          if (!negativeReasonKnown(reason)) {
-            err = "NEGATIVE line " + to_string(lineNo) + ": unknown reason '" + reason
-                + "' (the reason is a closed set; see NEGATIVE_REASONS)";
-            return false;
-          }
-          if (scopeText.empty()) {
-            err = "NEGATIVE line " + to_string(lineNo) + ": no scope (expected 'NEGATIVE <reason> "
-                  "<kind>[,<kind>...]'): an unscoped marker does not say which kind it is about, and "
-                  "reading it as 'all kinds' would assert kinds this run never measured";
-            return false;
-          }
-          out.negativeScope.clear();
-          {
-            string cur;
-            for (size_t i = 0; i <= scopeText.size(); i++) {
-              if (i == scopeText.size() || scopeText[i] == ',') {
-                if (cur.empty()) {
-                  err = "NEGATIVE line " + to_string(lineNo) + ": empty kind in scope '" + scopeText + "'";
-                  return false;
-                }
-                if (!tuneKindKnown(cur)) {
-                  err = "NEGATIVE line " + to_string(lineNo) + ": unknown kind '" + cur
-                      + "' in scope (the kind set is TUNE_KINDS; a marker about a kind this build does "
-                        "not know must not load)";
-                  return false;
-                }
-                for (size_t k = 0; k < out.negativeScope.size(); k++) {
-                  if (out.negativeScope[k] == cur) {
-                    err = "NEGATIVE line " + to_string(lineNo) + ": kind '" + cur
-                        + "' repeated in scope '" + scopeText + "'";
-                    return false;
-                  }
-                }
-                out.negativeScope.push_back(cur);
-                cur.clear();
-              }
-              else {
-                cur.push_back(scopeText[i]);
-              }
-            }
-          }
-          out.negative = true;
-          out.negativeReason = reason;
+          // The NEGATIVE segment was DELETED from the wire (SCHEMA_VERSION 5 -> 6): a cache file
+          // carries exactly one form, `ROWS n` followed by its ROW lines, and nothing else.  An old
+          // file that still carries a NEGATIVE line must NOT be read as if that line said nothing --
+          // that would load a stale durable claim under today's meaning -- so it is refused here,
+          // BY NAME and with the migration named, rather than falling into the generic unknown-key
+          // sentence below.  The refusal direction is unchanged from the deleted branch: a claim this
+          // tuner cannot interpret must not load as if it had said nothing (fail-open = empty row set
+          // = the whole key is re-tuned, which is the accepted landing point of this bump).
+          err = "line " + to_string(lineNo) + ": NEGATIVE lines were removed from the cache format "
+                "(this tuner reads one form: ROWS n plus ROW lines); refusing the file rather than "
+                "reading a durable marker this build no longer has a meaning for";
+          return false;
         }
         else if (line.compare(0, 4, "ROW ") == 0) {
           if (out.rows.size() >= MAX_ROWS_PER_FILE) {
@@ -2847,52 +2798,14 @@ namespace VulkanTuner {
       // one key holding the whole string (not one key per dimension), so a future mode dimension
       // grows this VALUE and never the key set -- the comparison stays "entire value equal".
       os << "MODE " << d.modeString << "\n";
-      // One file = one key, so "this key has rows" and "this key was all-rejected" are
-      // mutually exclusive statements.  The writer refuses to emit both; the reader still
-      // copes with a hand-edited file containing both (rows win, loudly).  The remaining
-      // case -- neither -- has no producer at all since R-29: the cache write path cannot
-      // create one (cacheEntryWritable() refuses it before this function is called), so the
-      // refusal below is a guard rather than a branch any run can reach.
-      // W2: this test now runs on the rows actually emitted.  When every row was dropped the emitted
-      // set is EMPTY and a NEGATIVE-only file is exactly the right statement -- which is the
-      // structural-all-reject outcome; the old `d.rows` spelling would have refused to write it.
-      //
-      // 🔴 W4b: the refusal is limited to the SAME KIND, and the general rule is now stated (rather than
-      // left to be re-derived): a file may carry ROW lines of one kind AND a NEGATIVE entry about
-      // ANOTHER, because those are statements about DIFFERENT kinds and the scope on the NEGATIVE line is
-      // what keeps them from contradicting each other.  What the format forbids is one kind being both
-      // "here are the rows" and "there is nothing here".  Since rows are mm rows today and TUNE_KINDS has
-      // exactly one member, every existing shape is still refused exactly as before -- the behaviour is
-      // unchanged, and adding `fa` will not need a second SCHEMA_VERSION bump to make mixing legal.
-      auto rowsKind = [](const vk_tune_row_spec& r) -> const char* {
-        // The row's kind is implied by which row family it is.  Today one family, so one answer; the
-        // mapping belongs HERE, next to the writer that has to decide, and it must move with TUNE_KINDS.
-        (void) r;
-        return "mm";
-      };
-      if (!rows.empty() && d.negative) {
-        bool sameKind = false;
-        for (size_t i = 0; i < d.negativeScope.size(); i++) {
-          for (size_t r = 0; r < rows.size(); r++) {
-            if (d.negativeScope[i] == rowsKind(rows[r])) {
-              sameKind = true;
-              break;
-            }
-          }
-          if (sameKind) {
-            break;
-          }
-        }
-        // An UNSCOPED marker cannot be told apart from one about the rows' own kind, so it is refused
-        // too: the safe direction is the one that cannot write a self-contradicting file.  (The writer
-        // refuses an empty scope outright further down; this branch is what keeps the CONTENT rule
-        // fail-closed rather than depending on which check happens to run first.)
-        if (d.negativeScope.empty() || sameKind) {
-          throw StringError("VulkanTuner: refusing to write a file with both ROW and NEGATIVE for the "
-                            "SAME kind (one file = one key: for one kind the two are exclusive "
-                            "statements; rows of one kind next to a marker about ANOTHER are allowed)");
-        }
-      }
+      // 🔴 ONE CACHE FORM (SCHEMA_VERSION 5 -> 6, which deleted the NEGATIVE wire segment): a cache
+      // file carries `ROWS n` plus its ROW lines and NOTHING ELSE, so the old "one file = one key, so
+      // rows and a marker are mutually exclusive, and the writer must refuse to emit both" rule has no
+      // second form left to exclude -- the exclusion, the `rowsKind` mapping that served it, and the
+      // throw that enforced it are gone with the segment.  An EMPTY row set is still a
+      // complete statement (`ROWS 0`: this key was measured and stock is the best this device has),
+      // which is why the cap check below runs on the rows ACTUALLY EMITTED rather than on `d.rows`:
+      // a run whose candidates were all dropped writes `ROWS 0`, not a refusal.
       // The writer enforces the SAME cap the parser does (MAX_ROWS_PER_FILE).  Refusing to
       // write an over-cap set is the only honest option: writing it would produce a file
       // that the reader then rejects, i.e. a cache that silently never loads.
@@ -2908,48 +2821,6 @@ namespace VulkanTuner {
            << " " << r.geom.WM << " " << r.geom.WN << " " << r.geom.WMITER
            << " " << r.geom.TM << " " << r.geom.TN << " " << r.geom.BS
            << " " << r.geom.pad << " " << r.geom.reshape << " " << r.geom.smaller << "\n";
-      }
-      if (d.negative) {
-        // The NEGATIVE segment.  Without this the negative channel had no WRITER at all: a
-        // decision that was (or had loaded) a negative entry written as `ROWS 0` and nothing
-        // else -- i.e. the marker was silently dropped and the round trip was broken, which is
-        // the same "it looked fine" failure the read side already refuses to make.
-        //
-        // The reason is taken from the Decision (never a literal here, so R17 can require that)
-        // and re-checked against the closed set: the parser refuses an unknown reason, so a file
-        // this writer produces is always re-readable.  `d.rows` is empty whenever `d.negative` is
-        // set (the guard above throws otherwise), which is also why the ROWSET_HASH written above
-        // is the hash of the EMPTY row set -- a deterministic value, not a placeholder.
-        if (!negativeReasonKnown(d.negativeReason)) {
-          throw StringError("VulkanTuner: refusing to write a NEGATIVE entry with reason '"
-                            + d.negativeReason + "' (it is not in the closed set, and a file this "
-                            "tuner cannot re-read must not be written)");
-        }
-        // W4b: the SCOPE is mandatory and closed-set too, and the writer enforces it for the same reason
-        // the parser does -- a file this tuner produces must be one it can read back.  Duplicates are
-        // collapsed AFTER checking, so the emitted line is canonical without the writer having to trust
-        // whatever built the Decision.
-        if (d.negativeScope.empty()) {
-          throw StringError("VulkanTuner: refusing to write an UNSCOPED NEGATIVE entry (reason '"
-                            + d.negativeReason + "'): the marker must name the kinds it is about, "
-                            "because 'no scope' cannot be read as 'all kinds'");
-        }
-        string scopeLine;
-        for (size_t i = 0; i < d.negativeScope.size(); i++) {
-          if (!tuneKindKnown(d.negativeScope[i])) {
-            throw StringError("VulkanTuner: refusing to write a NEGATIVE entry whose scope names the "
-                              "unknown kind '" + d.negativeScope[i] + "' (the kind set is TUNE_KINDS)");
-          }
-          bool seen = false;
-          for (size_t k = 0; k < i; k++) {
-            if (d.negativeScope[k] == d.negativeScope[i]) { seen = true; break; }
-          }
-          if (seen) {
-            continue;
-          }
-          scopeLine += (scopeLine.empty() ? "" : ",") + d.negativeScope[i];
-        }
-        os << "NEGATIVE " << d.negativeReason << " " << scopeLine << "\n";
       }
       return os.str();
     }
@@ -3035,8 +2906,10 @@ namespace VulkanTuner {
   // run with no cache file at all and require none to appear.
   //
   // The CALLER logs; this function only reports -- and that is now TRUE rather than aspirational:
-  // formatRowsFile() REFUSES some decisions by throwing (both ROW and NEGATIVE in one file; a
-  // reason outside the closed set), so the conversion to an error string happens HERE, once.  The
+  // formatRowsFile() REFUSES some decisions by throwing (since SCHEMA_VERSION 5 -> 6 that is the row
+  // count above the declared cap -- the "both ROW and NEGATIVE" throw and the "reason outside the
+  // closed set" one went away with the NEGATIVE wire segment), so the conversion to an error string
+  // happens HERE, once.  The
   // read path states the same contract for the same reason ("every load failure is fail-open +
   // loud, never an exception out of the hook"), and a caller that later moves outside the
   // decision's try/catch must not be able to turn a cache refusal into a crash.  Keeping the
@@ -3305,23 +3178,24 @@ namespace VulkanTuner {
       d.baselineVersion = "1";
       d.modelIdentity = "self-test";
       if (o.writable && string(o.klass) == "structural") {
-        // The one writable shape that says something without rows.
-        d.negative = true;
-        d.negativeReason = "no-injection-slot";
-        // G-D20: "the device has no injectable slot" is writable only when every rejection reason
-        // is a device property; the fixture has to say so explicitly (unset => not writable).
+        // The one writable shape that says something without rows -- and since the ONE-cache-form
+        // ruling (SCHEMA_VERSION 5 -> 6 deleted the NEGATIVE wire segment) what it SAYS is the EMPTY
+        // ROW SET: "every reason this key was rejected for is a property of this device, so the stock
+        // configuration is the best answer here".  The row's effect column is therefore `rows`, and the
+        // fixture must NOT mint a durable marker: there is no longer any marker in the format for a
+        // decision to hold, so a fixture that set one would fail this loop's own `effectMatches` check
+        // (measured: exactly that, the first run after the wire segment went).
+        // G-D20: "the device has no injectable slot" is writable only when every rejection reason is a
+        // device property; the fixture has to say so explicitly (unset => not writable).
         d.allRejectReasonsAreDevice = true;
         // W3-P1: and the row names a SECOND condition, so the fixture must satisfy that one too --
         // a fixture that only met `device-only` would fail this loop's positive direction, which is
         // how "the table gained a condition nobody's fixture knows about" announces itself.
         aMeasuredSet(d);
-        // W4b/option D: the row now names THREE (device-only, measured-here, swept-here), and the scope is
-        // mandatory for the writer, so the fixture carries it.  Each new condition gets its state set HERE
-        // rather than left to a default: the positive direction of this loop is what makes forgetting one
-        // of them a FAIL instead of a silent pass (the same position W3-P1 landed in).
+        // W4b/option D: the row now names THREE (device-only, measured-here, swept-here).  Each new
+        // condition gets its state set HERE rather than left to a default: the positive direction of
+        // this loop is what makes forgetting one of them a FAIL instead of a silent pass.
         aSweptSet(d);
-        d.negativeScope.clear();
-        d.negativeScope.push_back("mm");
       }
       else if (o.writable && string(o.klass) == "gate") {
         // The `gate` class's writable shape, MINTED BY THE REAL GATE rather than assembled here.  A
@@ -3846,35 +3720,39 @@ namespace VulkanTuner {
     }
 
     { // (j) D3b: THE WRITE PATH IS EXCEPTION-SAFE, and this case is the only executor that clause has.
-      // The shape it builds is one the FORMATTER refuses by throwing (a marker AND a row for the SAME
-      // kind), and the point is that the refusal comes back as a REFUSAL rather than as an exception out
-      // of the shell.  Every other case above either has no rows or a marker of another kind, so without
-      // this one the `try`/`catch` around the cache write path would be a clause nothing could
-      // falsify -- which is the "declared but never executed" gap this project refuses to ship.  The
-      // criterion is the refusal's OWN prefix: a writer that crashed would not produce a string at all.
+      // The shape it builds is one the FORMATTER refuses by THROWING.  🔴 THE TRIGGER MOVED WITH THE
+      // WIRE (SCHEMA_VERSION 5 -> 6): it used to be "a marker AND a row for the SAME kind", and THAT
+      // throw went away together with the NEGATIVE segment, so this case was re-pointed at the ONE
+      // refusal the formatter still throws for -- a row count above the declared cap
+      // (`MAX_ROWS_PER_FILE`, the same cap the parser enforces).
+      // The point is unchanged: the refusal must come back as a REFUSAL rather than as an exception out
+      // of the shell, and without this case the `try`/`catch` around the cache write path would be a
+      // clause nothing could falsify -- the "declared but never executed" gap this project refuses to
+      // ship.  The criterion is the refusal's OWN prefix: a writer that crashed would not produce a
+      // string at all.
       Decision d;
       d.deviceName = "self-test";
       d.cachePath = probePath;
       d.outcome = "structural-all-reject";
-      d.negative = true;
-      d.negativeReason = "no-injection-slot";
-      d.negativeOrigin = Decision::NegativeOrigin::AllReject;
+      // Every reason is a device property (or the FIRST unmet condition refuses and the formatter is
+      // never reached), and the two provenance conditions are satisfied -- so the only thing standing
+      // between this decision and a written file is the formatter's own cap.
+      d.allRejectReasonsAreDevice = true;
       aMeasuredSet(d);
       aSweptSet(d);
-      d.allRejectReasonsAreDevice = true;   // or the FIRST unmet condition refuses, and the formatter is never reached
-      d.negativeScope.clear();
-      d.negativeScope.push_back("mm");   // the SAME kind the row below carries: the formatter refuses that
-      d.install.declared = 1;
-      d.install.installed = 1;
-      vk_tune_row_spec r {};
-      r.path = VK_TILE_PATH_SCALAR;
-      r.src0_type = 1;
-      r.src1_type = 0;
-      r.geom.BM = 64; r.geom.BN = 64; r.geom.BK = 0;
-      r.geom.WM = 32; r.geom.WN = 32; r.geom.WMITER = 1;
-      r.geom.TM = 4; r.geom.TN = 4; r.geom.BS = 128;
-      r.geom.pad = -1; r.geom.reshape = -1; r.geom.smaller = -1;
-      d.rows.push_back(r);
+      d.install.declared = (uint32_t) (MAX_ROWS_PER_FILE + 1);
+      d.install.installed = (uint32_t) (MAX_ROWS_PER_FILE + 1);
+      for (size_t i = 0; i <= (size_t) MAX_ROWS_PER_FILE; i++) {
+        vk_tune_row_spec r {};
+        r.path = VK_TILE_PATH_SCALAR;
+        r.src0_type = 1;
+        r.src1_type = 0;
+        r.geom.BM = 64; r.geom.BN = 64; r.geom.BK = 0;
+        r.geom.WM = 32; r.geom.WN = 32; r.geom.WMITER = 1;
+        r.geom.TM = 4; r.geom.TN = 4; r.geom.BS = 128;
+        r.geom.pad = -1; r.geom.reshape = -1; r.geom.smaller = -1;
+        d.rows.push_back(r);
+      }
       string jErr;
       const bool jWrote = writeCacheIfAllowed(d, policy, jErr);
       if (jWrote || jErr.find("the cache entry was refused") == string::npos) {
@@ -3952,44 +3830,31 @@ namespace VulkanTuner {
         r.geom.pad = -1; r.geom.reshape = -1; r.geom.smaller = -1;
         g.rows.push_back(r);
         rejectBySpikeGate(g, judgeSpikeRate(25u, 100u, 6u));
-        const bool verdictOk0 = g.outcome == "gate-reject" && g.negative
-                             && g.negativeReason == "gate-reject"
-                             && g.negativeOrigin == Decision::NegativeOrigin::SpikeGate
-                             && g.negativeScope.size() == 1 && g.negativeScope[0] == "mm"
-                             && g.rows.empty();
-        // The entry must be WRITABLE and it must be the only thing the file says (ROWS 0 + the marker,
-        // never both for one kind -- the formatter throws on that, which is a different case's subject).
-        const bool writableOk0 = outcomeWritable(g) && cacheEntryWritable(g);
-        // 🔴 READ THE PRODUCT (section 8 trap 12): "the verdict is right" is not "the file is right".
-        // The formatter is the authority on what would reach the disk, so its OUTPUT is what is read.
-        string emitted0, emitErr;
-        try {
-          emitted0 = formatRowsFileImpl(g);
-        }
-        catch (const std::exception & e) {
-          emitErr = e.what();
-        }
-        const bool emitsOk = emitted0.find("\nROWS 0\n") != string::npos
-                          && emitted0.find("\nNEGATIVE gate-reject mm\n") != string::npos
-                          && emitted0.find("\nROW ") == string::npos;
-        // ... and the READ half of the pair, through the REAL parser: the file this process would write
-        // must be one this process can load.  The wave is synthesized (there is no device here), and it
-        // cannot matter: the fixture carries no ROW line.
-        RowsFile back;
-        string backErr;
-        const bool readOk = parseRowsFile(emitted0, vk_tile_wave_for(32), back, backErr)
-                         && back.negative && back.negativeReason == "gate-reject"
-                         && back.negativeScope.size() == 1 && back.negativeScope[0] == "mm"
-                         && back.rows.empty();
-        if (!verdictOk0 || !writableOk0 || !emitsOk || !readOk) {
+        // 🔴 RE-POINTED BY B3 (SCHEMA_VERSION 5 -> 6): the gate's decision no longer carries a durable
+        // entry, so what this case asserts is the NEGATIVE truth it exists for -- the gate refuses the
+        // measurement, installs nothing, and leaves NOTHING durable behind (the marker fields it used to
+        // assert here belong to the deleted family and go with it in B3.5).
+        const bool verdictOk0 = g.outcome == "gate-reject" && g.rows.empty();
+        // The entry must NOT be writable any more: that IS the ruling's consequence (a gate refusal is
+        // "re-tune next time", not a durable claim), and it is the direction this case has to pin -- a
+        // gate rejection that could still write would restore the backoff the batch removed.
+        const bool noEntryOk = !outcomeWritable(g) && !cacheEntryWritable(g);
+        // 🔴 READ THE PRODUCT (section 8 trap 12): "the verdict is right" is still not "the file is
+        // right", and the file-side truth is now that there is NO file.  The writer is the authority on
+        // what would reach the disk, so its REFUSAL is what is read here.  (This half used to format the
+        // decision and parse the marker back out of the emitted bytes; that subject died with the
+        // NEGATIVE wire segment -- the formatter cannot emit a marker and the parser refuses one.)
+        string gateErr;
+        const bool wroteGate = writeCacheIfAllowed(g, policy, gateErr);
+        const bool refusesOk = !wroteGate && gateErr.find("not in a writable state") != string::npos;
+        if (!verdictOk0 || !noEntryOk || !refusesOk) {
           ok = false;
           if (firstBad.empty()) {
-            firstBad = string("(k) the gate's durable entry is not the one the format carries: "
+            firstBad = string("(k) the gate's refusal is not the one the ruling describes: "
                               "verdict=") + (verdictOk0 ? "ok" : "BAD")
-                     + " writable=" + (writableOk0 ? "ok" : "BAD")
-                     + " emitted=" + (emitsOk ? "ok" : ("BAD (" + emitted0.substr(0, 120) + ")"))
-                     + " read-back=" + (readOk ? "ok" : ("BAD (" + backErr + ")"))
-                     + (emitErr.empty() ? "" : (" formatter refused: " + emitErr));
+                     + " no-durable-entry=" + (noEntryOk ? "ok" : "BAD")
+                     + " write-refused=" + (refusesOk ? "ok" : ("BAD (wrote=" + string(wroteGate ? "YES" : "no")
+                                                               + ", err='" + gateErr + "')"));
           }
         }
         // 🔴 THE EMPTY-INSTALL HALF OF THE ORDERING QUESTION, now EXECUTED instead of registered
@@ -4000,13 +3865,15 @@ namespace VulkanTuner {
         // The OTHER half (a row installing AFTER a gate rejection) still has no carrier and stays
         // registered for ⑤.
         const Decision::FinalizeVerdict vGate = finalizeOutcome(g);
-        if (vGate != Decision::FinalizeVerdict::Nothing || g.outcome != "gate-reject" || !g.negative
-            || g.negativeOrigin != Decision::NegativeOrigin::SpikeGate) {
+        // B3 re-point: the marker clauses that used to sit in this condition belonged to the deleted
+        // family (B3.5 removes the fields themselves); what this half must still hold is that the
+        // finalizer leaves a gate-rejected, empty-install decision ALONE.
+        if (vGate != Decision::FinalizeVerdict::Nothing || g.outcome != "gate-reject" || !g.rows.empty()) {
           ok = false;
           if (firstBad.empty()) {
             firstBad = string("(k) the finalizer did not leave the gate's verdict alone on an "
                               "empty-install decision: verdict ") + verdictName(vGate) + ", outcome '"
-                     + g.outcome + "', marker " + (g.negative ? "set" : "GONE (BUG)");
+                     + g.outcome + "'";
           }
         }
       }
@@ -4283,8 +4150,9 @@ namespace VulkanTuner {
     // constants, in order" -- must keep a carrier: it is the mechanical witness that a gate parameter
     // cannot leave policyFingerprint unnoticed.  The carrier is the SAME function the cache write path
     // calls (formatRowsFileImpl), driven with the REAL policy string and one LEGAL row.  The row is not
-    // decoration: the formatter refuses a decision carrying neither rows nor a marker, which is the rule
-    // A8c/A10 assert, so a row-less probe would throw instead of proving anything.
+    // decoration: the formatter refuses a decision carrying neither rows nor a marker.  ⚠️ After
+    // SCHEMA_VERSION 5 -> 6 there is only ONE form to carry those rows (`ROWS n` plus ROW lines), so the
+    // probe also holds the post-deletion truth: the LEGAL row is what makes the emit happen.
     // The emitted `POLICY` row is reported VERBATIM so the smoke can hold the declared constants as an
     // INDEPENDENT spelling -- a check that compares the product with itself cannot fail (R47's comment
     // names that disease), and the second spelling is the same discipline rowsethash.py follows for
@@ -4304,14 +4172,13 @@ namespace VulkanTuner {
       pr.geom.TM = 4;    pr.geom.TN = 4;       pr.geom.BS = 128;
       pr.geom.pad = -1;  pr.geom.reshape = -1; pr.geom.smaller = -1;
       pd.rows.push_back(pr);
-      // The marker is not a shortcut, it is the shape this file can WRITE: the formatter emits the
-      // durable per-row set (rowsForWrite), and a synthetic decision installs no row anywhere, so a
-      // row-only probe would come out EMPTY and the formatter refuses "neither rows nor a marker".
-      // The (k) case above uses exactly this marker shape and its output is already read back -- but the
-      // probe takes the MARKER only: it is not a gate event (it measured nothing), and calling the
-      // logging wrapper here emitted a third spike-rate NOTICE into the line whose count the smoke pins
-      // at two, with an empty device name, because the synthetic decision has none (measured).
-      setGateRejectMarker(pd);
+      // (deleted) the probe used to install the spike gate's marker here, because the formatter was the
+      // thing that refused a decision with neither rows nor a marker and the synthetic decision installs
+      // no row anywhere.  With the NEGATIVE segment deleted (SCHEMA_VERSION 5 -> 6) that marker is not a
+      // form the formatter can write any more -- `setGateRejectMarker` is called by `rejectBySpikeGate`
+      // ONLY, and it stays the ONE production site the census counts -- while the LEGAL row above is what
+      // gives this probe something to emit.  Calling it here would now be the one place that could make a
+      // self-test report a gate event it never measured.
       string emittedPolicy;
       try {
         emittedPolicy = formatRowsFileImpl(pd);
@@ -4344,16 +4211,29 @@ namespace VulkanTuner {
       if (firstBad.empty()) { firstBad = string("(m) the POLICY row the formatter emits: ") + policyRowText; }
     }
 
+    // 🔴 B3 (SCHEMA_VERSION 5 -> 6): THE CASE LETTERS IN THIS LINE ARE NON-CONTIGUOUS ON PURPOSE.
+    // The marker-shaped cases -- `(a)(b) no marker`, `(d) measured control`, `(e) our-gap`,
+    // `(f) all-reject->measured retracts`, `(i) unmeasured marker refused by name` -- were deleted
+    // together with the NEGATIVE wire segment (their subject was "what the file says about a marker",
+    // and the file can no longer say anything about one).  The surviving letters (c)(g)(h)(j)(k)(l)(m)(n)
+    // are NOT renumbered: a renumbering would silently invalidate every cross-reference in the batch
+    // records, the smoke's own comments and the plan.  The description below therefore spells out the
+    // cases that REALLY run -- which is also why it must not list the deleted ones: a self-test line
+    // that claims a case it no longer executes is the "declared but never run" defect this project
+    // refuses to ship.
     const bool absent = !FileUtils::exists(probePath);    logLine("cache write self-test: " + to_string(declared) + " outcome(s) declared, "
             + to_string(refused) + " refused by the state gate, " + to_string(allowed)
             + " state-writable; probe file " + (absent ? "absent" : "PRESENT")
             + "; encoding probe (non-ASCII name) written+read-back+removed ["
             + ((encWrote && encReadBack && encRemoved) ? "ok" : "FAIL") + "]"
-            + "; (a)(b) no marker / (c) from-file retirement / (d) measured control / (e) our-gap / (f) all-reject->measured retracts / (g)(h) fold AND+mismatch / (i) unmeasured marker refused by name / (j) the formatter's throw is contained / (k) spike gate: both directions + no-row-set + the durable entry's write/read pair / (l) third branch: drop accounting + the three directions + the finalizer leaves it alone ["
+            + "; (c) from-file retirement (on a HAND-SET state: a file can no longer carry a marker)"
+              " / (g)(h) fold AND+mismatch / (j) the formatter's throw is contained"
+              " / (k) spike gate: both directions + no-row-set + the refusal that leaves NO durable entry"
+              " / (l) third branch: drop accounting + the three directions + the finalizer leaves it alone ["
             + (verdictOk ? "ok" : "FAIL: " + verdictBad) + "]"
             + "; (n) the positive write-path leg (the real writer lands the row set it was allowed to write, the real reader reads it back, and the probe is removed) ["
             + (caseNOk ? "ok" : ("FAIL: " + caseNDetail)) + "]"
-            + "; POLICY row [" + policyRowText + "]"
+            + "; (m) POLICY row [" + policyRowText + "]"
             + " [" + ((ok && caseNOk && absent && encWrote && encReadBack && encRemoved && verdictOk && policyRowOk) ? "ok" : "FAIL") + "]"
             + (ok ? "" : " first problem: " + firstBad));
   }
@@ -5265,10 +5145,11 @@ namespace VulkanTuner {
   //     read-side legs assert "nothing to do means nothing written"), so all this
   //     function may do to it is RETIRE it on the one transition that makes it false by our own account
   //     -- a durable row was installed for this key -- and say so as StaleFromFileNegativeRetired.
-  // Together those two rules make `formatRowsFileImpl`'s "both ROW and NEGATIVE" throw (:1078)
-  // UNREACHABLE from the write path instead of merely caught: rows are emitted only when a row is
-  // durable in EVERY context (`rowsForWrite` is the AND mask), which implies install.installed > 0,
-  // which is exactly the branch that retires a from-file marker before the write.
+  // ⚠️ UPDATED BY B3 (SCHEMA_VERSION 5 -> 6): the "both ROW and NEGATIVE" throw that this sentence
+  // used to call UNREACHABLE from the write path NO LONGER EXISTS -- it went away with the NEGATIVE
+  // wire segment, and the unreachability argument went with it.  What survives in this function is the
+  // RETIREMENT rule itself (the one transition the finalizer still owns); the formatter's surviving
+  // refusal is the row-count cap, and the self-test drives it through the write path (case (j)).
   Decision::FinalizeVerdict finalizeOutcome(Decision& d) {
     // Recompute OUR marker from scratch: the verdict below is a pure function of the accounting, so the
     // same call on the same accounting must produce the same fields (and no leftover marker).
