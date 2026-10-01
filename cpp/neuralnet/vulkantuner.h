@@ -334,9 +334,22 @@ namespace VulkanTuner {
     //    pairsComplete     -- did the MEASUREMENT conclude every legal pair?
     //                         (decides whether a "nothing was better" claim may be written)
     // None of the three may be derived from another: different components answer them, at different
-    // moments, about different sets.  A future caller that walks the WHOLE shape set states `true` in the
-    // enumerator -- that is a different batch, and it is a different question from `candidateCoverage`.
+    // moments, about different sets.
     // 🔴 DEFAULT FALSE is the fail-closed direction, for the same reason as the line above.
+    // 🔴 B4 (2026-10-01): THE DECLARED IMPLICATION HAS NO PRODUCTION PATH TODAY, AND THIS PARAGRAPH IS
+    // THE REGISTRATION OF THAT FACT -- measured, not assumed.  The enumerator is this flag's ONLY
+    // production setter and it writes `false` EXPLICITLY, with its reason (vulkantuner.cpp, at the
+    // catalogue: the walk covers the declared STOCK VECTOR SURFACE, a proper subset of the slot's shape
+    // set, so `false` is a measurement of that fact rather than an unfilled default).  The only writer
+    // that ever states `true` is the SELF-TEST's fixture.  So the implication stated above -- "complete
+    // shape set => a whole-slot row is admissible" -- describes a form NOTHING MINTS YET: `key_m == 0`
+    // (the backend's "applies to every shape of this (family, acc)" form) reaches the install path only
+    // through a FILE, whose parser accepts it, or through that fixture.  The batch that makes the
+    // enumerator walk the WHOLE shape set is the batch that gives this implication its carrier, and it is
+    // a BEHAVIOUR + COST change (the enumeration domain widens), which is why it is not this batch.
+    // ⚠️ Do not read this as "the flag is unused": it is an INPUT the primitive ECHOES (the measurement
+    // line carries `coverage=`), and it is the field a whole-slot row's admissibility is DEFINED by --
+    // there is simply no production producer of `true` today.
     bool coverageComplete = false;
     // The DECLARED drop accounting (R-28 step (3)): the reason a candidate LEFT the judgeable set.
     // `CANDIDATE_DROPS[]` in vulkantuner.cpp is the ONE place the name and this field are paired, and it

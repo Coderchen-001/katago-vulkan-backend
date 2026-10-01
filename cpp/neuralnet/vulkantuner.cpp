@@ -2082,6 +2082,17 @@ namespace VulkanTuner {
       // the two values (36 vs 1) never collide as strings, so no grep or criterion would report it.
       // It is the same class as `coverage=` (a string here, a 0/1 echo on the measurement line).
       os << " candidates=" << cands.size() << " legal=" << legal;
+      // 🔴 B4 (2026-10-01): `graph_nodes=` MOVED HERE FROM THE DECISION LINE (it used to be printed by
+      // `formatDecisionLine`).  Why this line and not a new one: the coverage set's WEIGHT is a reading
+      // about the shape set, and this is the line that already reports what the graph and the search
+      // handed over (`declared=`/`postRule=`/`candidates=`/`legal=`/`coverage=`) -- and the value is
+      // ALREADY FINAL here, because `d->graphNodes` is summed from `d->graphShapeCounts` further up the
+      // decision (one producer, see the comment at that sum), ~115 lines before this line is printed and
+      // ~300 before the decision line.  The alternative (a new `dev:` line) is forbidden by the batch's
+      // own rule: a NEW counted line needs a writer, a SHELL_INVENTORY row and a section 9.4 row in the
+      // same batch, and this number needs none of that.  Readers that grepped the decision line's stderr
+      // still match, because both lines land in the same capture.
+      os << " graph_nodes=" << d.graphNodes;
       os << " coverage=" << d.candidateCoverage
          << " remaining=unknown (the format carries no coverage field; coverage IS remembered now that"
             " the search enumerates the declared domain, and the file's own conditions decide whether a"
@@ -2827,13 +2838,14 @@ namespace VulkanTuner {
          // accounted for", never "a complete measurement of nothing".
          << " cands=" << d.candidatesMeasured << "/" << d.candidatesEnumerated
          << " pairs=" << d.pairsLegal << "/" << d.shapesCount
-         // (7b) step 4: the two readings that consume the shape-set interface's two outputs (R-12: a
+         // (7b) step 4: the reading that consumes the shape-set interface's SECOND output (R-12: a
          // field only its producer reads must land with its consumer).  `graph_shapes` is the coverage
-         // set's size AFTER R-21's filter and `graph_nodes` is the row-table-side MUL_MAT dispatch count
-         // those shapes account for; the smoke pins both on a probe leg, so a walk that found nothing
-         // reads as 0 rather than as a smaller set.
+         // set's size AFTER R-21's filter; the smoke pins it on a probe leg, so a walk that found
+         // nothing reads as 0 rather than as a smaller set.  🔴 B4 (2026-10-01): its companion
+         // `graph_nodes=` (the same set's WEIGHT, the coverage rule's denominator) LEFT this line and is
+         // printed by `formatCandidateCatalog` now -- the decision line keeps the SIZE, which is what
+         // this class of leg reads, and the weight lives with the other search/domain readings.
          << " graph_shapes=" << d.graphShapes.size()
-         << " graph_nodes=" << d.graphNodes
          << " tuneMode=" << d.tuneModeText
          << " cache_state=" << d.cacheState
          << " tune_ms=" << d.tuneMs
@@ -4606,8 +4618,9 @@ namespace VulkanTuner {
     // statement about THIS set.
     d->graphShapes = graphShapes;
     d->graphShapeCounts = graphShapeCounts;
-    // ONE producer for the sum: the decision line's `graph_nodes=` and the coverage rule's denominator
-    // are then the same arithmetic over the same vector, instead of two numbers that could disagree.
+    // ONE producer for the sum: the CATALOG line's `graph_nodes=` (it moved there in B4) and the
+    // coverage rule's denominator are then the same arithmetic over the same vector, instead of two
+    // numbers that could disagree.
     d->graphNodes = 0;
     for (size_t i = 0; i < graphShapeCounts.size(); i++) {
       d->graphNodes += graphShapeCounts[i];
