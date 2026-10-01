@@ -420,6 +420,14 @@ namespace VulkanTuner {
     uint32_t precheckShots = 0;     // the inverted time constraint: ceil(min_block_time / per_dispatch)
     uint32_t precheckReps = 0;      // `allocateReps`'s answer for this machine's block-relative scale
     double precheckSigmaRel = 0.0;  // the A/A sentinel's own block-relative paired scale
+    // 🔴 (P0, 2026-09-30) THE BUDGET'S TWO OTHER READINGS, so "who decided `reps`" is a printed
+    // fact instead of an inference.  `allocateReps` returns three numbers and this struct carried only
+    // one of them: the Gaussian formula's own answer (`repsFormula`) and whether that answer was
+    // CLAMPED at `REPS_MAX` were written and read by NOTHING (the self-test prints the formula on its own
+    // budget line; the clamp flag was printed by no one).  The clamp is not a refusal anywhere in this
+    // build -- it is a PRICE, and a dead flag is how a 20x price stayed invisible.
+    uint32_t precheckRepsFormula = 0;   // the Gaussian vote (reported, and obeyed whenever > the floor)
+    bool precheckClampedAtMax = false;  // true = the vote was cut at REPS_MAX rather than answered
     // (7b) step 5: THE MEASUREMENT (tune-measurement.md section 2.6's main step): one call over the
     // COVERAGE SET, every covered shape against the catalogue's candidates plus the stock anchor and
     // the A/A sentinel.  It lives on the decision for the same reason the pre-check does -- the call

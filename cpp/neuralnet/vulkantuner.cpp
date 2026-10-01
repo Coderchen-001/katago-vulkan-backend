@@ -5629,6 +5629,14 @@ namespace VulkanTuner {
                                       TuneStats::ALPHA, TuneStats::PAIRS_FLOOR, TuneStats::REPS_MAX);
             if (!preBudget.repsRequired.empty()) {
               decision->precheckReps = (uint32_t) preBudget.repsRequired[0];
+              // (P0, 2026-09-30) the same budget's other two readings, carried to the printed line.  See
+              // the field comments in vulkantuner.h: the clamp is a price, not a refusal, and a formula
+              // whose own comment calls it "systematically optimistic" must not out-vote the declared floor
+              // silently (that is the 512-vs-25 question P0 exists to make readable).
+              if (!preBudget.repsFormula.empty()) {
+                decision->precheckRepsFormula = (uint32_t) preBudget.repsFormula[0];
+              }
+              decision->precheckClampedAtMax = preBudget.anyClampedAtMax;
             }
           }
         }
@@ -5647,6 +5655,8 @@ namespace VulkanTuner {
             << " marginal_us=" << decision->precheckMarginalUs
               << " shots=" << decision->precheckShots
               << " reps=" << decision->precheckReps
+              << " reps_formula=" << decision->precheckRepsFormula
+              << " clamped=" << (decision->precheckClampedAtMax ? 1 : 0)
               << " sigma=" << decision->precheckSigmaRel
               << " (K=" << TuneStats::HOT_BLOCKS_K << " warmup=" << TuneStats::WARMUP_BLOCKS << ")";
         logLine(preOs.str());
