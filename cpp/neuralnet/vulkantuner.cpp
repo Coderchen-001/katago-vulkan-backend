@@ -111,7 +111,12 @@ namespace VulkanTuner {
     //   5. the geometry rule table                         (vulkan-tile-validity.h)
     // Committed changes are ALSO covered by b<rev16>; this counter is the belt for the braces,
     // so it must not be the only thing anyone relies on.
-    const int TUNER_POLICY_VERSION = 1;
+    // 🔴 1 -> 2 (2026-10-01): a PROTOCOL change, not a knob change.  `allocateReps` used to let the
+    // Gaussian formula decide `reps`; it no longer does -- the budget IS the declared `PAIRS_FLOOR`.  That
+    // rule is not a `POLICY_CONSTANTS` row, so the fingerprint does not move by itself, and a row set
+    // measured under "the formula may vote" is not the same article as one measured under "the floor is
+    // the budget" -- which is exactly what this counter exists to say.
+    const int TUNER_POLICY_VERSION = 2;
 
     // Which header keys are required depends on the CHANNEL, and the split follows what each
     // key GUARANTEES.  These two arrays are the single source of truth: the parser builds its

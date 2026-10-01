@@ -311,23 +311,30 @@ namespace TuneStats {
     b.floorReps = floorReps;
     b.totalReps = 0;
     b.anyClampedAtMax = false;
-    // The FORMULA is the Gaussian face of the same problem (z, not t) and it is REPORTED, not obeyed:
-    // under our measured spikes it is systematically optimistic (the scale the formula assumes is the
-    // one the spikes inflate), which is exactly why the REQUIRED count is the max with the MEASURED
-    // floor.  Printing both is what keeps "the floor is doing the work here" visible instead of
-    // implied by a single number that looks like a formula's output.
+    // 🔴 THE FORMULA REPORTS, IT DOES NOT VOTE (ruling 2026-10-01).  This function used to return
+    // `max(formula, floor)`, so the formula DECIDED `reps` whenever its answer exceeded the declared floor
+    // -- and its own comment called it "systematically optimistic", i.e. wrong in the one direction that
+    // matters here.  Its input is a THREE-point MAD (`vulkantuner.cpp`'s pre-check) and `reps ∝ sigma²`,
+    // so one outlier in that estimate multiplied the work: measured 512/753 reps, `m_blocks = 116736`
+    // against 5700 for the ordinary draw, i.e. 320-375 s legs instead of ~20 s -- and WHICH leg got hit
+    // moved between runs.  The project's own measurement (tune-measurement.md section 2.5) puts the
+    // block-relative scale at ~0.057-0.092% at n = 50: R is about 1 at the 1% tolerance, and that
+    // section's own conclusion is "the noise is not the constraint at all, the constraint is the test's
+    // own sample floor".  So the ANSWER is the declared floor, and the formula is kept as a REPORTED
+    // number plus one alarm: `anyClampedAtMax` now means "the formula ASKED for more than REPS_MAX",
+    // which is a statement about the ESTIMATE, not a budget anybody pays.
     const double z = normInv(1.0 - alpha / 2.0);
     for (size_t s = 0; s < sigmaRel.size(); s++) {
-      long reps;
-      if (tolerance <= 0.0 || sigmaRel[s] <= 0.0) { reps = floorReps; }
+      long formula;
+      if (tolerance <= 0.0 || sigmaRel[s] <= 0.0) { formula = floorReps; }
       else {
         const double need = (z * sigmaRel[s] / tolerance);
-        reps = (long)ceil(need * need);
+        formula = (long)ceil(need * need);
       }
-      if (reps < 1) reps = 1;
-      b.repsFormula.push_back(reps);
-      long req = reps < floorReps ? floorReps : reps;
-      if (req > maxReps) { req = maxReps; b.anyClampedAtMax = true; }
+      if (formula < 1) formula = 1;
+      b.repsFormula.push_back(formula);
+      const long req = floorReps;
+      if (formula > maxReps) { b.anyClampedAtMax = true; }
       b.repsRequired.push_back(req);
       b.totalReps += req;
     }

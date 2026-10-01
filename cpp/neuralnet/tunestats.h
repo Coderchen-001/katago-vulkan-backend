@@ -224,13 +224,19 @@ namespace TuneStats {
 
   // ---- the budget: solved ONCE, up front (no optional stopping) ----
   struct Budget {
-    std::vector<long> repsFormula;   // the Gaussian formula's answer: REPORTED, and systematically low under spikes
-    std::vector<long> repsRequired;  // max(floorReps, formula) -- what is actually run
+    std::vector<long> repsFormula;   // the Gaussian formula's answer: REPORTED ONLY (ruling 2026-10-01)
+    std::vector<long> repsRequired;  // == floorReps, ALWAYS: the DECLARED floor is the budget
     long totalReps;
     long floorReps;
     bool anyClampedAtMax;
   };
-  // reps_s = ceil( (z_{1-alpha/2} * sigmaRel_s / tolerance)^2 ), clamped to [floorReps, maxReps].
+  // 🔴 THE RULE (ruling 2026-10-01): reps_s = floorReps, ALWAYS.  The Gaussian answer
+  // `ceil((z_{1-alpha/2}*sigmaRel_s/tolerance)^2)` is REPORTED in `repsFormula` and never obeyed: its input
+  // is a three-point MAD, `reps ∝ sigma^2` turns one outlier in that estimate into ~20x the work, and this
+  // project's own measurement (tune-measurement.md section 2.5) puts the true block-relative scale at
+  // 0.057-0.092% at n = 50 -- R about 1 at the 1% tolerance, so the noise is not the constraint and the
+  // test's own sample floor is.  `anyClampedAtMax` is therefore an ALARM ABOUT THE ESTIMATE ("the formula
+  // asked for more than maxReps"), not a budget anyone pays.
   // sigmaRel_s is the BLOCK-relative paired scale: see tune-measurement.md section 2.5 -- the
   // per-dispatch-relative figure benchgemm prints is NOT the right normalisation.
   Budget allocateReps(const std::vector<double>& sigmaRel, double tolerance, double alpha,
