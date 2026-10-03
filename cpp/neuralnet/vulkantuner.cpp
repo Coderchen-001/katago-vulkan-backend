@@ -2543,13 +2543,28 @@ namespace VulkanTuner {
           return false;
         }
       }
-      // The path token is the vk_tile_path enum; accepting the spelling as well keeps a
-      // hand-written fixture readable and costs three comparisons.
-      if (pathToken == "scalar") path = VK_TILE_PATH_SCALAR;
-      else if (pathToken == "cm1") path = VK_TILE_PATH_CM1;
-      else if (pathToken == "cm2") path = VK_TILE_PATH_CM2;
-      else path = atoi(pathToken.c_str());
-      if (path != VK_TILE_PATH_SCALAR && path != VK_TILE_PATH_CM1 && path != VK_TILE_PATH_CM2) {
+      // 🔴 B4d (2026-10-03): THE ACCEPT SET IS EXACTLY SIX SPELLINGS -- the three names and the three
+      // DIGITS.  The digits are not a convenience: our own WRITER emits the enum as a number
+      // (the formatter's row-emission statement writes the enum field, not a path NAME), so the numeric
+      // cache file carries; the names are what a hand-written fixture may use.  Anything else is refused
+      // with the token quoted back.
+      // ⚠️ Do NOT quote that emission statement in THIS comment: R21 finds the ONE row-emission
+      // statement by looking for the `"ROW "` literal next to the stream operator on the RAW line
+      // (comments included), so quoting it here makes R21 count two of them and report `ROW fields=0`.
+      // WHY THE OLD `atoi` FALLBACK HAD TO GO: its accept set is UNBOUNDED -- it also takes `+2`, `2.0`,
+      // `02` and trailing junk (`2junk`), and because `VK_TILE_PATH_SCALAR == 0` a token it could not
+      // parse became a SCALAR row SILENTLY.  Enumerating what `atoi` accepts would be patching an
+      // unbounded set; six exact strings are readable, enumerable and reverse-checkable.  They also
+      // match `_wssync/tools/rowsethash.py`'s accept set, so this format's two independent
+      // implementations now give the same answer -- MEASURED before the fix: the tool refused `2junk`
+      // (`a ROW line's path token '2junk' is neither scalar/cm1/cm2 nor an integer`) while this parser
+      // read it as cm2, and the file's own ROWSET_HASH AGREED with that lenient reading, so nothing else
+      // in the pipeline could catch it.  Smoke leg `A8d_cache_bad_path` is that file, and it is the
+      // reason the check below quotes the token back instead of just failing.
+      if (pathToken == "scalar" || pathToken == "0") path = VK_TILE_PATH_SCALAR;
+      else if (pathToken == "cm1" || pathToken == "1") path = VK_TILE_PATH_CM1;
+      else if (pathToken == "cm2" || pathToken == "2") path = VK_TILE_PATH_CM2;
+      else {
         err = "ROW line " + to_string(lineNo) + ": unknown path '" + pathToken + "'";
         return false;
       }
