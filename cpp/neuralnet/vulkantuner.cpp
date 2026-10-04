@@ -1004,16 +1004,52 @@ namespace VulkanTuner {
       };
       // (c) THE SENTINEL, one interval per covered shape, and EVERY one of them has to pass: "this
       //     comparison is comparable" is a statement about the whole run, not about its best shape.
+      // (2026-10-04) ONE nearest-rank definition for BOTH families below: the sentinel's widths are read
+      // BEFORE the candidate loop, so a lambda declared at the end of this body would be out of scope.  The
+      // smallest observation whose rank reaches `p` -- no interpolation, no distributional assumption, and
+      // the same family as the rank tests the verdicts already use.
+      const auto nearestRank = [](double p, const std::vector<double> & s) -> double {
+        const double k = p * (double) s.size();
+        size_t i = (size_t) k;
+        if ((double) i < k) {
+          i++;                                     // ceil, without <cmath>
+        }
+        if (i < 1) {
+          i = 1;
+        }
+        if (i > s.size()) {
+          i = s.size();
+        }
+        return s[i - 1];
+      };
       bool sentinelOk = true;
+      // (2026-10-04) the sentinel's own widths, kept while ITS intervals are walked: see the field comment
+      // for why this is a comparison and not symmetry.
+      std::vector<double> sentinelHalfWidths;
+      std::vector<double> sentinelByShape((size_t) nShapes, 0.0);
       for (uint32_t s = 0; s < nShapes; s++) {
         TuneStats::PairedResult r {};
         intervalFor(1u, s, r);
         j.sentinelPairs++;
+        if (r.ciOk) {
+          const double halfWidth = 0.5 * (r.ciHigh - r.ciLow);
+          sentinelHalfWidths.push_back(halfWidth);
+          sentinelByShape[s] = halfWidth;
+          if (halfWidth > j.ciHalfWidthSentinelMax) {
+            j.ciHalfWidthSentinelMax = halfWidth;
+          }
+        }
         if (!r.ciOk || !TuneStats::equivalentWithin(r, TuneStats::TOLERANCE)) {
           sentinelOk = false;
         }
       }
       j.sentinelEquivalent = sentinelOk;
+      if (!sentinelHalfWidths.empty()) {
+        std::sort(sentinelHalfWidths.begin(), sentinelHalfWidths.end());
+        j.ciHalfWidthSentinelP50 = nearestRank(0.50, sentinelHalfWidths);
+        j.ciHalfWidthSentinelP90 = nearestRank(0.90, sentinelHalfWidths);
+      }
+      j.ciHalfWidthSentinelByShape = sentinelByShape;
       // (d) THE CANDIDATES, shape by shape; the first candidate that passes on EVERY covered shape wins.
       bool winnerFound = false;
       // (A6b, 2026-10-04) THE DISTRIBUTION OF THE SAME QUANTITY, kept while the pairs are walked, so the
@@ -1089,20 +1125,6 @@ namespace VulkanTuner {
       // candidate interval formed) leaves both at 0 rather than inventing a value.
       if (!halfWidths.empty()) {
         std::sort(halfWidths.begin(), halfWidths.end());
-        const auto nearestRank = [](double p, const std::vector<double> & s) -> double {
-          const double k = p * (double) s.size();
-          size_t i = (size_t) k;
-          if ((double) i < k) {
-            i++;                                   // ceil, without <cmath>
-          }
-          if (i < 1) {
-            i = 1;
-          }
-          if (i > s.size()) {
-            i = s.size();
-          }
-          return s[i - 1];
-        };
         j.ciHalfWidthP50 = nearestRank(0.50, halfWidths);
         j.ciHalfWidthP90 = nearestRank(0.90, halfWidths);
       }
@@ -5925,6 +5947,15 @@ namespace VulkanTuner {
           ciHalfWidthByShape += to_string(decision->judgement.ciHalfWidthShapeMax[hw]);
         }
         ciHalfWidthByShape += "]";
+        // (2026-10-04) the sentinel's per-shape list, same idiom (bracketed, comma-separated, no spaces).
+        string ciHalfWidthSentinelByShape = "[";
+        for (size_t hw = 0; hw < decision->judgement.ciHalfWidthSentinelByShape.size(); hw++) {
+          if (hw != 0) {
+            ciHalfWidthSentinelByShape += ",";
+          }
+          ciHalfWidthSentinelByShape += to_string(decision->judgement.ciHalfWidthSentinelByShape[hw]);
+        }
+        ciHalfWidthSentinelByShape += "]";
         jOs << "judge: attempted=" << (decision->judgement.attempted ? 1 : 0)
             << " gate_reject=" << (decision->judgement.gateRejected ? 1 : 0)
             << " gate_high=" << decision->judgement.gateHigh
@@ -5959,6 +5990,15 @@ namespace VulkanTuner {
             << " ci_halfwidth_p50=" << decision->judgement.ciHalfWidthP50
             << " ci_halfwidth_p90=" << decision->judgement.ciHalfWidthP90
             << " ci_halfwidth_shape_max=" << ciHalfWidthByShape
+            // (2026-10-04) THE SENTINEL'S OWN QUARTET, i.e. the measurement's own non-common-mode term as a
+            // distribution: compare `ci_halfwidth_sentinel_p50` against `ci_halfwidth_p50` to see whether the
+            // resolution limit belongs to the MEASUREMENT (they are comparable) or to the candidates'
+            // differences (the sentinel is much narrower).  Still a reading: `sentinel_ok` is not a gate, and
+            // nothing here may become one (the ruling forbids `unreliable => no write`).
+            << " ci_halfwidth_sentinel_p50=" << decision->judgement.ciHalfWidthSentinelP50
+            << " ci_halfwidth_sentinel_p90=" << decision->judgement.ciHalfWidthSentinelP90
+            << " ci_halfwidth_sentinel_max=" << decision->judgement.ciHalfWidthSentinelMax
+            << " ci_halfwidth_sentinel_by_shape=" << ciHalfWidthSentinelByShape
             // P3 (2026-10-01): the two numbers the recovery reads and the one it writes.  `band_max` is
             // the WIDEST observed band among the wide pairs (0 = none), `remeasure` is the budget the
             // second pass was given (0 = the intervals all formed on the first pass).  Both are readings

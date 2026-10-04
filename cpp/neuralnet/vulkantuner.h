@@ -543,6 +543,20 @@ namespace VulkanTuner {
       // entry count is the covered shape count (`shapes=` on the measurement line) -- both are held by the
       // smoke.  Empty when no interval formed.
       std::vector<double> ciHalfWidthShapeMax;
+      // (2026-10-04) THE SAME QUARTET FOR THE A/A SENTINEL, and the reason is a COMPARISON rather than
+      // symmetry: the sentinel is a second object pointing at the anchor's OWN pipeline, measured inside
+      // the same pass structure, so its interval width is the measurement's own non-common-mode term --
+      // the drift between a pair's two blocks plus block noise, with NO real difference in it.  Comparing
+      // its typical width with the candidates' answers "is the resolution limit the measurement's own, or
+      // the candidates' differences?" -- which is the question the ordering work (both arms in one pass)
+      // depends on, and the one `sentinel_ok` cannot answer: that field is a single 0/1 that no consumer
+      // reads today (registered), while this is a distribution.
+      // Same nearest-rank definition, same unit, same "0 when no interval formed"; the per-shape list has
+      // ONE entry per covered shape, because the sentinel is one pair per shape.
+      double ciHalfWidthSentinelP50 = 0.0;
+      double ciHalfWidthSentinelP90 = 0.0;
+      double ciHalfWidthSentinelMax = 0.0;
+      std::vector<double> ciHalfWidthSentinelByShape;
       // The shapes whose own block is below `MIN_BLOCK_TIME_MS`, and the lightest ruler seen: the floor as
       // a reading rather than a silent gate.
       uint32_t shapesBelowFloor = 0;
