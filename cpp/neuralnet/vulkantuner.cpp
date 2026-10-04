@@ -1033,6 +1033,17 @@ namespace VulkanTuner {
           // ci_never=14 counted.  A bijection is not enough: the pairing is the measurement.
           intervalFor(2u + s * nCands + c, s, r);
           j.candidatePairs++;
+          // (A6, 2026-10-03) THE MDE, READ OFF THE INTERVALS THIS LAYER ALREADY FORMED.  The widest
+          // half-width among the CANDIDATE pairs is "the finest difference this run could resolve" -- the
+          // quantity the plan asked for under two names (MDE / SE).  It is accumulated HERE, in the
+          // candidate loop, and not inside `intervalFor`, so the sentinel's equivalence intervals can
+          // never enter it by accident.  No threshold, no branch: it is a reading.
+          if (r.ciOk) {
+            const double halfWidth = 0.5 * (r.ciHigh - r.ciLow);
+            if (halfWidth > j.ciHalfWidthMax) {
+              j.ciHalfWidthMax = halfWidth;
+            }
+          }
           if (!r.ciOk) {
             // NO INTERVAL IS NOT "UNSTABLE": it is missing data, and the branches answer for it.
             j.ciMissing++;
@@ -3070,6 +3081,32 @@ namespace VulkanTuner {
     return { std::vector<uint8_t>(ctx.size(), 0), true, acc.size() };
   }
 
+  // 🔴 (A6, 2026-10-03) THE REFUSAL SENTENCE, IN ONE PLACE, WITH THE ONE DISTINCTION THAT MATTERS.
+  // `writeCacheIfAllowed` refusing means THIS DECISION was not written down -- and that fact has two very
+  // different consequences for the reader, which the old single sentence left implicit (it said "not
+  // retried", true of this object, and easily misread as "the tuner will not try again"):
+  //   * `measurement.ok == false`: this run never completed a measurement (a refused probe, or a decision
+  //     that came from a file and stayed `running`), so there is nothing here to stop paying for.  The
+  //     MEASURED counterexample that fixes the predicate is
+  //     `A15b_scalar_foreign_policy_refused`: it reads `measure: attempted=1 ok=0` while printing this
+  //     very NOTICE -- an `attempted`-based test would have told its reader that the next launch pays
+  //     again, which is false.
+  //   * `measurement.ok == true`: a completed measurement's result could not be written down, so the NEXT
+  //     LAUNCH WILL MEASURE AGAIN.  That is the one case where the reader must be told the control that
+  //     stops it (`vulkanTune=off`).
+  // A pure text function (so the self-test can assert the sentence without capturing the log) plus a
+  // one-statement printer (the SHELL_INVENTORY writer): one literal site, one writer.
+  string writeRefusalText(const Decision & d, const string & err) {
+    const bool paid = d.measurement.ok;
+    return "NOTICE: the cache write was refused for " + d.deviceName + ": " + err
+           + (paid ? " (final for this decision: it is not retried, and because this RUN DID measure, the "
+                     "NEXT LAUNCH will measure again; to stop paying for that, set vulkanTune=off)"
+                   : " (final for this decision: it is not retried)");
+  }
+  void reportWriteRefusal(const Decision & d, const string & err) {
+    logLine(writeRefusalText(d, err));
+  }
+
   void cacheWriteSelfTest(const TunePolicy & policy, const string & cacheDir) {
     TunePolicy readOnly = policy;
     readOnly.off = true;
@@ -4043,6 +4080,78 @@ namespace VulkanTuner {
         }
       }
     }
+    // ── (A6, 2026-10-03) THE "MEASURED, BUT NOT WRITTEN DOWN" REFUSAL ─────────────────────────────
+    // WHY THIS NEEDS A FIXTURE: the production trigger is a COMPLETED measurement whose outcome the state
+    // gate refuses -- and this machine cannot reach it today, because since B1 an EMPTY row set is a
+    // durable artifact, so all three real measuring legs DO write (`A30_auto_creates_nothing`,
+    // `N2_abba_B_tuned`, `S2_baseline`).  Registering the branch while pretending a leg covered it is the
+    // "declared but never run" defect this project refuses to ship, so the honest executor is a synthetic
+    // decision driven through the REAL write gate -- the same device-free shape as (n), which is why it
+    // sits here.  The clause under test is the SENTENCE: when a run really paid for a measurement, the
+    // reader must be told that the next launch pays again AND the control that stops it (`vulkanTune=off`).
+    // The line this prints is what the smoke leg reads (one site, one writer).
+    bool caseOWasAbsent = false, caseORefused = false, caseOSentence = false;
+    string caseODetail;
+    {
+      Decision d;
+      d.deviceName = "self-test";
+      d.cachePath = caseNPath;          // the same device-free path: this case must write nothing
+      d.nnXLen = 19;
+      d.nnYLen = 19;
+      d.maxBatchSize = 8;
+      d.fingerprint = "self-test";
+      d.policyFingerprint = policyFingerprint();
+      d.baselineVersion = "1";
+      d.modelIdentity = "self-test";
+      d.modeString = modeString(enabled_t::True);
+      // The state gate's own refusal reason: a decision that is still `running` may not be remembered.
+      d.outcome = "running";
+      // 🔴 THE PREDICATE UNDER TEST: this run DID complete a measurement.  That is exactly what separates
+      // "the next launch pays again" from "nothing was paid here" -- see `writeRefusalText`.
+      d.measurement.attempted = true;
+      d.measurement.ok = true;
+      vk_tile_row_spec r {};
+      r.path = VK_TILE_PATH_SCALAR;
+      r.src0_type = 1;
+      r.src1_type = 0;
+      r.geom.BM = 64; r.geom.BN = 64; r.geom.BK = 0;
+      r.geom.WM = 32; r.geom.WN = 32; r.geom.WMITER = 1;
+      r.geom.TM = 4;  r.geom.TN = 4;  r.geom.BS = 128;
+      r.geom.pad = -1; r.geom.reshape = -1; r.geom.smaller = -1;
+      d.rows.push_back(r);
+      // ⚠️ The row's LEGALITY is (n)'s clause, not this one's: re-checking it here would add a second
+      // synthesized wave call site (R23 counts them) for a fact (n) already asserts.  The row is still
+      // BUILT, because it is what makes the decision's state the only reason left for the gate to refuse.
+      caseOWasAbsent = !FileUtils::exists(caseNPath);
+      string err;
+      // The REAL gate: the row is legal and the mode allows writing, so the ONLY reason left is the state.
+      caseORefused = !writeCacheIfAllowed(d, policy, err);
+      const string text = writeRefusalText(d, err);
+      caseOSentence = text.find("the NEXT LAUNCH will measure again") != string::npos
+                   && text.find("set vulkanTune=off") != string::npos;
+      if (!caseOWasAbsent) {
+        caseODetail = "the probe file already existed before this case (" + caseNPath + ")";
+      }
+      else if (!caseORefused) {
+        caseODetail = "a decision that is not in a writable state was written down";
+      }
+      else if (!caseOSentence) {
+        caseODetail = "a run that DID measure did not tell the reader that the next launch measures again "
+                      "/ how to stop it: " + text;
+      }
+      // And the line itself: the smoke reads it, so the sentence is exercised where it is printed.
+      reportWriteRefusal(d, err);
+    }
+    const bool caseOOk = caseOWasAbsent && caseORefused && caseOSentence;
+    if (!caseOOk) {
+      if (caseODetail.empty()) {
+        caseODetail = "a clause failed without naming itself (the refusal-sentence verdict is incomplete)";
+      }
+      ok = false;
+      if (firstBad.empty()) {
+        firstBad = string("(o) the measured-but-not-written refusal is not actionable: ") + caseODetail;
+      }
+    }
     const bool caseNOk = caseNRowLegal && caseNWasAbsent && caseNWrote && caseNRead
                       && caseNKey && caseNRows && caseNRemoved;
     if (!caseNOk) {
@@ -4143,7 +4252,7 @@ namespace VulkanTuner {
     // that does not declare a case it really executes is the same defect as one that declares a case it
     // does not.  That is why the list below is spelled out and why `verdictOk` reports BOTH surviving
     // finalizer cases: (e) and the (k) half.
-    // The surviving letters (e)(g)(h)(j)(k)(l)(m)(n) are NOT renumbered: a renumbering would silently
+    // The surviving letters (e)(g)(h)(j)(k)(l)(m)(n)(o) are NOT renumbered: a renumbering would silently
     // invalidate every cross-reference in the batch records, the smoke's own comments and the plan.  The
     // description below therefore spells out the cases that REALLY run -- which is also why it must not
     // list the deleted ones: a self-test line that claims a case it no longer executes is the "declared
@@ -4160,8 +4269,10 @@ namespace VulkanTuner {
             + (verdictOk ? "ok" : "FAIL: " + verdictBad) + "]"
             + "; (n) the positive write-path leg (the real writer lands the row set it was allowed to write, the real reader reads it back, and the probe is removed) ["
             + (caseNOk ? "ok" : ("FAIL: " + caseNDetail)) + "]"
+            + "; (o) the measured-but-not-written refusal names the next launch and the control that stops it ["
+            + (caseOOk ? "ok" : ("FAIL: " + caseODetail)) + "]"
             + "; (m) POLICY row [" + policyRowText + "]"
-            + " [" + ((ok && caseNOk && absent && encWrote && encReadBack && encRemoved && verdictOk && policyRowOk) ? "ok" : "FAIL") + "]"
+            + " [" + ((ok && caseNOk && caseOOk && absent && encWrote && encReadBack && encRemoved && verdictOk && policyRowOk) ? "ok" : "FAIL") + "]"
             + (ok ? "" : " first problem: " + firstBad));
   }
 
@@ -5200,8 +5311,11 @@ namespace VulkanTuner {
         else {
           d.writeState = Decision::WriteState::RefusedByGate;
           d.writeRefusal = err;
-          logLine("NOTICE: the cache write was refused for " + d.deviceName + ": " + err
-                  + " (final: this decision is consumed and is NOT retried)");
+          // (A6, 2026-10-03) ONE sentence, built where the two cases can be told apart (a run that paid
+          // for a measurement must say that the next launch pays again, and name the control that stops
+          // it): see `writeRefusalText`, whose predicate is `measurement.ok` for the measured reason
+          // recorded there.
+          reportWriteRefusal(d, err);
         }
       };
     }
@@ -5786,6 +5900,9 @@ namespace VulkanTuner {
             << ":" << decision->judgement.firstMissingObject
             << " ci_coarse=" << decision->judgement.ciMissingCoarse
             << " ci_wide=" << decision->judgement.ciMissingWide
+            // (A6, 2026-10-03) the MDE as ONE reading: the widest candidate interval's half-width, in the
+            // tolerance's unit, with no threshold attached (see `Judgement::ciHalfWidthMax`).
+            << " ci_halfwidth_max=" << decision->judgement.ciHalfWidthMax
             // P3 (2026-10-01): the two numbers the recovery reads and the one it writes.  `band_max` is
             // the WIDEST observed band among the wide pairs (0 = none), `remeasure` is the budget the
             // second pass was given (0 = the intervals all formed on the first pass).  Both are readings

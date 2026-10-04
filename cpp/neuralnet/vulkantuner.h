@@ -522,6 +522,15 @@ namespace VulkanTuner {
       // does not come from the pre-check's sample-count-limited sigma.  It stays 0 whenever no pair is
       // wide, which is what this machine has measured so far (`ci_wide=0` on every leg, 2026-10-01).
       double wideBandMax = 0.0;
+      // (A6, 2026-10-03) THE MDE, AS ONE QUANTITY RATHER THAN TWO: the WIDEST interval half-width among the
+      // CANDIDATE pairs whose interval formed, in the same block-relative unit as the tolerance.  "MDE" and
+      // "the half-width of the interval" are two names for one fact, so printing both would read as two
+      // different measurements.  The A/A sentinel is deliberately EXCLUDED: it answers "was this comparison
+      // comparable" (an equivalence test), while this answers "how fine a difference could this run
+      // resolve" -- one number must not answer two questions.  It is a READING with NO threshold:
+      // "half-width > tolerance" must never become a write gate (the ruling forbids `unstable => no
+      // write`).  0 means no candidate interval formed.
+      double ciHalfWidthMax = 0.0;
       // The shapes whose own block is below `MIN_BLOCK_TIME_MS`, and the lightest ruler seen: the floor as
       // a reading rather than a silent gate.
       uint32_t shapesBelowFloor = 0;
