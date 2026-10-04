@@ -531,6 +531,18 @@ namespace VulkanTuner {
       // "half-width > tolerance" must never become a write gate (the ruling forbids `unstable => no
       // write`).  0 means no candidate interval formed.
       double ciHalfWidthMax = 0.0;
+      // (A6b, 2026-10-04) THE SAME READING AS A DISTRIBUTION, because the maximum is the fragile end of it:
+      // 215 good pairs and one bad one report the bad one (measured on the production leg: `cand_pairs=216`,
+      // of which `not_worse=28` are the pairs a verdict actually rests on).  The two order statistics are by
+      // NEAREST RANK (no interpolation) -- the same family as the rank tests the verdicts already use, and
+      // no distributional assumption.  Both stay 0 when no candidate interval formed, like `ciHalfWidthMax`.
+      double ciHalfWidthP50 = 0.0;
+      double ciHalfWidthP90 = 0.0;
+      // ...and the same quantity PER COVERED SHAPE, so "one shape's blocks are the jittery ones" is a
+      // readable fact rather than an inference.  By construction `max(entry) == ciHalfWidthMax`, and the
+      // entry count is the covered shape count (`shapes=` on the measurement line) -- both are held by the
+      // smoke.  Empty when no interval formed.
+      std::vector<double> ciHalfWidthShapeMax;
       // The shapes whose own block is below `MIN_BLOCK_TIME_MS`, and the lightest ruler seen: the floor as
       // a reading rather than a silent gate.
       uint32_t shapesBelowFloor = 0;

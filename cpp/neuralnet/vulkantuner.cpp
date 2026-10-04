@@ -1016,6 +1016,12 @@ namespace VulkanTuner {
       j.sentinelEquivalent = sentinelOk;
       // (d) THE CANDIDATES, shape by shape; the first candidate that passes on EVERY covered shape wins.
       bool winnerFound = false;
+      // (A6b, 2026-10-04) THE DISTRIBUTION OF THE SAME QUANTITY, kept while the pairs are walked, so the
+      // line can report order statistics instead of only the worst pair (see the field's comment for the
+      // measured reason: 216 candidate pairs, 28 of which a verdict rests on).
+      std::vector<double> halfWidths;
+      halfWidths.reserve((size_t) nCands * (size_t) nShapes);
+      std::vector<double> shapeHalfWidthMax((size_t) nShapes, 0.0);
       for (uint32_t c = 0; c < nCands; c++) {
         bool allShapes = true;
         bool anyUnstable = false;
@@ -1042,6 +1048,11 @@ namespace VulkanTuner {
             const double halfWidth = 0.5 * (r.ciHigh - r.ciLow);
             if (halfWidth > j.ciHalfWidthMax) {
               j.ciHalfWidthMax = halfWidth;
+            }
+            // (A6b) the same value, kept for the distribution and for its shape's own maximum.
+            halfWidths.push_back(halfWidth);
+            if (halfWidth > shapeHalfWidthMax[s]) {
+              shapeHalfWidthMax[s] = halfWidth;
             }
           }
           if (!r.ciOk) {
@@ -1072,6 +1083,30 @@ namespace VulkanTuner {
           j.winnerMargin = worstMargin;
         }
       }
+      // (A6b, 2026-10-04) THE TWO ORDER STATISTICS, by NEAREST RANK: the smallest observation whose rank
+      // reaches `p` -- no interpolation, no distributional assumption, and the same family as the rank tests
+      // the verdicts already use.  Sorting a few hundred doubles is deterministic; an empty set (no
+      // candidate interval formed) leaves both at 0 rather than inventing a value.
+      if (!halfWidths.empty()) {
+        std::sort(halfWidths.begin(), halfWidths.end());
+        const auto nearestRank = [](double p, const std::vector<double> & s) -> double {
+          const double k = p * (double) s.size();
+          size_t i = (size_t) k;
+          if ((double) i < k) {
+            i++;                                   // ceil, without <cmath>
+          }
+          if (i < 1) {
+            i = 1;
+          }
+          if (i > s.size()) {
+            i = s.size();
+          }
+          return s[i - 1];
+        };
+        j.ciHalfWidthP50 = nearestRank(0.50, halfWidths);
+        j.ciHalfWidthP90 = nearestRank(0.90, halfWidths);
+      }
+      j.ciHalfWidthShapeMax = shapeHalfWidthMax;
     }
 
     // ── R-28 step (3): THE CANDIDATE-DROP ACCOUNTING AND THE THIRD BRANCH ─────────────────────────
@@ -5879,6 +5914,17 @@ namespace VulkanTuner {
       // `no-gain` or `no-winner` is the branches' question, decided from `pairsComplete`.
       {
         std::ostringstream jOs;
+        // (A6b, 2026-10-04) the per-shape list, built exactly like the measurement line's `anchor_us=`
+        // (bracketed, comma-separated, no spaces), because a second spelling of "how a list is printed" is
+        // how two readers come to disagree about the same bytes.
+        string ciHalfWidthByShape = "[";
+        for (size_t hw = 0; hw < decision->judgement.ciHalfWidthShapeMax.size(); hw++) {
+          if (hw != 0) {
+            ciHalfWidthByShape += ",";
+          }
+          ciHalfWidthByShape += to_string(decision->judgement.ciHalfWidthShapeMax[hw]);
+        }
+        ciHalfWidthByShape += "]";
         jOs << "judge: attempted=" << (decision->judgement.attempted ? 1 : 0)
             << " gate_reject=" << (decision->judgement.gateRejected ? 1 : 0)
             << " gate_high=" << decision->judgement.gateHigh
@@ -5905,6 +5951,14 @@ namespace VulkanTuner {
             // (A6, 2026-10-03) the MDE as ONE reading: the widest candidate interval's half-width, in the
             // tolerance's unit, with no threshold attached (see `Judgement::ciHalfWidthMax`).
             << " ci_halfwidth_max=" << decision->judgement.ciHalfWidthMax
+            // (A6b, 2026-10-04) the distribution and the per-shape maxima.  `max(ci_halfwidth_shape_max)`
+            // EQUALS `ci_halfwidth_max` by construction and the list's length is the covered shape count, so
+            // the smoke holds both relations instead of trusting the arithmetic; and "is ONE shape the
+            // jittery one, or is it the whole regime" is then a readable fact (the question the next
+            // algorithmic step -- two arms in one pass -- depends on).
+            << " ci_halfwidth_p50=" << decision->judgement.ciHalfWidthP50
+            << " ci_halfwidth_p90=" << decision->judgement.ciHalfWidthP90
+            << " ci_halfwidth_shape_max=" << ciHalfWidthByShape
             // P3 (2026-10-01): the two numbers the recovery reads and the one it writes.  `band_max` is
             // the WIDEST observed band among the wide pairs (0 = none), `remeasure` is the budget the
             // second pass was given (0 = the intervals all formed on the first pass).  Both are readings
