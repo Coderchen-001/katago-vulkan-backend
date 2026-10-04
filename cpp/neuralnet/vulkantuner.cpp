@@ -1590,6 +1590,25 @@ namespace VulkanTuner {
     // `s_warptile_mmq` with BK=128) but measured 33 ms pathological vs 1579.8 us at BK=64
     // (census-t05-shapes.md section 4.4, mm total).  Trying it cannot change "the best", so the search
     // domain is 36 geometries, not 72.  Re-open it only by re-running that BK sweep on this device.
+    //
+    // 🔴 2026-10-04 (user ruling): THE REASON IS THIS MACHINE'S OWN MEASUREMENT, and it says why in the
+    // unit the ruling asked for.  On the 5080, BK=64's mm-family total is **1579.8 us** against BK=128's
+    // **2792.2 us** -- 128 is **1.77x SLOWER**, and its first pass additionally produced a pathological
+    // 33.4 ms sample (x5.4).  So this is not "a table says it is not worth it": it was TRIED, and it is
+    // slower here.  (Same source and same run as the line above: census-t05-shapes.md section 4.4, whose
+    // sweep walked the probe over 16 / 32 / 64 / 128, two rounds each.)
+    // THE REPRODUCTION, named so the next reader does not have to reconstruct it (the probe is still in
+    // the tree: the backend reads this env and echoes it as an evidence line):
+    //   1) point the probe at each of 16 / 32 / 64 / 128 in turn (two rounds each), turn the perf logger
+    //      on, and clear every other KATAGO_VK_* probe;
+    //   2) run: katago benchmarknn -model b10c384h6nbttflrs.onnx -batch-size 8 -warmup 1 -iterations 2;
+    //   3) confirm the probe really applied by the evidence line the backend prints for that env (it
+    //      echoes the requested value beside the default) -- a sweep whose probe did not apply is a
+    //      sweep of the default four times.
+    // 🔴 AND IT IS A ONE-MACHINE CONCLUSION, NOT A CROSS-DEVICE LAW: the declaration is a compile-time
+    // constant, so nothing here re-derives it per device.  On another device class the BK axis value has
+    // to be RE-RULED with that sweep; until someone does, this line is the honest name of why the search
+    // domain is 36 and not 72, and the sweep above is how it gets re-opened.
     const uint32_t CM2_BK_VALUES[]      = { 64 };
     const uint32_t CM2_SMALLER_VALUES[] = { 0, 1 };
     const AxisDomain CM2_DOMAIN[] = {
