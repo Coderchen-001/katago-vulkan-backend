@@ -5502,7 +5502,24 @@ namespace VulkanTuner {
           // The model `block(s) = fixed + s * marginal` needs two points, so the probe is run twice at
           // DECLARED shot counts, and the same shape/objects/seed are reused so the two points differ in
           // `shots` and nothing else.
-          const uint32_t preProbeShots = 8;
+          //
+          // 🔴 THE SECOND POINT WAS MOVED INTO THE TARGET'S OWN REGIME (2026-10-04, A3(乙)'s discriminating
+          // experiment; spec `older/_a3b-and-samepass-spec.md` section 1.5).  It was 8, and the MEASURED
+          // consequence (B-1's own note higher up) is that the fit asked for 142 shots while the run
+          // achieved 1202 us against the declared 2000: the target sits ~18x BEYOND the highest
+          // calibration point, and the secant over 1->8 still contains the fixed term's exit, so it
+          // OVERESTIMATES the marginal cost at large `s` and the first pass lands short.  The correction
+          // pass then re-measures the WHOLE grid to fix that -- 10.5 s against the first pass's 6.8 s, i.e.
+          // 61% of a measuring leg's cost, for a number this calibration can produce.
+          // `64` is ~half the predicted block's own length, so the secant is measured where it is used.
+          // THE PRICE IS ~24 ms PER DECISION (32 blocks x ~0.9 ms against the 8-shot point's ~0.15 ms),
+          // which is four orders below what it may remove.
+          // ⚠️ PROVISIONAL, AND THE ACCEPTANCE IS TWO-WAY (spec section 1.5): the reading decides.  If the
+          // measurement line now shows `shots=[x,x]` (the correction pass did NOT fire) with
+          // `hot_us >= MIN_BLOCK_TIME_MS * 1000`, the second point stays here.  If the pass still fires,
+          // the error was NOT (only) the extrapolation distance and this value goes back to 8 with a new
+          // bug registered -- forcing it would be inventing an explanation for a number.
+          const uint32_t preProbeShots = 64;
           pp.shots = preProbeShots;
           std::vector<double> preD2((size_t) 2 * (size_t) preReps, 0.0);
           vk_tune_probe_result preRes2 {};
