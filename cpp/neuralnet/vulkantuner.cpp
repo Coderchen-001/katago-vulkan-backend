@@ -4110,7 +4110,9 @@ namespace VulkanTuner {
       // "the next launch pays again" from "nothing was paid here" -- see `writeRefusalText`.
       d.measurement.attempted = true;
       d.measurement.ok = true;
-      vk_tile_row_spec r {};
+      // The row TYPE is the one the formatter and the row builder take (case (n) uses the same): the shell
+      // does not own a second spelling of it.
+      vk_tune_row_spec r {};
       r.path = VK_TILE_PATH_SCALAR;
       r.src0_type = 1;
       r.src1_type = 0;
