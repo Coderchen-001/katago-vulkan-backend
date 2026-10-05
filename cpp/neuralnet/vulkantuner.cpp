@@ -157,7 +157,16 @@ namespace VulkanTuner {
     // runs on per-shape counts solved from those anchors.  Measured motivation: at `shots=228` the six
     // shapes landed 1601..1849 us against the 2000 us floor (ALL short, 15% spread between them), and the
     // grid therefore ran TWICE (~10 s + 10.5 s) on every measuring leg here.
-    const int TUNER_POLICY_VERSION = 4;
+    // 🔴 4 -> 5 (2026-10-05, batch b): a PROTOCOL change, and the largest one this counter has recorded -- the
+    // CORRECTION MECHANISM IS DELETED.  A note in this string moves the fingerprint by construction anyway
+    // (`tolerated_resolution_loss` leaves it), and the counter still moves because what a run MEASURES changed
+    // in a way no constant can express: the grid ran TWICE, and now it runs ONCE.  A row set measured under
+    // "a short shape triggers a second full pass" is not the same article as one measured under "the grid is
+    // measured once at the per-shape counts the anchor run solved for".  Measured basis (step 0(a), evidence
+    // `logs-t3/step0a/step0a-correction-off.md`): the verdicts do not degrade without it -- `verdicts=1`,
+    // `ci_missing = ci_coarse = ci_wide = 0`, half-widths p50 3.49% -> 3.58%, p90 5.94% -> 5.62%, max
+    // 7.65% -> 7.39%, `winner=-1` either way -- while each measuring leg costs 13.5 s instead of 24.9 s.
+    const int TUNER_POLICY_VERSION = 5;
 
     // Which header keys are required depends on the CHANNEL, and the split follows what each
     // key GUARANTEES.  These two arrays are the single source of truth: the parser builds its
@@ -2344,13 +2353,13 @@ namespace VulkanTuner {
       // is a SCALE estimate's sample count, and they used to be one number (R38: one name, one meaning).
       { "calib_pairs_floor", std::to_string(TuneStats::CALIB_PAIRS_FLOOR) },
       { "stall_blocks",    std::to_string(TuneStats::STALL_BLOCKS)    },
-      // A3(beta) batch 2 (2026-10-05): THE CORRECTION'S DEAD BAND, DECLARED AS THE POLICY IT IS.  What enters
-      // this string is the TOLERATED RESOLUTION LOSS -- the decision -- while the dead band itself is
-      // DERIVED from it in tunestats.h (`CORRECTION_DEADBAND = 1 - 1/(1+L)^2`), so the numeric mechanism
-      // cannot drift away from the policy it implements and there is exactly one place to argue with.  It
-      // belongs here for the reason every row above does: it decides what a run MEASURES (whether the grid
-      // is measured a second time), and therefore what a durable row set was measured UNDER.
-      { "tolerated_resolution_loss", std::to_string(TuneStats::TOLERATED_RESOLUTION_LOSS) },
+      // 🔴 (2026-10-05, batch b) `tolerated_resolution_loss` LEFT THIS TABLE, and the row is deleted rather
+      // than kept: it was the POLICY behind the correction's dead band, and the correction is gone.  A policy
+      // has no subject once the mechanism that implemented it does -- keeping the row would leave a number
+      // that nothing reads (the other half of R38's one-name-one-meaning).  The block length is still WATCHED,
+      // by two sanity louds after the measurement line, and those need no constant: one threshold is derived
+      // (1/0.1%, the sigma budget this file's own floor comment declares) and the other is measured-relative
+      // (the machine's widest shape spread, 1.23x, against K = 3).
     };
 
       // The DEV-SURFACE knobs: everything that can change what this tuner may select (or the
@@ -5937,93 +5946,23 @@ namespace VulkanTuner {
         const bool mOk = ::ggml_backend_vk_tune_probe_candidate(backend, rows.data(), rows.size(), &mp,
                                                                mSamples.data(), mSamples.size(), &mRes,
                                                                mErr, sizeof(mErr));
-        // 🔴 (2026-10-04) PASS 1 IS THE CORRECTION'S OWN INPUT, AND THE NEXT BLOCK OVERWRITES IT (`mRes =
-        // mRes2`).  Copying it here is what makes "which shape was short in pass 1, and by how much" a
-        // READING instead of a derivation: `anchor_us=` and `shots=[min,max]` on the measurement line are
-        // pass 2's, and the min/max pair does not say which shape got which count.  `shotsByShape` starts
-        // as "one count for every shape" (pass 1's); the correction's own vector replaces it below, at the
-        // one place where the corrected result actually becomes the reported one.
-        decision->measurement.anchorUsPass1.assign(mRes.shape_anchor_us,
-                                                   mRes.shape_anchor_us + mRes.n_shape_anchor_us);
+        // 🔴 (2026-10-05, batch b) THE CORRECTION MECHANISM IS GONE, and this is what its removal rests on.
+        // MEASURED (step 0(a); evidence `logs-t3/step0a/step0a-correction-off.md`, mirrored into `_wssync`):
+        // with the correction disabled the verdict does NOT degrade on this machine -- `verdicts=1`,
+        // `ci_missing = ci_coarse = ci_wide = 0`, `ci_halfwidth_p50` 3.49% -> 3.58%, `p90` 5.94% -> 5.62%,
+        // `max` 7.65% -> 7.39% (the tail came out BETTER), `winner=-1` either way -- while each measuring leg
+        // costs 13.5 s instead of 24.9 s (2.11 + 11.33 + 11.48 against 2.06 + 11.41).
+        // WHY IT COULD BE REMOVED.  The mechanism's whole job was to enforce `MIN_BLOCK_TIME_MS`: any shape
+        // whose achieved block came out short triggered a re-measurement, and because the trigger was
+        // PER-SHAPE while the re-measurement was ALL OR NOTHING, ONE short shape cost a second full grid pass.
+        // What the floor really is, its own comment already said: a sigma-budget argument (a 1000 us block
+        // uses 0.1% of it), and 2000 us is a 2x margin on that -- a TARGET, not a verdict-changing gate.  It
+        // stays a target for the pre-check's solve and a READING (`hot_us=`, `anchor_us=`), and the two
+        // block-length sanity louds after the measurement line take over the watching job.
+        // WHAT STAYED, and why: the in-regime ANCHOR RUN and the per-shape solve, because they land the six
+        // shapes 1886-1952 us instead of 1601-1849 (measured) -- more uniform blocks, better resolution, for
+        // 2.06 s -- and `shotsByShape`, the reading of what the ONE grid pass actually used.
         decision->measurement.shotsByShape = solvedShotsPerShape;
-        // (2026-10-05, batch 2) AND WHAT THIS FIRST PASS COST.  The reported `elapsed_us`/`blocks` describe
-        // whatever run the verdict ends up coming from, so when the fallback fires they are the SECOND pass's
-        // -- which left the fallback's price readable only by inference (and it was inferred wrongly once).
-        decision->measurement.pass1ElapsedUs = mRes.elapsed_us;
-        decision->measurement.pass1Blocks = mRes.blocks;
-        // 🔴 (B-1) ONE CORRECTION STEP, FROM THE BLOCK THIS RUN ACTUALLY MEASURED.  The derivation above
-        // is a FIRST GUESS: it fits `block(s) = fixed + s*marginal` from two short points, and that fit
-        // overestimates the marginal cost at large `s` (measured: it asked for shots=142 and the run
-        // achieved 1202 us against the declared 2000).  So the achieved block is the feedback -- the same
-        // quantity the declaration is about -- and one step lands it.  The re-call reuses the same params,
-        // objects and buffer (the buffer is sized by slots x reps, which `shots` does not change, and the
-        // primitive NaN-fills it on entry, so a second call is safe by construction).
-        const double targetBlockUs = TuneStats::MIN_BLOCK_TIME_MS * 1000.0;
-        // 🔴 (B-2) THE CORRECTION IS PER SHAPE, BECAUSE THE BLOCK LENGTH IS.  One shared `shots` gave
-        // the heaviest shape ~2000 us and left the light ones at 1582-1999 (measured), while the floor is a
-        // per-shape criterion -- so each shape gets ITS OWN ratio, computed from ITS OWN achieved block
-        // (`shape_anchor_us[s]`, the same median the primitive divides by).  Handing the heaviest shape's
-        // cost to the light ones would repeat the "one ruler for six shapes" mistake one layer down.
-        // 🔴 (2026-10-05, batch 2b) ITS BASE IS THE SHAPE'S OWN COUNT, NOT `mp.shots`.  This vector used to be
-        // initialised from `mp.shots` -- the pre-check's ONE shared count -- while the grid had already run on
-        // the PER-SHAPE solved counts, so the correction's ratio was taken against a count the shape was never
-        // run at.  Measured consequence on the A30 leg: with the grid at solved counts (~250-290) and
-        // `mp.shots = 229`, the one short shape's ratio produced `want = 236` and the correction therefore
-        // LOWERED it -- the reported run then landed at [1799,1955,1590,1691,1672,1666], i.e. the rows would
-        // have been measured BELOW the declared floor.  A ratio that can shrink a short shape is not a
-        // correction; it starts from what the shape was actually given.
-        std::vector<uint32_t> shotsPerShape = solvedShotsPerShape;
-        bool anyShapeShort = false;
-        for (size_t sIdx = 0; sIdx < coverage.size() && sIdx < (size_t) mRes.n_shape_anchor_us; sIdx++) {
-          const double aUs = mRes.shape_anchor_us[sIdx];
-          // 🔴 (2026-10-05, batch 2) THE TRIGGER HAS A DEAD BAND.  It used to be a bare `<`, so a run that
-          // reached 99.8% of the declared block paid a SECOND FULL PASS over the grid.  The dead band is
-          // derived from the tolerated resolution loss declared in tunestats.h (`CORRECTION_DEADBAND`, 4.82%
-          // at a 2.5% loss), and the floor stays a MINIMUM: this line decides only whether the correction
-          // runs, never what the block should be.  ⚠️ The pre-check's inversion deliberately does NOT get
-          // this treatment -- it SOLVES for the target, so a dead band there would undershoot `shots`.
-          if (aUs > 0.0 && aUs < targetBlockUs * (1.0 - TuneStats::CORRECTION_DEADBAND)) {
-            anyShapeShort = true;
-            // 🔴 DAMPED, AND HERE IS WHY (measured, B-2).  The first pass computes every ratio while
-            // ALL shapes share one `shots`; once the shapes carry different block lengths their per-dispatch
-            // costs move (differently sized blocks interfere through cache and thermals), so a full step
-            // overshoots -- the heaviest shape came out at 3596 us against a 2000 us target and the run cost
-            // ~40% more for the same blocks, with NO correctness benefit: the floor is a MINIMUM.
-            // THE BLOCK LENGTH IS A FUNCTION OF DEVICE STATE, not a constant of the protocol, which is why
-            // this is damped rather than solved once -- a device whose state shifts will show it in
-            // `anchor_us=` on the measurement line, which is the reading that exists for exactly this.
-            // Damping (not a second feedback round): a second round would double the measurement budget to
-            // chase a quantity that cannot change any verdict.
-            const double rawRatio = targetBlockUs / aUs;
-            const double dampedRatio = 1.0 + 0.5 * (rawRatio - 1.0);
-            const double want = (double) mp.shots * dampedRatio;
-            const uint32_t wantShots = (uint32_t) (want + 0.999);
-            if (wantShots > shotsPerShape[sIdx]) {
-              shotsPerShape[sIdx] = wantShots;
-            }
-          }
-        }
-        if (anyShapeShort && mRes.st == VK_TUNE_PROBE_OK && mp.shots > 0) {
-          mp.shotsPerShape = shotsPerShape.data();
-          mp.nShotsPerShape = (uint32_t) shotsPerShape.size();
-          vk_tune_probe_result mRes2 {};
-          char corrErr[512];
-          corrErr[0] = '\0';
-          const bool corrOk = ::ggml_backend_vk_tune_probe_candidate(backend, rows.data(), rows.size(), &mp,
-                                                                    mSamples.data(), mSamples.size(), &mRes2,
-                                                                    corrErr, sizeof(corrErr));
-          // The params object is shared with whatever follows: leave it exactly as the caller found it.
-          mp.shotsPerShape = nullptr;
-          mp.nShotsPerShape = 0;
-          if (corrOk && mRes2.st == VK_TUNE_PROBE_OK) {
-            mRes = mRes2;   // the corrected run IS the measurement: the short one only calibrated the shots
-            // (2026-10-04) ... and the per-shape counts the READINGS describe are pass 2's, so they move at
-            // the same moment the measurement does.  Writing them anywhere else would reopen the gap this
-            // copy exists to close: "which run is the measurement" and "which counts the line reports" are
-            // one decision, not two.
-            decision->measurement.shotsByShape = shotsPerShape;
-          }
-        }
         decision->measurement.shapes = coverage;
         decision->measurement.objects = mp.nObjects;
         decision->measurement.reps = mp.reps;
@@ -6294,14 +6233,6 @@ namespace VulkanTuner {
           // input -- and the per-shape counts the reported run used.  `anchor_pass1_us` is rounded to
           // microseconds exactly like `anchor_us=`, so the two lists are literally comparable when the
           // correction did not run (which is the invariant the smoke pins).
-          string pass1List = "[";
-          for (size_t ai = 0; ai < decision->measurement.anchorUsPass1.size(); ai++) {
-            if (ai != 0) {
-              pass1List += ",";
-            }
-            pass1List += to_string((long) (decision->measurement.anchorUsPass1[ai] + 0.5));
-          }
-          pass1List += "]";
           string shotsByShapeList = "[";
           for (size_t si = 0; si < decision->measurement.shotsByShape.size(); si++) {
             if (si != 0) {
@@ -6310,7 +6241,7 @@ namespace VulkanTuner {
             shotsByShapeList += to_string((long) decision->measurement.shotsByShape[si]);
           }
           shotsByShapeList += "]";
-          mOs << " anchor_pass1_us=" << pass1List << " shots_by_shape=" << shotsByShapeList;
+          mOs << " shots_by_shape=" << shotsByShapeList;
           // (2026-10-05, batch 2) THE ANCHOR RUN'S OWN READINGS, and the fallback's price.  `anchor_run_us`
           // is the per-shape anchor the solve read (so a shape that lands off the floor can be traced to its
           // input rather than to a story about it); `anchor_run_elapsed_us` prices the run that replaced the
@@ -6346,11 +6277,56 @@ namespace VulkanTuner {
           mOs << " anchor_run_us=" << anchorRunList
               << " anchor_run_hi_us=" << anchorHiList
               << " solved_shots=" << solvedList
-              << " anchor_run_elapsed_us=" << decision->measurement.anchorRunElapsedUs
-              << " pass1_elapsed_us=" << decision->measurement.pass1ElapsedUs
-              << " pass1_blocks=" << decision->measurement.pass1Blocks;
+              << " anchor_run_elapsed_us=" << decision->measurement.anchorRunElapsedUs;
         }
         logLine(mOs.str());
+        // 🔴 (2026-10-05, batch b) THE BLOCK-LENGTH SANITY LOUD -- THE FLOOR'S REPLACEMENT, IN TWO FORMS.
+        // The correction mechanism above was the only thing that watched the block length, and it did so by
+        // re-measuring.  With it gone, a machine whose blocks come out absurdly short would be SILENT, and
+        // silence is what this project refuses -- so the watching job moves here, as a loud with no effect on
+        // any verdict.  TWO forms, because each is blind to the other's case:
+        //   * ABSOLUTE: `min(anchor_us) < 1/0.1%` = 1000 us.  DERIVED, not picked: the µs clock's 1 µs quantum
+        //     is 0.1% of a 1000 µs block, i.e. it would use the whole sigma budget `MIN_BLOCK_TIME_MS`'s own
+        //     comment declares.  (That comment also quotes 0.19%, which is 1 µs / 526 µs -- a figure from the
+        //     era it was written; at today's 2000 µs the quantisation is 0.05%, and the comment was corrected
+        //     in this batch.)  This form catches the UNIFORM case: an unexpectedly fast machine where every
+        //     shape is short.
+        //   * RELATIVE: `min(anchor_us) < median(anchor_us) / 3`.  Catches ONE anomalous shape even when no
+        //     shape is below 1000 µs -- the case the absolute form cannot see.  K = 3 is measured-relative, not
+        //     picked: the widest per-shape spread ever seen here is 1.23x (the anchor run's 1479..1816) and
+        //     1.15x at a shared count (1601..1849), so 3 is the first round number beyond this machine's own
+        //     spread -- it stays silent in health and speaks on a genuine outlier.
+        // LOUD ONLY: no verdict, no row, no refusal.  `MIN_BLOCK_TIME_MS` is a TARGET now (the pre-check solves
+        // for it), and this line is what compensates for it no longer being enforced.
+        {
+          const double absFloorUs = 1000.0;   // 1 / 0.1%: the declared sigma budget's own limit
+          double minAnchor = 0.0;
+          double medAnchor = 0.0;
+          if (!decision->measurement.anchorUs.empty()) {
+            std::vector<double> sortedAnchors = decision->measurement.anchorUs;
+            std::sort(sortedAnchors.begin(), sortedAnchors.end());
+            minAnchor = sortedAnchors.front();
+            medAnchor = sortedAnchors[sortedAnchors.size() / 2];
+          }
+          string absoluteWhy;
+          string relativeWhy;
+          if (minAnchor > 0.0 && minAnchor < absFloorUs) {
+            absoluteWhy = "min_anchor_us=" + to_string((long) (minAnchor + 0.5)) + " < "
+                        + to_string((long) absFloorUs) + " (1/0.1%: the us clock's quantum would use the "
+                          "whole declared sigma budget)";
+          }
+          if (minAnchor > 0.0 && medAnchor > 0.0 && minAnchor < medAnchor / 3.0) {
+            relativeWhy = "min_anchor_us=" + to_string((long) (minAnchor + 0.5)) + " < median/3 = "
+                        + to_string((long) (medAnchor / 3.0 + 0.5)) + " (one shape is anomalous: the widest "
+                          "spread measured on this machine is 1.23x)";
+          }
+          if (!absoluteWhy.empty() || !relativeWhy.empty()) {
+            logLine("WARNING: block-length sanity: " + absoluteWhy
+                    + (absoluteWhy.empty() || relativeWhy.empty() ? "" : "; ") + relativeWhy
+                    + " -- LOUD ONLY: MIN_BLOCK_TIME_MS is a target, not an enforced gate (the correction "
+                      "mechanism was removed in this batch; see correction-removal-inventory.md)");
+          }
+        }
       }
 }
 

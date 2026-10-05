@@ -444,15 +444,10 @@ namespace VulkanTuner {
       // bounded-tie rule are decided per shape from these, because one shared ruler was measured to be
       // wrong for six shapes at once.
       std::vector<double> anchorUs;
-      // (2026-10-04) THE TWO READINGS THAT MAKE THE CORRECTION'S OWN INPUT VISIBLE.  Every statement about
-      // "which shape fell short in pass 1, and by how much" used to be a DERIVATION, and one of them was
-      // nearly believed: the correction overwrites `mRes` (`mRes = mRes2`), so the printed `anchor_us=` is
-      // pass 2's, and `shots=[min,max]` does not say WHICH shape got which count.  `anchorUsPass1` is pass
-      // 1's per-shape ruler -- the trigger's own input -- and `shotsByShape` is the per-shape count the
-      // REPORTED run used (pass 2's vector when the correction ran, otherwise one count for every shape).
-      // Together they turn that pairing from an assumption into a reading.  Neither is read by any verdict
-      // or gate: they are printed on the measurement line, and that is their whole job.
-      std::vector<double> anchorUsPass1;
+      // (2026-10-05, batch b) THE PER-SHAPE COUNTS THE ONE GRID PASS USED.  Before this batch they described
+      // "the reported run", which was sometimes the correction's second pass; the correction is gone (see
+      // `correction-removal-inventory.md`), so there is exactly one grid pass and this is what it ran at.  It
+      // is a READING: the solve's output, printed, read by no verdict.
       std::vector<uint32_t> shotsByShape;
       // (2026-10-05, batch 2) THE ANCHOR RUN'S OWN READINGS.  The pre-check solves ONE `shots` from two
       // points on ONE shape (the heaviest); the anchor run then measures EVERY covered shape AT that count,
@@ -472,12 +467,6 @@ namespace VulkanTuner {
       // (`shots_by_shape` is then the solved vector), which is exactly where the batch-2 defect hid: when the
       // fallback fired, the reported per-shape counts were the CORRECTION's and the solved ones vanished.
       std::vector<uint32_t> solvedShotsByShape;
-      // (2026-10-05, batch 2) WHAT THE FALLBACK COST: the FIRST full-grid pass's own numbers.  The reported
-      // `elapsedUs`/`blocks` describe the run the verdict came from, which is the SECOND pass whenever the
-      // fallback fires -- so without these two, the price of the fallback could only be inferred (and it
-      // was, wrongly, for a whole round).
-      uint64_t pass1ElapsedUs = 0;
-      uint32_t pass1Blocks = 0;
       uint32_t samplesWritten = 0;
       uint32_t pairsIllegal = 0;
       uint32_t spikes = 0;

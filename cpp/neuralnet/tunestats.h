@@ -58,7 +58,17 @@
 namespace TuneStats {
 
   // ---- the DECLARED protocol constants: ONE source, so the probe batch cannot re-copy them ----
-  constexpr double MIN_BLOCK_TIME_MS = 2.0;  // declared block; the us clock's 0.19% quantisation stays under the 0.1% sigma budget
+  // declared block; a 2x MARGIN on the sigma budget this file's own argument needs.  That argument: the µs
+  // clock's 1 µs quantum has to stay under the 0.1% sigma budget, and it does from a 1000 µs block upwards
+  // (1/1000 = 0.1% exactly); this value is twice that.  ⚠️ The "0.19%" this comment used to quote is
+  // 1 µs / 526 µs -- a block length from the era it was written: at today's 2000 µs the quantisation is
+  // 0.05%, four times better (corrected 2026-10-05, batch b).
+  // 🔴 IT IS A TARGET AND A READING, NOT AN ENFORCED GATE.  The pre-check SOLVES for it, `hot_us=`/`anchor_us=`
+  // report what was reached, and the mechanism that used to re-measure a short shape was DELETED in batch b
+  // (2026-10-05) after step 0(a) measured that the verdicts do not degrade without it
+  // (`logs-t3/step0a/step0a-correction-off.md`).  Two block-length sanity louds take over the watching job,
+  // and the deletion's reasoning plus its resurrection recipe live in `correction-removal-inventory.md`.
+  constexpr double MIN_BLOCK_TIME_MS = 2.0;
   constexpr long   PAIRS_FLOOR = 25;         // DECLARED + conservative: 16 and 25 are indistinguishable here (see the header)
   constexpr double ALPHA = 0.05;             // declared, not hidden inside a formula
   constexpr double TOLERANCE = 0.01;         // 1% : the product tolerance
@@ -133,37 +143,16 @@ namespace TuneStats {
   //   changes meaning because of it); it is in the fingerprint by ruling, so a change invalidates the
   //   row sets rather than silently mixing two regimes.
   constexpr long STALL_BLOCKS = (long) (1000.0 / MIN_BLOCK_TIME_MS);
-  // ---- THE CORRECTION'S DEAD BAND (2026-10-05, batch 2 / A3(beta)'s second defect) ---------------------
-  // WHAT WAS WRONG.  `shots` is solved for `MIN_BLOCK_TIME_MS`, the first pass lands short of it, and the
-  // correction STILL fired -- because its trigger was a bare `<`.  A run that reaches 99.8% of the declared
-  // block paid a SECOND FULL MEASUREMENT of the whole grid (measured 10.5 s against the first pass's ~10 s,
-  // on every measuring leg of this machine).
-  // THE POLICY IS THE LOSS WE TOLERATE, NOT THE PERCENTAGE THAT IMPLEMENTS IT.  What is declared -- and what
-  // is a row in POLICY_CONSTANTS -- is TOLERATED_RESOLUTION_LOSS; the dead band is DERIVED from it.  That is
-  // deliberate: "we accept a ruler this much coarser" is a decision somebody can argue about, while "5% of
-  // the block target" is a number that only looks like one.
-  //   DERIVATION.  The interval half-width falls as 1/sqrt(shots*reps) -- the per-dispatch average the
-  //   calibration's own sigma is taken over -- so accepting a relative loss L in the half-width allows
-  //   `shots` to fall by 1/(1+L)^2.  At L = 2.5%: 1 - 1/1.025^2 = 4.82%.
-  //   WHAT THAT COSTS, MEASURED AGAINST WHAT IS ALREADY TOLERATED.  This machine reads ci_halfwidth_p50 ~ 4%
-  //   and p90 ~ 6.5-8.8% (A6b), so a 2.5% relative change in ONE factor of the half-width sits far inside the
-  //   4-9% the verdicts already live with -- and it is BELOW the +-20% run-to-run spread of that p50
-  //   (measured on one binary: 3.77% and 4.69%), i.e. a single run cannot even resolve it.  The conservative
-  //   reading (half-width falling as 1/sqrt(reps) alone) gives ~5% instead of 4.82%: the same order, and
-  //   either way the block floor stays a MINIMUM.
-  // ⚠️ It is the CORRECTION that gets the dead band, NOT the pre-check's inversion: that one SOLVES for the
-  // target, so a dead band there would systematically undershoot `shots`.  It is also the belt that makes the
-  // per-shape solve's residual (a percent or two: the block/shots relation has measured curvature) a
-  // non-event instead of a whole second pass.
-  constexpr double TOLERATED_RESOLUTION_LOSS = 0.025;
-  constexpr double CORRECTION_DEADBAND =
-    1.0 - 1.0 / ((1.0 + TOLERATED_RESOLUTION_LOSS) * (1.0 + TOLERATED_RESOLUTION_LOSS));
-  // Both edges are real failure modes rather than typos: a non-positive loss would make the trigger STRICTER
-  // than the target it exists to reach, and a dead band of 1 would switch the correction off entirely.
-  static_assert(TOLERATED_RESOLUTION_LOSS > 0.0 && CORRECTION_DEADBAND > 0.0 && CORRECTION_DEADBAND < 1.0,
-                "the correction's dead band is derived from a positive tolerated loss (a non-positive one "
-                "would tighten the trigger instead of loosening it, and a dead band of 1 would disable the "
-                "correction entirely)");
+  // 🔴 (2026-10-05, batch b) THE CORRECTION'S DEAD BAND LIVED HERE AND IS DELETED WITH THE MECHANISM IT
+  // SERVED.  It was `CORRECTION_DEADBAND = 1 - 1/(1+TOLERATED_RESOLUTION_LOSS)^2` (4.82% at a 2.5% loss) and
+  // it existed to stop a run that reached 99.8% of the declared block from re-measuring the whole grid.  The
+  // correction itself is gone because step 0(a) MEASURED that the verdicts do not move without it while each
+  // measuring leg drops from 24.9 s to 13.5 s (`logs-t3/step0a/step0a-correction-off.md`); with the mechanism
+  // gone, a band on its trigger has no subject, and a policy constant nothing reads is the other half of
+  // R38's one-name-one-meaning.  The block length is still watched -- by two sanity louds after the
+  // measurement line, whose thresholds need no declared constant (one is derived from the sigma budget
+  // `MIN_BLOCK_TIME_MS` declares, the other is measured-relative).  Resurrection recipe and the full
+  // reasoning: `correction-removal-inventory.md`.
   // THE ROTATION SEED: the block sequence rotates with a randomized Latin square (tune-measurement.md
   // section 2.2, one block per (shape, object) slot), and "fixed seed, reproducible" is only true if
   // the seed is declared.  It is the same value the statistics self-test uses as its default base seed
