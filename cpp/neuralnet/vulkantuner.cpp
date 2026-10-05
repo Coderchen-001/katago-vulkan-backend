@@ -148,7 +148,16 @@ namespace VulkanTuner {
     // (b) P3: when the judgement's own observed band is wider than the tolerance, the measurement is
     // re-run ONCE at `n' = n*(band/tol)^2` instead of the run writing nothing at all.  Both change what a
     // durable row set was measured UNDER, and neither is a constant the revision alone would expose.
-    const int TUNER_POLICY_VERSION = 3;
+    // 🔴 3 -> 4 (2026-10-05, batch 2): a PROTOCOL change, and it is visible twice over.  (a) The constant it
+    // introduces (`TOLERATED_RESOLUTION_LOSS`) is ALSO a `POLICY_CONSTANTS` row, so the fingerprint moves by
+    // construction -- that half needs no counter.  (b) The counter still moves, because the MEASUREMENT
+    // changed in two ways: a run that reaches the declared block within the tolerated loss no longer pays
+    // the correction pass, and the grid no longer runs on one shared `shots` derived from a single shape --
+    // an in-regime ANCHOR RUN now measures every covered shape at the pre-check's own count and the grid
+    // runs on per-shape counts solved from those anchors.  Measured motivation: at `shots=228` the six
+    // shapes landed 1601..1849 us against the 2000 us floor (ALL short, 15% spread between them), and the
+    // grid therefore ran TWICE (~10 s + 10.5 s) on every measuring leg here.
+    const int TUNER_POLICY_VERSION = 4;
 
     // Which header keys are required depends on the CHANNEL, and the split follows what each
     // key GUARANTEES.  These two arrays are the single source of truth: the parser builds its
@@ -2335,6 +2344,13 @@ namespace VulkanTuner {
       // is a SCALE estimate's sample count, and they used to be one number (R38: one name, one meaning).
       { "calib_pairs_floor", std::to_string(TuneStats::CALIB_PAIRS_FLOOR) },
       { "stall_blocks",    std::to_string(TuneStats::STALL_BLOCKS)    },
+      // A3(beta) batch 2 (2026-10-05): THE CORRECTION'S DEAD BAND, DECLARED AS THE POLICY IT IS.  What enters
+      // this string is the TOLERATED RESOLUTION LOSS -- the decision -- while the dead band itself is
+      // DERIVED from it in tunestats.h (`CORRECTION_DEADBAND = 1 - 1/(1+L)^2`), so the numeric mechanism
+      // cannot drift away from the policy it implements and there is exactly one place to argue with.  It
+      // belongs here for the reason every row above does: it decides what a run MEASURES (whether the grid
+      // is measured a second time), and therefore what a durable row set was measured UNDER.
+      { "tolerated_resolution_loss", std::to_string(TuneStats::TOLERATED_RESOLUTION_LOSS) },
     };
 
       // The DEV-SURFACE knobs: everything that can change what this tuner may select (or the
@@ -5796,8 +5812,92 @@ namespace VulkanTuner {
         mp.reps = measReps;
         mp.stallBlocks = (uint32_t) TuneStats::STALL_BLOCKS;
         mp.coverageComplete = decision->coverageComplete;
-        mp.shotsPerShape = nullptr;
-        mp.nShotsPerShape = 0;
+        // 🔴 (2026-10-05, batch 2) THE ANCHOR RUN: ONE IN-REGIME POINT PER SHAPE, BEFORE THE GRID.
+        // WHY IT EXISTS.  The pre-check solves ONE `shots` from two points measured on ONE shape (the
+        // heaviest) at 1 and 64 shots, so the grid's single shared `shots` is an extrapolation for that
+        // shape and an assumption for the other five.  Measured (A30 leg): at the solved `shots=228` the six
+        // shapes land 1601..1849 us against the 2000 us floor -- ALL short, with a 15% spread BETWEEN shapes
+        // at one shared count -- and the correction pass then re-measured the WHOLE grid to fix that, at
+        // 10.5 s on top of ~10 s.  The shortfall is not a mystery: the shapes do not share a per-dispatch
+        // cost (measured 6.79 to 8.16 us/shot at the same count), so no single count can put six shapes on
+        // one floor.
+        // WHAT IT IS.  The pre-check's own two stock objects (anchor + A/A sentinel, constructed exactly as
+        // the grid's arms so the anchor medians are the same quantity), EVERY covered shape, ONE shared
+        // `shots` = the pre-check's answer, and NO candidate rows -- the primitive accepts `rows = nullptr`
+        // (the pre-check already calls it that way).  Cost is `shapes x 2 objects x (warmup+K+reps)` blocks.
+        vk_tune_probe_object anchorObjects[2];
+        for (int a = 0; a < 2; a++) {
+          anchorObjects[a].stock = true;
+          anchorObjects[a].rowIndex = 0;
+          anchorObjects[a].aligned = false;
+        }
+        vk_tune_probe_params ap {};
+        ap.shapes = coverage.data();
+        ap.nShapes = (uint32_t) coverage.size();
+        ap.objects = anchorObjects;
+        ap.nObjects = 2;
+        ap.shots = decision->precheckShots;
+        ap.warmupBlocks = (uint32_t) TuneStats::WARMUP_BLOCKS;
+        ap.reps = measReps;   // the SAME statistic the grid's anchors are taken with (PAIRS_FLOOR), so the two are comparable
+        ap.stallBlocks = (uint32_t) TuneStats::STALL_BLOCKS;
+        // ⚠️ `coverageComplete` is deliberately NOT set here.  The anchor run covers the COVERAGE set, not the
+        // slot's whole shape set, so the flag's value must be false -- which is what `ap` already holds from
+        // value-initialisation, and R45 pins the number of explicit caller statements for that field at two
+        // (the pre-check's and the grid's).  A third statement would add no information and would move a pin
+        // that exists to stop the LOADER from writing the field, not to count statements.
+        ap.shotsPerShape = nullptr;
+        ap.nShotsPerShape = 0;
+        ap.seed = TuneStats::PROBE_ROTATION_SEED;
+        ap.spikeBandLo = TuneStats::SPIKE_BAND_LO;
+        ap.spikeBandHi = TuneStats::SPIKE_BAND_HI;
+        std::vector<double> aD((size_t) coverage.size() * (size_t) 2 * (size_t) measReps, 0.0);
+        vk_tune_probe_result aRes {};
+        char aErr[512];
+        aErr[0] = '\0';
+        const bool aOk = ::ggml_backend_vk_tune_probe_candidate(backend, nullptr, 0, &ap, aD.data(), aD.size(),
+                                                               &aRes, aErr, sizeof(aErr));
+        if (aOk && aRes.st == VK_TUNE_PROBE_OK) {
+          decision->measurement.anchorRunUs.assign(aRes.shape_anchor_us,
+                                                   aRes.shape_anchor_us + aRes.n_shape_anchor_us);
+        }
+        decision->measurement.anchorRunElapsedUs = aRes.elapsed_us;
+        // THE PER-SHAPE SOLVE, from each shape's OWN in-regime anchor.  `block(s) = fixed + s*marginal`
+        // inverted at that shape's measured point: `marginal_i = (a_i - fixed)/shots0`, so reaching the
+        // target needs `s_i = (target - fixed) * shots0 / (a_i - fixed)`.  🔴 NOTE THE `- fixed` IN THE
+        // DENOMINATOR: dividing the target by `a_i/shots0` -- the shape's AVERAGE per-shot cost, fixed term
+        // included -- subtracts the fixed cost twice and UNDER-shoots by ~2.5% (measured on the A30 leg:
+        // 243.3 against 249.7 shots on the heaviest shape), and under-shooting is the direction that spends
+        // the fallback pass, so the arithmetic is load-bearing rather than fastidious.
+        // FAIL-CLOSED: if the anchor run did not produce a usable result, every shape keeps the pre-check's own
+        // count, which is exactly yesterday's behaviour -- a failed anchor run must not invent per-shape
+        // numbers.
+        std::vector<uint32_t> solvedShotsPerShape(coverage.size(), mp.shots);
+        if (aOk && aRes.st == VK_TUNE_PROBE_OK) {
+          const double targetUs = TuneStats::MIN_BLOCK_TIME_MS * 1000.0;
+          const double fixedUs = decision->precheckFixedUs;
+          const uint32_t shots0 = mp.shots > 0 ? mp.shots : 1u;
+          for (size_t sIdx = 0; sIdx < coverage.size() && sIdx < (size_t) aRes.n_shape_anchor_us; sIdx++) {
+            const double aUs = aRes.shape_anchor_us[sIdx];
+            const double marginalUs = (aUs - fixedUs) / (double) shots0;
+            if (aUs > 0.0 && marginalUs > 0.0) {
+              double want = (targetUs - fixedUs) / marginalUs;
+              // 🔴 THE ONLY UPPER BOUND, and it is derived rather than picked: the `marginal_i` above comes
+              // from ONE secant, so a shape whose rate moved enough to need more than 4x the count that
+              // secant already reached is a shape the model cannot speak for -- the FALLBACK pass is the
+              // honest answer for it (it re-measures instead of trusting the model).  The registered open
+              // item "wantShots has no upper bound" covers the pre-check's inversion and this line alike.
+              if (want > 4.0 * (double) shots0) {
+                want = 4.0 * (double) shots0;
+              }
+              if (want < 1.0) {
+                want = 1.0;
+              }
+              solvedShotsPerShape[sIdx] = (uint32_t) (want + 0.999);
+            }
+          }
+        }
+        mp.shotsPerShape = solvedShotsPerShape.data();
+        mp.nShotsPerShape = (uint32_t) solvedShotsPerShape.size();
         mp.seed = TuneStats::PROBE_ROTATION_SEED;
         mp.spikeBandLo = TuneStats::SPIKE_BAND_LO;
         mp.spikeBandHi = TuneStats::SPIKE_BAND_HI;
@@ -5817,7 +5917,12 @@ namespace VulkanTuner {
         // one place where the corrected result actually becomes the reported one.
         decision->measurement.anchorUsPass1.assign(mRes.shape_anchor_us,
                                                    mRes.shape_anchor_us + mRes.n_shape_anchor_us);
-        decision->measurement.shotsByShape.assign(coverage.size(), mp.shots);
+        decision->measurement.shotsByShape = solvedShotsPerShape;
+        // (2026-10-05, batch 2) AND WHAT THIS FIRST PASS COST.  The reported `elapsed_us`/`blocks` describe
+        // whatever run the verdict ends up coming from, so when the fallback fires they are the SECOND pass's
+        // -- which left the fallback's price readable only by inference (and it was inferred wrongly once).
+        decision->measurement.pass1ElapsedUs = mRes.elapsed_us;
+        decision->measurement.pass1Blocks = mRes.blocks;
         // 🔴 (B-1) ONE CORRECTION STEP, FROM THE BLOCK THIS RUN ACTUALLY MEASURED.  The derivation above
         // is a FIRST GUESS: it fits `block(s) = fixed + s*marginal` from two short points, and that fit
         // overestimates the marginal cost at large `s` (measured: it asked for shots=142 and the run
@@ -5835,7 +5940,13 @@ namespace VulkanTuner {
         bool anyShapeShort = false;
         for (size_t sIdx = 0; sIdx < coverage.size() && sIdx < (size_t) mRes.n_shape_anchor_us; sIdx++) {
           const double aUs = mRes.shape_anchor_us[sIdx];
-          if (aUs > 0.0 && aUs < targetBlockUs) {
+          // 🔴 (2026-10-05, batch 2) THE TRIGGER HAS A DEAD BAND.  It used to be a bare `<`, so a run that
+          // reached 99.8% of the declared block paid a SECOND FULL PASS over the grid.  The dead band is
+          // derived from the tolerated resolution loss declared in tunestats.h (`CORRECTION_DEADBAND`, 4.82%
+          // at a 2.5% loss), and the floor stays a MINIMUM: this line decides only whether the correction
+          // runs, never what the block should be.  ⚠️ The pre-check's inversion deliberately does NOT get
+          // this treatment -- it SOLVES for the target, so a dead band there would undershoot `shots`.
+          if (aUs > 0.0 && aUs < targetBlockUs * (1.0 - TuneStats::CORRECTION_DEADBAND)) {
             anyShapeShort = true;
             // 🔴 DAMPED, AND HERE IS WHY (measured, B-2).  The first pass computes every ratio while
             // ALL shapes share one `shots`; once the shapes carry different block lengths their per-dispatch
@@ -6088,6 +6199,28 @@ namespace VulkanTuner {
       // stderr with its own marker.
       {
         std::ostringstream mOs;
+        // 🔴 (2026-10-05, batch 2) `per_dispatch_us` IS A SAME-RUN RATIO NOW.  It used to divide the
+        // REPORTED run's `hot_us` by the PRE-CHECK's `shots` -- a cross-pass number, and the pre-check's
+        // count belongs to ONE shape while `hot_us` is the hottest shape's block (measured: 1951/228 = 8.56
+        // against that shape's own 1951/237 = 8.23).  It is the re-derivable half of "the block is defined by
+        // time" (R50's carrier), so it has to be two numbers from the same run: the hottest shape's block over
+        // THAT shape's own count.  Fallbacks keep a reading rather than a zero: the hottest shape is found by
+        // the same max the block itself is, and only if the lists disagree in length does it use `shots_max`.
+        double perDispatchUs = 0.0;
+        if (!decision->measurement.anchorUs.empty()) {
+          size_t hotIdx = 0;
+          for (size_t i = 0; i < decision->measurement.anchorUs.size(); i++) {
+            if (decision->measurement.anchorUs[i] > decision->measurement.anchorUs[hotIdx]) {
+              hotIdx = i;
+            }
+          }
+          const uint32_t hotShots = (hotIdx < decision->measurement.shotsByShape.size())
+                                      ? decision->measurement.shotsByShape[hotIdx]
+                                      : decision->measurement.shotsMax;
+          if (hotShots > 0) {
+            perDispatchUs = decision->measurement.hotUs / (double) hotShots;
+          }
+        }
         mOs << "measure: attempted=" << (decision->measurement.attempted ? 1 : 0)
             << " ok=" << (decision->measurement.ok ? 1 : 0)
             << " shapes=" << decision->measurement.shapes.size()
@@ -6096,9 +6229,7 @@ namespace VulkanTuner {
             << " cands=" << decision->candidatesMeasured << "/" << decision->candidatesEnumerated
             << " blocks=" << decision->measurement.blocks
             << " hot_us=" << decision->measurement.hotUs
-            << " per_dispatch_us=" << (decision->precheckShots > 0
-                                          ? decision->measurement.hotUs / (double) decision->precheckShots
-                                          : 0.0)
+            << " per_dispatch_us=" << perDispatchUs
             << " reps=" << decision->measurement.reps
             << " samples=" << decision->measurement.samplesWritten
             << " pairs_illegal=" << decision->measurement.pairsIllegal
@@ -6144,6 +6275,23 @@ namespace VulkanTuner {
           }
           shotsByShapeList += "]";
           mOs << " anchor_pass1_us=" << pass1List << " shots_by_shape=" << shotsByShapeList;
+          // (2026-10-05, batch 2) THE ANCHOR RUN'S OWN READINGS, and the fallback's price.  `anchor_run_us`
+          // is the per-shape anchor the solve read (so a shape that lands off the floor can be traced to its
+          // input rather than to a story about it); `anchor_run_elapsed_us` prices the run that replaced the
+          // second grid; `pass1_elapsed_us`/`pass1_blocks` are the FIRST grid pass's own numbers, which the
+          // reported `elapsed_us`/`blocks` stop being the moment the fallback fires.
+          string anchorRunList = "[";
+          for (size_t ai = 0; ai < decision->measurement.anchorRunUs.size(); ai++) {
+            if (ai != 0) {
+              anchorRunList += ",";
+            }
+            anchorRunList += to_string((long) (decision->measurement.anchorRunUs[ai] + 0.5));
+          }
+          anchorRunList += "]";
+          mOs << " anchor_run_us=" << anchorRunList
+              << " anchor_run_elapsed_us=" << decision->measurement.anchorRunElapsedUs
+              << " pass1_elapsed_us=" << decision->measurement.pass1ElapsedUs
+              << " pass1_blocks=" << decision->measurement.pass1Blocks;
         }
         logLine(mOs.str());
       }

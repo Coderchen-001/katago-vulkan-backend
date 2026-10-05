@@ -133,6 +133,37 @@ namespace TuneStats {
   //   changes meaning because of it); it is in the fingerprint by ruling, so a change invalidates the
   //   row sets rather than silently mixing two regimes.
   constexpr long STALL_BLOCKS = (long) (1000.0 / MIN_BLOCK_TIME_MS);
+  // ---- THE CORRECTION'S DEAD BAND (2026-10-05, batch 2 / A3(beta)'s second defect) ---------------------
+  // WHAT WAS WRONG.  `shots` is solved for `MIN_BLOCK_TIME_MS`, the first pass lands short of it, and the
+  // correction STILL fired -- because its trigger was a bare `<`.  A run that reaches 99.8% of the declared
+  // block paid a SECOND FULL MEASUREMENT of the whole grid (measured 10.5 s against the first pass's ~10 s,
+  // on every measuring leg of this machine).
+  // THE POLICY IS THE LOSS WE TOLERATE, NOT THE PERCENTAGE THAT IMPLEMENTS IT.  What is declared -- and what
+  // is a row in POLICY_CONSTANTS -- is TOLERATED_RESOLUTION_LOSS; the dead band is DERIVED from it.  That is
+  // deliberate: "we accept a ruler this much coarser" is a decision somebody can argue about, while "5% of
+  // the block target" is a number that only looks like one.
+  //   DERIVATION.  The interval half-width falls as 1/sqrt(shots*reps) -- the per-dispatch average the
+  //   calibration's own sigma is taken over -- so accepting a relative loss L in the half-width allows
+  //   `shots` to fall by 1/(1+L)^2.  At L = 2.5%: 1 - 1/1.025^2 = 4.82%.
+  //   WHAT THAT COSTS, MEASURED AGAINST WHAT IS ALREADY TOLERATED.  This machine reads ci_halfwidth_p50 ~ 4%
+  //   and p90 ~ 6.5-8.8% (A6b), so a 2.5% relative change in ONE factor of the half-width sits far inside the
+  //   4-9% the verdicts already live with -- and it is BELOW the +-20% run-to-run spread of that p50
+  //   (measured on one binary: 3.77% and 4.69%), i.e. a single run cannot even resolve it.  The conservative
+  //   reading (half-width falling as 1/sqrt(reps) alone) gives ~5% instead of 4.82%: the same order, and
+  //   either way the block floor stays a MINIMUM.
+  // ⚠️ It is the CORRECTION that gets the dead band, NOT the pre-check's inversion: that one SOLVES for the
+  // target, so a dead band there would systematically undershoot `shots`.  It is also the belt that makes the
+  // per-shape solve's residual (a percent or two: the block/shots relation has measured curvature) a
+  // non-event instead of a whole second pass.
+  constexpr double TOLERATED_RESOLUTION_LOSS = 0.025;
+  constexpr double CORRECTION_DEADBAND =
+    1.0 - 1.0 / ((1.0 + TOLERATED_RESOLUTION_LOSS) * (1.0 + TOLERATED_RESOLUTION_LOSS));
+  // Both edges are real failure modes rather than typos: a non-positive loss would make the trigger STRICTER
+  // than the target it exists to reach, and a dead band of 1 would switch the correction off entirely.
+  static_assert(TOLERATED_RESOLUTION_LOSS > 0.0 && CORRECTION_DEADBAND > 0.0 && CORRECTION_DEADBAND < 1.0,
+                "the correction's dead band is derived from a positive tolerated loss (a non-positive one "
+                "would tighten the trigger instead of loosening it, and a dead band of 1 would disable the "
+                "correction entirely)");
   // THE ROTATION SEED: the block sequence rotates with a randomized Latin square (tune-measurement.md
   // section 2.2, one block per (shape, object) slot), and "fixed seed, reproducible" is only true if
   // the seed is declared.  It is the same value the statistics self-test uses as its default base seed

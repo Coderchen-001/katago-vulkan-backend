@@ -454,6 +454,19 @@ namespace VulkanTuner {
       // or gate: they are printed on the measurement line, and that is their whole job.
       std::vector<double> anchorUsPass1;
       std::vector<uint32_t> shotsByShape;
+      // (2026-10-05, batch 2) THE ANCHOR RUN'S OWN READINGS.  The pre-check solves ONE `shots` from two
+      // points on ONE shape (the heaviest); the anchor run then measures EVERY covered shape AT that count,
+      // in the regime the grid is about to use, and its per-shape anchors are what the per-shape solve
+      // reads.  They are printed because the solve's INPUT is the thing to audit when a shape lands off the
+      // floor, and `anchorRunElapsedUs` prices the run that replaced the second grid.
+      std::vector<double> anchorRunUs;
+      uint64_t anchorRunElapsedUs = 0;
+      // (2026-10-05, batch 2) WHAT THE FALLBACK COST: the FIRST full-grid pass's own numbers.  The reported
+      // `elapsedUs`/`blocks` describe the run the verdict came from, which is the SECOND pass whenever the
+      // fallback fires -- so without these two, the price of the fallback could only be inferred (and it
+      // was, wrongly, for a whole round).
+      uint64_t pass1ElapsedUs = 0;
+      uint32_t pass1Blocks = 0;
       uint32_t samplesWritten = 0;
       uint32_t pairsIllegal = 0;
       uint32_t spikes = 0;
