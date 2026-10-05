@@ -5971,6 +5971,7 @@ namespace VulkanTuner {
         {
           decision->measurement.anchorRunHotUs = aRes.t_block_hot_us;
           std::vector<double> madByShape((size_t) coverage.size(), 0.0);
+          std::vector<uint32_t> pairsByShape((size_t) coverage.size(), 0u);
           for (size_t sIdx = 0; sIdx < coverage.size(); sIdx++) {
             std::vector<double> sDiffs;
             sDiffs.reserve((size_t) measReps);
@@ -5982,11 +5983,16 @@ namespace VulkanTuner {
                 sDiffs.push_back(aD[slot]);
               }
             }
+            // The count is the point: a MAD's own relative error is ~1/sqrt(2n), so `n` decides whether a
+            // spread across shapes is sampling or mechanism -- and a shape with fewer finite pairs than `reps`
+            // also says its blocks were dropped.
+            pairsByShape[sIdx] = (uint32_t) sDiffs.size();
             if (!sDiffs.empty()) {
               madByShape[sIdx] = TuneStats::madScale(sDiffs);
             }
           }
           decision->measurement.anchorRunMadByShape = madByShape;
+          decision->measurement.anchorRunPairsByShape = pairsByShape;
         }
         // THE PER-SHAPE SOLVE, from each shape's OWN two in-regime points.  `block(s) = fixed + s*marginal`
         // through `(s0, a1)` and `(2*s0, a2)`: `marginal = (a2 - a1)/s0` and `fixed = a1 - marginal*s0`, so
@@ -6422,12 +6428,23 @@ namespace VulkanTuner {
             anchorRunMadList += to_string(decision->measurement.anchorRunMadByShape[am]);
           }
           anchorRunMadList += "]";
+          // Q2: the pair count per shape, beside the MAD it was taken over -- a MAD's own relative error is
+          // ~1/sqrt(2n), so `n` decides whether a spread across shapes is sampling or mechanism.
+          string anchorRunPairsList = "[";
+          for (size_t ap2 = 0; ap2 < decision->measurement.anchorRunPairsByShape.size(); ap2++) {
+            if (ap2 != 0) {
+              anchorRunPairsList += ",";
+            }
+            anchorRunPairsList += to_string((long) decision->measurement.anchorRunPairsByShape[ap2]);
+          }
+          anchorRunPairsList += "]";
           mOs << " anchor_run_us=" << anchorRunList
               << " anchor_run_hi_us=" << anchorHiList
               << " solved_shots=" << solvedList
               << " anchor_run_elapsed_us=" << decision->measurement.anchorRunElapsedUs
               << " anchor_run_hot_us=" << decision->measurement.anchorRunHotUs
-              << " anchor_run_mad_by_shape=" << anchorRunMadList;
+              << " anchor_run_mad_by_shape=" << anchorRunMadList
+              << " anchor_run_pairs_by_shape=" << anchorRunPairsList;
         }
         logLine(mOs.str());
         // 🔴 (2026-10-05, batch b) THE BLOCK-LENGTH SANITY LOUD -- THE FLOOR'S REPLACEMENT, IN TWO FORMS.

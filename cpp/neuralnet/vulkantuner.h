@@ -465,6 +465,14 @@ namespace VulkanTuner {
       // explanations can be separated by reading rather than by argument.  `anchor_run_mad` (pooled) is GONE --
       // one meaning, one name -- and neither reading is used as a discriminator until the anomaly is explained.
       std::vector<double> anchorRunMadByShape;
+      // 🔴 Q2 (2026-10-05): HOW MANY PAIRED DIFFERENCES EACH SHAPE'S MAD WAS TAKEN OVER.  The review's cheap
+      // decisive check, and the reason it is needed: a MAD has a relative standard error of about 1/sqrt(2n),
+      // so its own NOISE depends entirely on n -- and n here is NOT the pre-check's `CALIB_PAIRS_FLOOR` (16)
+      // but the anchor run's `reps` (`PAIRS_FLOOR` = 25), minus whatever the primitive left NaN.  With n = 25
+      // that error is ~14%, which cannot produce the 6x spread measured across shapes -- so the spread is a
+      // real shape effect rather than sampling; printing n makes that a reading instead of an argument, and it
+      // also catches a shape whose blocks were dropped (fewer finite pairs than `reps`).
+      std::vector<uint32_t> anchorRunPairsByShape;
       double anchorRunHotUs = 0.0;
       // (2026-10-05, batch 2b) THE ANCHOR RUN'S SECOND POINT, at twice the pre-check's count.  One point was
       // not enough and the measurement said so: the block/shots relation is concave for the light shapes, so a
