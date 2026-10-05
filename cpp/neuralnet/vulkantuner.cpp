@@ -1094,6 +1094,9 @@ namespace VulkanTuner {
       std::vector<uint32_t> notWorseByShape((size_t) nShapes, 0u);
       double bestMargin = 0.0;
       bool bestMarginDefined = false;
+      // Q2 (second half): the maximin candidate's own per-shape margins (declared here with the other locals;
+      // the field it is copied into is `Judgement::bestShapeMargin`).
+      std::vector<double> bestShapeMargin;
       for (uint32_t c = 0; c < nCands; c++) {
         bool allShapes = true;
         bool anyUnstable = false;
@@ -1105,6 +1108,10 @@ namespace VulkanTuner {
         bool candAllCiOk = true;
         bool candHaveMargin = false;
         double candMinMargin = 0.0;
+        // Q2 (second half): this candidate's margins, shape by shape -- kept so the maximin's argmax can hand
+        // its own vector to the reading above.  A shape without an interval gets 0.0 here and the candidate is
+        // already disqualified by `candAllCiOk`, so the value is never read.
+        std::vector<double> candMargins((size_t) nShapes, 0.0);
         for (uint32_t s = 0; s < nShapes; s++) {
           TuneStats::PairedResult r {};
           // 🔴 THE IDENTITY THE MEASUREMENT ACTUALLY BUILT (measured 2026-09-29).  Rows -- and therefore
@@ -1142,6 +1149,7 @@ namespace VulkanTuner {
               candMinMargin = marginHere;
               candHaveMargin = true;
             }
+            candMargins[s] = marginHere;
           }
           if (!r.ciOk) {
             // NO INTERVAL IS NOT "UNSTABLE": it is missing data, and the branches answer for it.
@@ -1180,6 +1188,7 @@ namespace VulkanTuner {
           if (!bestMarginDefined || candMinMargin > bestMargin) {
             bestMargin = candMinMargin;
             bestMarginDefined = true;
+            bestShapeMargin = candMargins;   // the argmax's OWN margins: where the best candidate falls short
           }
         }
       }
@@ -1201,6 +1210,7 @@ namespace VulkanTuner {
       j.notWorseByShape = notWorseByShape;
       j.bestMargin = bestMargin;
       j.bestMarginDefined = bestMarginDefined;
+      j.bestShapeMargin = bestShapeMargin;
     }
 
     // ── R-28 step (3): THE CANDIDATE-DROP ACCOUNTING AND THE THIRD BRANCH ─────────────────────────
@@ -5959,21 +5969,24 @@ namespace VulkanTuner {
         // `precheck:`'s `sigma` is (the MAD of the sentinel's paired differences); the half-width it implies
         // differs from it by a factor of sqrt(reps), so the two must not be read as the same number.
         {
-          std::vector<double> aDiffs;
-          aDiffs.reserve((size_t) coverage.size() * (size_t) measReps);
+          decision->measurement.anchorRunHotUs = aRes.t_block_hot_us;
+          std::vector<double> madByShape((size_t) coverage.size(), 0.0);
           for (size_t sIdx = 0; sIdx < coverage.size(); sIdx++) {
+            std::vector<double> sDiffs;
+            sDiffs.reserve((size_t) measReps);
             for (uint32_t r = 0; r < measReps; r++) {
               // Object 1 is the A/A sentinel, so its slots carry the paired differences (the anchor's own slots
               // stay NaN by design -- there is no difference to take against itself).
               const size_t slot = ((size_t) sIdx * 2u + 1u) * (size_t) measReps + (size_t) r;
               if (slot < aD.size() && std::isfinite(aD[slot])) {
-                aDiffs.push_back(aD[slot]);
+                sDiffs.push_back(aD[slot]);
               }
             }
+            if (!sDiffs.empty()) {
+              madByShape[sIdx] = TuneStats::madScale(sDiffs);
+            }
           }
-          if (!aDiffs.empty()) {
-            decision->measurement.anchorRunMad = TuneStats::madScale(aDiffs);
-          }
+          decision->measurement.anchorRunMadByShape = madByShape;
         }
         // THE PER-SHAPE SOLVE, from each shape's OWN two in-regime points.  `block(s) = fixed + s*marginal`
         // through `(s0, a1)` and `(2*s0, a2)`: `marginal = (a2 - a1)/s0` and `fixed = a1 - marginal*s0`, so
@@ -6190,6 +6203,17 @@ namespace VulkanTuner {
           notWorseByShapeList += to_string((long) decision->judgement.notWorseByShape[nw]);
         }
         notWorseByShapeList += "]";
+        // Q2 (second half): the maximin candidate's own per-shape margins -- a signed distance per shape, so an
+        // allocation rule can feed the shapes that are NEGATIVE (which is where a conjunction fails) instead of
+        // the shape with the smallest `shape_margin_max` (which is a different, measured-different thing).
+        string bestShapeMarginList = "[";
+        for (size_t bm = 0; bm < decision->judgement.bestShapeMargin.size(); bm++) {
+          if (bm != 0) {
+            bestShapeMarginList += ",";
+          }
+          bestShapeMarginList += to_string(decision->judgement.bestShapeMargin[bm]);
+        }
+        bestShapeMarginList += "]";
         jOs << "judge: attempted=" << (decision->judgement.attempted ? 1 : 0)
             << " gate_reject=" << (decision->judgement.gateRejected ? 1 : 0)
             << " gate_high=" << decision->judgement.gateHigh
@@ -6238,6 +6262,9 @@ namespace VulkanTuner {
             // half-width quartet states above).
             << " shape_margin_max=" << shapeMarginMaxList
             << " not_worse_by_shape=" << notWorseByShapeList
+            // Q2 (second half): the maximin candidate's OWN margins.  Empty when no candidate had intervals
+            // everywhere (the fail-closed edge), and the shapes that are negative here are D''s targets.
+            << " best_shape_margin=" << bestShapeMarginList
             // P3 (2026-10-01): the two numbers the recovery reads and the one it writes.  `band_max` is
             // the WIDEST observed band among the wide pairs (0 = none), `remeasure` is the budget the
             // second pass was given (0 = the intervals all formed on the first pass).  Both are readings
@@ -6385,11 +6412,22 @@ namespace VulkanTuner {
             solvedList += to_string((long) decision->measurement.solvedShotsByShape[si]);
           }
           solvedList += "]";
+          // Q2 (second half): the anchor run's per-shape A/A MAD, in the same list idiom, beside its own block
+          // length (printed with the group below) -- the pair that separates "object count" from "block length".
+          string anchorRunMadList = "[";
+          for (size_t am = 0; am < decision->measurement.anchorRunMadByShape.size(); am++) {
+            if (am != 0) {
+              anchorRunMadList += ",";
+            }
+            anchorRunMadList += to_string(decision->measurement.anchorRunMadByShape[am]);
+          }
+          anchorRunMadList += "]";
           mOs << " anchor_run_us=" << anchorRunList
               << " anchor_run_hi_us=" << anchorHiList
               << " solved_shots=" << solvedList
               << " anchor_run_elapsed_us=" << decision->measurement.anchorRunElapsedUs
-              << " anchor_run_mad=" << decision->measurement.anchorRunMad;
+              << " anchor_run_hot_us=" << decision->measurement.anchorRunHotUs
+              << " anchor_run_mad_by_shape=" << anchorRunMadList;
         }
         logLine(mOs.str());
         // 🔴 (2026-10-05, batch b) THE BLOCK-LENGTH SANITY LOUD -- THE FLOOR'S REPLACEMENT, IN TWO FORMS.

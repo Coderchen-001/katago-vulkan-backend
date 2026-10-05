@@ -456,10 +456,16 @@ namespace VulkanTuner {
       // floor, and `anchorRunElapsedUs` prices the run that replaced the second grid.
       std::vector<double> anchorRunUs;
       uint64_t anchorRunElapsedUs = 0;
-      // 🔴 Q2 (2026-10-05): THE ANCHOR RUN'S A/A MAD -- block-relative, the same statistic `precheck:`'s
-      // `sigma` is, and the two-object end of the range whose 218-object end is `ci_halfwidth_sentinel_*`.  A
-      // reading: no verdict reads it.  (Its half-width differs from it by a factor of sqrt(reps).)
-      double anchorRunMad = 0.0;
+      // 🔴 Q2 (2026-10-05, second half): THE ANCHOR RUN'S A/A MAD, PER SHAPE, plus ITS OWN BLOCK LENGTH.  The
+      // first version pooled every shape's slots into one MAD and reported 0.1529 -- SEVEN TIMES the grid's
+      // sentinel widths -- which is the opposite of what "fewer objects, less interference" predicts.  A pooled
+      // MAD across shapes is not the same statistic as the grid's (which is normalised per shape), and the
+      // anchor run's blocks are SHORTER than the grid's (it runs at the pre-check's count, not the solved one),
+      // which alone can raise sigma.  So: per shape, and with the block length next to it, so the two candidate
+      // explanations can be separated by reading rather than by argument.  `anchor_run_mad` (pooled) is GONE --
+      // one meaning, one name -- and neither reading is used as a discriminator until the anomaly is explained.
+      std::vector<double> anchorRunMadByShape;
+      double anchorRunHotUs = 0.0;
       // (2026-10-05, batch 2b) THE ANCHOR RUN'S SECOND POINT, at twice the pre-check's count.  One point was
       // not enough and the measurement said so: the block/shots relation is concave for the light shapes, so a
       // marginal taken at `s0` under-states the cost at the count the shape actually needs and the solve
@@ -614,6 +620,14 @@ namespace VulkanTuner {
       std::vector<uint32_t> notWorseByShape;
       double bestMargin = 0.0;
       bool bestMarginDefined = false;
+      // 🔴 Q2 (2026-10-05, second half): THE MAXIMIN CANDIDATE'S OWN PER-SHAPE MARGINS, signed.  `shapeMarginMax`
+      // answers "can THIS shape pass at all" (a max over candidates); this answers "where does the best
+      // candidate actually fall short" (that one candidate's margins, shape by shape).  Measured 2026-10-05,
+      // these are NOT the same thing and the difference is the whole point: all six of `shapeMarginMax` were
+      // positive (0.0057 .. 0.0258) while `bestMargin` was NEGATIVE (-0.000319) -- i.e. no single candidate is
+      // good everywhere, which is what a conjunction fails on.  D''-style allocation must feed the shapes that
+      // are negative HERE, not the shape with the smallest `shapeMarginMax` (that shape is not the blocker).
+      std::vector<double> bestShapeMargin;
     };
     Judgement judgement;
     // (7d): the branch selection runs ONCE per decision, like the pre-check, the measurement and the
