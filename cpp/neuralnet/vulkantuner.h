@@ -456,6 +456,10 @@ namespace VulkanTuner {
       // floor, and `anchorRunElapsedUs` prices the run that replaced the second grid.
       std::vector<double> anchorRunUs;
       uint64_t anchorRunElapsedUs = 0;
+      // 🔴 Q2 (2026-10-05): THE ANCHOR RUN'S A/A MAD -- block-relative, the same statistic `precheck:`'s
+      // `sigma` is, and the two-object end of the range whose 218-object end is `ci_halfwidth_sentinel_*`.  A
+      // reading: no verdict reads it.  (Its half-width differs from it by a factor of sqrt(reps).)
+      double anchorRunMad = 0.0;
       // (2026-10-05, batch 2b) THE ANCHOR RUN'S SECOND POINT, at twice the pre-check's count.  One point was
       // not enough and the measurement said so: the block/shots relation is concave for the light shapes, so a
       // marginal taken at `s0` under-states the cost at the count the shape actually needs and the solve
@@ -594,6 +598,22 @@ namespace VulkanTuner {
       int winner = -1;                   // the first candidate not-worse on every shape (-1 = none)
       bool winnerUnstable = false;       // the stability boundary, read on that candidate's intervals
       double winnerMargin = 0.0;         // report: the winner's tightest `ciLow + tolerance`
+      // 🔴 Q2 (2026-10-05): THE VERDICT AS A CONTINUOUS DISTANCE.  The 0/1 `winner` is an EXTREME statistic
+      // (a `min over shapes` of per-shape quantities that are themselves 1.8x noisy), so measured across three
+      // same-parameter legs it moved 1/3 -> 0/3 while the aggregate p50 held to +-6.4%.  These three readings
+      // make it comparable:
+      //   * `shapeMarginMax[s]` = max over candidates of (ciLow + TOLERANCE): each shape's distance to having a
+      //     passing candidate (sentinel -1.0 when no interval formed for that shape).  The ALLOCATION input.
+      //   * `notWorseByShape[s]` = the passing-pair count per shape: the per-shape split of `notWorsePairs`,
+      //     whose total the smoke checks against that scalar.
+      //   * `bestMargin` = the maximin (max over candidates of their min-over-shapes margin), signed, defined
+      //     even when nothing passes; `bestMarginDefined` says whether any candidate had intervals everywhere.
+      //     With a winner, `bestMargin == winnerMargin` and only `winner_margin` is printed; without one, only
+      //     `best_margin` is -- one meaning, one name, and the verdict is a DISTANCE in both cases.
+      std::vector<double> shapeMarginMax;
+      std::vector<uint32_t> notWorseByShape;
+      double bestMargin = 0.0;
+      bool bestMarginDefined = false;
     };
     Judgement judgement;
     // (7d): the branch selection runs ONCE per decision, like the pre-check, the measurement and the

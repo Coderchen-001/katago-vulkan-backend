@@ -153,14 +153,25 @@ namespace TuneStats {
   // measurement line, whose thresholds need no declared constant (one is derived from the sigma budget
   // `MIN_BLOCK_TIME_MS` declares, the other is measured-relative).  Resurrection recipe and the full
   // reasoning: `correction-removal-inventory.md`.
-  // THE ROTATION SEED: the block sequence rotates with a randomized Latin square (tune-measurement.md
-  // section 2.2, one block per (shape, object) slot), and "fixed seed, reproducible" is only true if
-  // the seed is declared.  It is the same value the statistics self-test uses as its default base seed
-  // (devSeed() reads it instead of repeating the literal), so one number serves both and a rerun of
-  // either reproduces the other.  It is a CODE constant, not an env knob: it is covered by the build
-  // revision in the policy fingerprint, and making it settable would let two runs of the same machine
-  // differ in a way no header records.
+  // THE ROTATION SEED (**SELF-TEST ONLY SINCE 2026-10-05**): the block sequence rotates with a randomized
+  // Latin square (tune-measurement.md section 2.2, one block per (shape, object) slot), and "fixed seed,
+  // reproducible" is only true if the seed is declared.  It is the statistics self-test's default base seed
+  // (`devSeed()` reads it instead of repeating the literal).  It is a CODE constant, not an env knob: it is
+  // covered by the build revision in the policy fingerprint, and making it settable would let two runs of the
+  // same machine differ in a way no header records.
+  // 🔴 SPLIT 2026-10-05 (Q2 step 1's finding): this constant was ONE NAME FOR TWO MEANINGS -- the measurement's
+  // rotation order AND the self-test's base seed.  Measured consequence: swapping it to test whether the ISSUE
+  // ORDER is a lever (it is: the aggregate p90 moved +18.5%, `not_worse` fell 58 -> 28) also moved the
+  // self-test's coverage assertion and turned the unrelated `A3o_validator_selftest_all_ok` leg red.  So the
+  // measurement's seed moved to its own constant below, this one now means ONLY the self-test's base seed, and
+  // BOTH keep the value they had -- the split is behaviour-neutral by construction.  The smoke pins the split
+  // in both directions (`devSeed` still reads THIS one).
   constexpr unsigned long long PROBE_ROTATION_SEED = 0x5EEDC0DEULL;
+  // THE MEASUREMENT'S ROTATION SEED: the ORDER in which (shape, object) slots are issued.  It is a real
+  // parameter -- measured 2026-10-05: a different seed moved the aggregate p90 by +18.5% and halved the number
+  // of pairs that pass, i.e. MORE than the arm-to-arm difference a budget experiment tries to resolve.
+  // Consequence recorded in the handoff: every Q2 conclusion is CONDITIONAL ON THIS ORDER.
+  constexpr unsigned long long PROBE_MEASURE_ROTATION_SEED = 0x5EEDC0DEULL;
   constexpr long   DEV_TRIALS_DEFAULT = 200; // the self-test's size when KATAGO_VK_TUNE_STATS_TRIALS is unset
   // The trial count below which the coverage assertion is LOOSE, and SAYS SO in the printed line.  With
   // the SE taken from the measured coverage (a plug-in estimate -- that is WHY the line floats with the

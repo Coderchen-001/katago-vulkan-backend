@@ -1076,11 +1076,35 @@ namespace VulkanTuner {
       std::vector<double> halfWidths;
       halfWidths.reserve((size_t) nCands * (size_t) nShapes);
       std::vector<double> shapeHalfWidthMax((size_t) nShapes, 0.0);
+      // 🔴 Q2 readings (2026-10-05): THE VERDICT AS A CONTINUOUS DISTANCE, plus its per-shape pieces.
+      // WHY (measured): the verdict is a conjunction over shapes ("not worse in EVERY shape"), so its binding
+      // statistic is a `min over shapes` of a per-shape quantity whose own run-to-run spread is 1.8x -- and the
+      // min of six noisy quantities is an EXTREME statistic.  Measured across three same-parameter legs:
+      // `not_worse` moved 78/54/42 and a winner appeared in ONE of them, at a 0.082% margin.  So the 0/1 winner
+      // is not comparable across runs while these are:
+      //   * `shapeMarginMax[s]` = max over candidates of (ciLow + TOLERANCE): how far THIS shape is from having
+      //     a passing candidate.  The ALLOCATION input (which shape is binding).
+      //   * `bestMargin` = max over candidates of (min over shapes of that margin): the maximin, i.e. the
+      //     verdict's own distance -- SIGNED, and defined even when no candidate passes.  `>= 0` iff a winner
+      //     exists, and when one does it IS `winner_margin`; only one of the two names is printed, ever.
+      // Fail-closed edges: a shape with no interval keeps the sentinel below (a margin of -1.0 is far below any
+      // real one, and neither reading is a gate); a candidate missing an interval cannot be the maximin's
+      // argmax, the same "no interval, no claim" rule `notWorseThan` already states.
+      std::vector<double> shapeMarginMax((size_t) nShapes, -1.0);
+      std::vector<uint32_t> notWorseByShape((size_t) nShapes, 0u);
+      double bestMargin = 0.0;
+      bool bestMarginDefined = false;
       for (uint32_t c = 0; c < nCands; c++) {
         bool allShapes = true;
         bool anyUnstable = false;
         bool haveMargin = false;
         double worstMargin = 0.0;
+        // Q2: the same walk, at CANDIDATE granularity: the smallest margin this candidate shows across the
+        // shapes, and whether every shape had an interval at all (a candidate with a hole cannot be the
+        // maximin's argmax -- fail-closed, not a guess).
+        bool candAllCiOk = true;
+        bool candHaveMargin = false;
+        double candMinMargin = 0.0;
         for (uint32_t s = 0; s < nShapes; s++) {
           TuneStats::PairedResult r {};
           // 🔴 THE IDENTITY THE MEASUREMENT ACTUALLY BUILT (measured 2026-09-29).  Rows -- and therefore
@@ -1098,6 +1122,7 @@ namespace VulkanTuner {
           // quantity the plan asked for under two names (MDE / SE).  It is accumulated HERE, in the
           // candidate loop, and not inside `intervalFor`, so the sentinel's equivalence intervals can
           // never enter it by accident.  No threshold, no branch: it is a reading.
+          const double marginHere = r.ciOk ? (r.ciLow + TuneStats::TOLERANCE) : 0.0;
           if (r.ciOk) {
             const double halfWidth = 0.5 * (r.ciHigh - r.ciLow);
             if (halfWidth > j.ciHalfWidthMax) {
@@ -1108,15 +1133,26 @@ namespace VulkanTuner {
             if (halfWidth > shapeHalfWidthMax[s]) {
               shapeHalfWidthMax[s] = halfWidth;
             }
+            // Q2: and the shape's own best-candidate DISTANCE, from every interval that formed (not only the
+            // passing ones, which is what makes it a distance rather than a count).
+            if (marginHere > shapeMarginMax[s]) {
+              shapeMarginMax[s] = marginHere;
+            }
+            if (!candHaveMargin || marginHere < candMinMargin) {
+              candMinMargin = marginHere;
+              candHaveMargin = true;
+            }
           }
           if (!r.ciOk) {
             // NO INTERVAL IS NOT "UNSTABLE": it is missing data, and the branches answer for it.
             j.ciMissing++;
             allShapes = false;
+            candAllCiOk = false;
             continue;
           }
           if (TuneStats::notWorseThan(r, TuneStats::TOLERANCE)) {
             j.notWorsePairs++;
+            notWorseByShape[s]++;
             const double margin = r.ciLow + TuneStats::TOLERANCE;
             if (!haveMargin || margin < worstMargin) {
               worstMargin = margin;
@@ -1136,6 +1172,16 @@ namespace VulkanTuner {
           j.winnerUnstable = anyUnstable;
           j.winnerMargin = worstMargin;
         }
+        // Q2: THE MAXIMIN.  A candidate's verdict distance is its SMALLEST margin across the shapes (the
+        // conjunction); the best candidate's is the largest of those.  Kept for candidates that had an interval
+        // everywhere, and kept whether or not it reaches zero -- which is exactly what makes the verdict
+        // comparable across runs where the 0/1 winner is not.
+        if (candAllCiOk && candHaveMargin) {
+          if (!bestMarginDefined || candMinMargin > bestMargin) {
+            bestMargin = candMinMargin;
+            bestMarginDefined = true;
+          }
+        }
       }
       // (A6b, 2026-10-04) THE TWO ORDER STATISTICS, by NEAREST RANK: the smallest observation whose rank
       // reaches `p` -- no interpolation, no distributional assumption, and the same family as the rank tests
@@ -1147,6 +1193,14 @@ namespace VulkanTuner {
         j.ciHalfWidthP90 = nearestRank(0.90, halfWidths);
       }
       j.ciHalfWidthShapeMax = shapeHalfWidthMax;
+      // Q2 (2026-10-05): the verdict's continuous form and its per-shape pieces, stored where the line reads
+      // them.  `bestMarginDefined` is carried rather than inferred from `winner >= 0`: when no WINNER exists
+      // there is still a best candidate with a distance, and the line needs to know whether that number is
+      // real (a candidate with intervals everywhere existed at all) or absent.
+      j.shapeMarginMax = shapeMarginMax;
+      j.notWorseByShape = notWorseByShape;
+      j.bestMargin = bestMargin;
+      j.bestMarginDefined = bestMarginDefined;
     }
 
     // ── R-28 step (3): THE CANDIDATE-DROP ACCOUNTING AND THE THIRD BRANCH ─────────────────────────
@@ -1370,7 +1424,7 @@ namespace VulkanTuner {
           cp.nShotsPerShape = 0;
           // A DIFFERENT rotation cycle than the selection used, so these are blocks the selection never
           // saw: the seed is the declared one, the cycle number is what changes.
-          cp.seed = TuneStats::PROBE_ROTATION_SEED;
+          cp.seed = TuneStats::PROBE_MEASURE_ROTATION_SEED;
           cp.spikeBandLo = TuneStats::SPIKE_BAND_LO;
           cp.spikeBandHi = TuneStats::SPIKE_BAND_HI;
           std::vector<double> confD((size_t) cp.nObjects * (size_t) cp.reps, 0.0);
@@ -5525,7 +5579,7 @@ namespace VulkanTuner {
         pp.coverageComplete = false;
         pp.shotsPerShape = nullptr;
         pp.nShotsPerShape = 0;
-        pp.seed = TuneStats::PROBE_ROTATION_SEED;
+        pp.seed = TuneStats::PROBE_MEASURE_ROTATION_SEED;
         pp.spikeBandLo = TuneStats::SPIKE_BAND_LO;
         pp.spikeBandHi = TuneStats::SPIKE_BAND_HI;
         std::vector<double> preD((size_t) 2 * (size_t) preReps, 0.0);
@@ -5856,7 +5910,7 @@ namespace VulkanTuner {
         // that exists to stop the LOADER from writing the field, not to count statements.
         ap.shotsPerShape = nullptr;
         ap.nShotsPerShape = 0;
-        ap.seed = TuneStats::PROBE_ROTATION_SEED;
+        ap.seed = TuneStats::PROBE_MEASURE_ROTATION_SEED;
         ap.spikeBandLo = TuneStats::SPIKE_BAND_LO;
         ap.spikeBandHi = TuneStats::SPIKE_BAND_HI;
         // 🔴 TWO POINTS, BOTH IN THE TARGET'S REGIME (2026-10-05, batch 2b).  ONE point was not enough, and
@@ -5897,6 +5951,30 @@ namespace VulkanTuner {
         // Both points are the price of the stage that replaced the second grid: summed, because that is what the
         // leg pays.
         decision->measurement.anchorRunElapsedUs = aRes.elapsed_us + aRes2.elapsed_us;
+        // 🔴 Q2 (2026-10-05): THE ANCHOR RUN'S OWN A/A DISPERSION -- the measurement's non-common-mode term
+        // measured with TWO objects instead of 218.  The grid's sentinel width is already printed
+        // (`ci_halfwidth_sentinel_*`); this is the same quantity at the other end of the object-count range, so
+        // the pair answers "does interference between many objects widen the pairs?" without a new sweep --
+        // which is the cheap discriminator the review asked for.  UNIT: BLOCK-RELATIVE, the same statistic
+        // `precheck:`'s `sigma` is (the MAD of the sentinel's paired differences); the half-width it implies
+        // differs from it by a factor of sqrt(reps), so the two must not be read as the same number.
+        {
+          std::vector<double> aDiffs;
+          aDiffs.reserve((size_t) coverage.size() * (size_t) measReps);
+          for (size_t sIdx = 0; sIdx < coverage.size(); sIdx++) {
+            for (uint32_t r = 0; r < measReps; r++) {
+              // Object 1 is the A/A sentinel, so its slots carry the paired differences (the anchor's own slots
+              // stay NaN by design -- there is no difference to take against itself).
+              const size_t slot = ((size_t) sIdx * 2u + 1u) * (size_t) measReps + (size_t) r;
+              if (slot < aD.size() && std::isfinite(aD[slot])) {
+                aDiffs.push_back(aD[slot]);
+              }
+            }
+          }
+          if (!aDiffs.empty()) {
+            decision->measurement.anchorRunMad = TuneStats::madScale(aDiffs);
+          }
+        }
         // THE PER-SHAPE SOLVE, from each shape's OWN two in-regime points.  `block(s) = fixed + s*marginal`
         // through `(s0, a1)` and `(2*s0, a2)`: `marginal = (a2 - a1)/s0` and `fixed = a1 - marginal*s0`, so
         // reaching the target needs `s = (target - fixed)/marginal`.  🔴 The `- fixed` is load-bearing (dividing
@@ -5935,7 +6013,7 @@ namespace VulkanTuner {
         decision->measurement.solvedShotsByShape = solvedShotsPerShape;
         mp.shotsPerShape = solvedShotsPerShape.data();
         mp.nShotsPerShape = (uint32_t) solvedShotsPerShape.size();
-        mp.seed = TuneStats::PROBE_ROTATION_SEED;
+        mp.seed = TuneStats::PROBE_MEASURE_ROTATION_SEED;
         mp.spikeBandLo = TuneStats::SPIKE_BAND_LO;
         mp.spikeBandHi = TuneStats::SPIKE_BAND_HI;
         const size_t mSlots = coverage.size() * mObjects.size();
@@ -6092,6 +6170,26 @@ namespace VulkanTuner {
           ciHalfWidthSentinelByShape += to_string(decision->judgement.ciHalfWidthSentinelByShape[hw]);
         }
         ciHalfWidthSentinelByShape += "]";
+        // Q2 (2026-10-05): the same list idiom for the verdict's per-shape pieces.  `shape_margin_max` is in
+        // TOLERANCE units (a margin, not a width: `ciLow + TOLERANCE`, so positive means that shape could have a
+        // passing candidate) and `not_worse_by_shape` is a count whose SUM the smoke compares against
+        // `not_worse=` -- a build-time-true relation that reddens if either accumulator drifts.
+        string shapeMarginMaxList = "[";
+        for (size_t sm = 0; sm < decision->judgement.shapeMarginMax.size(); sm++) {
+          if (sm != 0) {
+            shapeMarginMaxList += ",";
+          }
+          shapeMarginMaxList += to_string(decision->judgement.shapeMarginMax[sm]);
+        }
+        shapeMarginMaxList += "]";
+        string notWorseByShapeList = "[";
+        for (size_t nw = 0; nw < decision->judgement.notWorseByShape.size(); nw++) {
+          if (nw != 0) {
+            notWorseByShapeList += ",";
+          }
+          notWorseByShapeList += to_string((long) decision->judgement.notWorseByShape[nw]);
+        }
+        notWorseByShapeList += "]";
         jOs << "judge: attempted=" << (decision->judgement.attempted ? 1 : 0)
             << " gate_reject=" << (decision->judgement.gateRejected ? 1 : 0)
             << " gate_high=" << decision->judgement.gateHigh
@@ -6135,6 +6233,11 @@ namespace VulkanTuner {
             << " ci_halfwidth_sentinel_p90=" << decision->judgement.ciHalfWidthSentinelP90
             << " ci_halfwidth_sentinel_max=" << decision->judgement.ciHalfWidthSentinelMax
             << " ci_halfwidth_sentinel_by_shape=" << ciHalfWidthSentinelByShape
+            // 🔴 Q2 (2026-10-05): the verdict's per-shape pieces -- a DISTANCE per shape and the per-shape
+            // count whose sum must equal `not_worse=`.  Readings only: no threshold, no gate (the same rule the
+            // half-width quartet states above).
+            << " shape_margin_max=" << shapeMarginMaxList
+            << " not_worse_by_shape=" << notWorseByShapeList
             // P3 (2026-10-01): the two numbers the recovery reads and the one it writes.  `band_max` is
             // the WIDEST observed band among the wide pairs (0 = none), `remeasure` is the budget the
             // second pass was given (0 = the intervals all formed on the first pass).  Both are readings
@@ -6145,7 +6248,15 @@ namespace VulkanTuner {
             << " remeasure=" << decision->wideBandRemeasure
             << " winner=" << decision->judgement.winner
             << " winner_unstable=" << (decision->judgement.winnerUnstable ? 1 : 0)
-            << " winner_margin=" << decision->judgement.winnerMargin
+            // 🔴 Q2 (2026-10-05): ONE MEANING, ONE NAME -- exactly one of these two is printed, ever.  With a
+            // winner it reports that candidate's binding margin; without one it reports the best candidate's
+            // (the maximin), which is the same quantity and is defined whether or not it reaches zero.  The
+            // smoke pins the mutual exclusion in both directions, because two names for one number is the
+            // failure mode this project has spent a year removing.
+            << (decision->judgement.winner >= 0
+                  ? (" winner_margin=" + to_string(decision->judgement.winnerMargin))
+                  : (" best_margin=" + to_string(decision->judgement.bestMarginDefined
+                                                  ? decision->judgement.bestMargin : 0.0)))
             << " spikes=" << decision->judgement.gateSpikes
             << " blocks=" << decision->judgement.gateBlocks
             << " objects=" << decision->judgement.gateObjects;
@@ -6277,7 +6388,8 @@ namespace VulkanTuner {
           mOs << " anchor_run_us=" << anchorRunList
               << " anchor_run_hi_us=" << anchorHiList
               << " solved_shots=" << solvedList
-              << " anchor_run_elapsed_us=" << decision->measurement.anchorRunElapsedUs;
+              << " anchor_run_elapsed_us=" << decision->measurement.anchorRunElapsedUs
+              << " anchor_run_mad=" << decision->measurement.anchorRunMad;
         }
         logLine(mOs.str());
         // 🔴 (2026-10-05, batch b) THE BLOCK-LENGTH SANITY LOUD -- THE FLOOR'S REPLACEMENT, IN TWO FORMS.
