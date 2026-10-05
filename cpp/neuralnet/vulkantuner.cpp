@@ -5850,44 +5850,71 @@ namespace VulkanTuner {
         ap.seed = TuneStats::PROBE_ROTATION_SEED;
         ap.spikeBandLo = TuneStats::SPIKE_BAND_LO;
         ap.spikeBandHi = TuneStats::SPIKE_BAND_HI;
+        // 🔴 TWO POINTS, BOTH IN THE TARGET'S REGIME (2026-10-05, batch 2b).  ONE point was not enough, and
+        // the measurement says exactly why: the block/shots relation is CONCAVE for the light shapes (measured:
+        // their per-shot cost rose 6.79 -> 7.57 us when their count went 228 -> 262), so a marginal taken at
+        // `s0` UNDER-states the cost at the count the shape actually needs -- the solve overshoots, and the grid
+        // pays for it.  Measured with one point: pass 1 took 12.79 s and landed [2012,1900,2295,2223,2060,2256]
+        // (+14.8% on one shape, and ONE shape 3.6 us under the dead band was enough to re-measure the whole
+        // grid).  With a second point at `2*s0` the target is INTERPOLATED per shape, so each shape's own fixed
+        // and marginal terms are MEASURED rather than borrowed from the heaviest shape (which is all one point
+        // could do).
         std::vector<double> aD((size_t) coverage.size() * (size_t) 2 * (size_t) measReps, 0.0);
         vk_tune_probe_result aRes {};
         char aErr[512];
         aErr[0] = '\0';
         const bool aOk = ::ggml_backend_vk_tune_probe_candidate(backend, nullptr, 0, &ap, aD.data(), aD.size(),
                                                                &aRes, aErr, sizeof(aErr));
+        // `2*s0`, guarded: `wantShots` has no declared upper bound (a registered open item), so a pathological
+        // pre-check answer must not turn this multiplication into a run measured in minutes.
+        const uint32_t shotsHi = (mp.shots > 0 && mp.shots < 100000u) ? (2u * mp.shots) : mp.shots;
+        ap.shots = shotsHi;
+        std::vector<double> aD2((size_t) coverage.size() * (size_t) 2 * (size_t) measReps, 0.0);
+        vk_tune_probe_result aRes2 {};
+        char aErr2[512];
+        aErr2[0] = '\0';
+        const bool aOk2 = ::ggml_backend_vk_tune_probe_candidate(backend, nullptr, 0, &ap, aD2.data(), aD2.size(),
+                                                                &aRes2, aErr2, sizeof(aErr2));
+        const bool aUsable = aOk && aRes.st == VK_TUNE_PROBE_OK && aOk2 && aRes2.st == VK_TUNE_PROBE_OK
+                             && shotsHi > mp.shots;
         if (aOk && aRes.st == VK_TUNE_PROBE_OK) {
           decision->measurement.anchorRunUs.assign(aRes.shape_anchor_us,
                                                    aRes.shape_anchor_us + aRes.n_shape_anchor_us);
         }
-        decision->measurement.anchorRunElapsedUs = aRes.elapsed_us;
-        // THE PER-SHAPE SOLVE, from each shape's OWN in-regime anchor.  `block(s) = fixed + s*marginal`
-        // inverted at that shape's measured point: `marginal_i = (a_i - fixed)/shots0`, so reaching the
-        // target needs `s_i = (target - fixed) * shots0 / (a_i - fixed)`.  🔴 NOTE THE `- fixed` IN THE
-        // DENOMINATOR: dividing the target by `a_i/shots0` -- the shape's AVERAGE per-shot cost, fixed term
-        // included -- subtracts the fixed cost twice and UNDER-shoots by ~2.5% (measured on the A30 leg:
-        // 243.3 against 249.7 shots on the heaviest shape), and under-shooting is the direction that spends
-        // the fallback pass, so the arithmetic is load-bearing rather than fastidious.
-        // FAIL-CLOSED: if the anchor run did not produce a usable result, every shape keeps the pre-check's own
-        // count, which is exactly yesterday's behaviour -- a failed anchor run must not invent per-shape
-        // numbers.
+        if (aOk2 && aRes2.st == VK_TUNE_PROBE_OK) {
+          decision->measurement.anchorRunHiUs.assign(aRes2.shape_anchor_us,
+                                                     aRes2.shape_anchor_us + aRes2.n_shape_anchor_us);
+        }
+        // Both points are the price of the stage that replaced the second grid: summed, because that is what the
+        // leg pays.
+        decision->measurement.anchorRunElapsedUs = aRes.elapsed_us + aRes2.elapsed_us;
+        // THE PER-SHAPE SOLVE, from each shape's OWN two in-regime points.  `block(s) = fixed + s*marginal`
+        // through `(s0, a1)` and `(2*s0, a2)`: `marginal = (a2 - a1)/s0` and `fixed = a1 - marginal*s0`, so
+        // reaching the target needs `s = (target - fixed)/marginal`.  🔴 The `- fixed` is load-bearing (dividing
+        // the target by the shape's AVERAGE per-shot cost subtracts the fixed cost twice and under-shoots by
+        // ~2.5%, and under-shooting is the direction that spends the fallback pass) -- but with TWO points the
+        // fixed term is no longer an assumption at all.
+        // FAIL-CLOSED: if either point is unusable, every shape keeps the pre-check's own count, which is
+        // exactly the pre-batch behaviour -- a failed anchor run must not invent per-shape numbers.
         std::vector<uint32_t> solvedShotsPerShape(coverage.size(), mp.shots);
-        if (aOk && aRes.st == VK_TUNE_PROBE_OK) {
+        if (aUsable) {
           const double targetUs = TuneStats::MIN_BLOCK_TIME_MS * 1000.0;
-          const double fixedUs = decision->precheckFixedUs;
-          const uint32_t shots0 = mp.shots > 0 ? mp.shots : 1u;
-          for (size_t sIdx = 0; sIdx < coverage.size() && sIdx < (size_t) aRes.n_shape_anchor_us; sIdx++) {
-            const double aUs = aRes.shape_anchor_us[sIdx];
-            const double marginalUs = (aUs - fixedUs) / (double) shots0;
-            if (aUs > 0.0 && marginalUs > 0.0) {
+          const double span = (double) shotsHi - (double) mp.shots;
+          const size_t nAnchor = std::min((size_t) aRes.n_shape_anchor_us, (size_t) aRes2.n_shape_anchor_us);
+          for (size_t sIdx = 0; sIdx < coverage.size() && sIdx < nAnchor; sIdx++) {
+            const double a1 = aRes.shape_anchor_us[sIdx];
+            const double a2 = aRes2.shape_anchor_us[sIdx];
+            const double marginalUs = (a2 - a1) / span;
+            if (a1 > 0.0 && a2 > 0.0 && marginalUs > 0.0) {
+              const double fixedUs = a1 - marginalUs * (double) mp.shots;
               double want = (targetUs - fixedUs) / marginalUs;
-              // 🔴 THE ONLY UPPER BOUND, and it is derived rather than picked: the `marginal_i` above comes
-              // from ONE secant, so a shape whose rate moved enough to need more than 4x the count that
-              // secant already reached is a shape the model cannot speak for -- the FALLBACK pass is the
-              // honest answer for it (it re-measures instead of trusting the model).  The registered open
-              // item "wantShots has no upper bound" covers the pre-check's inversion and this line alike.
-              if (want > 4.0 * (double) shots0) {
-                want = 4.0 * (double) shots0;
+              // 🔴 THE ONLY UPPER BOUND, and it is derived rather than picked: the two points span
+              // `[s0, 2*s0]`, so a shape whose solution lies beyond 4x the pre-check's count is outside what
+              // one secant pair can speak for -- the FALLBACK pass is the honest answer for it (it re-measures
+              // instead of trusting the model).  The registered open item "wantShots has no upper bound" covers
+              // the pre-check's inversion and this line alike.
+              if (want > 4.0 * (double) mp.shots) {
+                want = 4.0 * (double) mp.shots;
               }
               if (want < 1.0) {
                 want = 1.0;
@@ -5896,6 +5923,7 @@ namespace VulkanTuner {
             }
           }
         }
+        decision->measurement.solvedShotsByShape = solvedShotsPerShape;
         mp.shotsPerShape = solvedShotsPerShape.data();
         mp.nShotsPerShape = (uint32_t) solvedShotsPerShape.size();
         mp.seed = TuneStats::PROBE_ROTATION_SEED;
@@ -5936,7 +5964,15 @@ namespace VulkanTuner {
         // per-shape criterion -- so each shape gets ITS OWN ratio, computed from ITS OWN achieved block
         // (`shape_anchor_us[s]`, the same median the primitive divides by).  Handing the heaviest shape's
         // cost to the light ones would repeat the "one ruler for six shapes" mistake one layer down.
-        std::vector<uint32_t> shotsPerShape(coverage.size(), mp.shots);
+        // 🔴 (2026-10-05, batch 2b) ITS BASE IS THE SHAPE'S OWN COUNT, NOT `mp.shots`.  This vector used to be
+        // initialised from `mp.shots` -- the pre-check's ONE shared count -- while the grid had already run on
+        // the PER-SHAPE solved counts, so the correction's ratio was taken against a count the shape was never
+        // run at.  Measured consequence on the A30 leg: with the grid at solved counts (~250-290) and
+        // `mp.shots = 229`, the one short shape's ratio produced `want = 236` and the correction therefore
+        // LOWERED it -- the reported run then landed at [1799,1955,1590,1691,1672,1666], i.e. the rows would
+        // have been measured BELOW the declared floor.  A ratio that can shrink a short shape is not a
+        // correction; it starts from what the shape was actually given.
+        std::vector<uint32_t> shotsPerShape = solvedShotsPerShape;
         bool anyShapeShort = false;
         for (size_t sIdx = 0; sIdx < coverage.size() && sIdx < (size_t) mRes.n_shape_anchor_us; sIdx++) {
           const double aUs = mRes.shape_anchor_us[sIdx];
@@ -6288,7 +6324,28 @@ namespace VulkanTuner {
             anchorRunList += to_string((long) (decision->measurement.anchorRunUs[ai] + 0.5));
           }
           anchorRunList += "]";
+          string anchorHiList = "[";
+          for (size_t ai = 0; ai < decision->measurement.anchorRunHiUs.size(); ai++) {
+            if (ai != 0) {
+              anchorHiList += ",";
+            }
+            anchorHiList += to_string((long) (decision->measurement.anchorRunHiUs[ai] + 0.5));
+          }
+          anchorHiList += "]";
+          // The solve's OWN output, always: when the fallback fires, `shots_by_shape` is the CORRECTION's vector,
+          // so without this the solved counts would vanish exactly when something went wrong -- which is where
+          // batch 2's defect hid.
+          string solvedList = "[";
+          for (size_t si = 0; si < decision->measurement.solvedShotsByShape.size(); si++) {
+            if (si != 0) {
+              solvedList += ",";
+            }
+            solvedList += to_string((long) decision->measurement.solvedShotsByShape[si]);
+          }
+          solvedList += "]";
           mOs << " anchor_run_us=" << anchorRunList
+              << " anchor_run_hi_us=" << anchorHiList
+              << " solved_shots=" << solvedList
               << " anchor_run_elapsed_us=" << decision->measurement.anchorRunElapsedUs
               << " pass1_elapsed_us=" << decision->measurement.pass1ElapsedUs
               << " pass1_blocks=" << decision->measurement.pass1Blocks;

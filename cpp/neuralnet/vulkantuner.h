@@ -461,6 +461,17 @@ namespace VulkanTuner {
       // floor, and `anchorRunElapsedUs` prices the run that replaced the second grid.
       std::vector<double> anchorRunUs;
       uint64_t anchorRunElapsedUs = 0;
+      // (2026-10-05, batch 2b) THE ANCHOR RUN'S SECOND POINT, at twice the pre-check's count.  One point was
+      // not enough and the measurement said so: the block/shots relation is concave for the light shapes, so a
+      // marginal taken at `s0` under-states the cost at the count the shape actually needs and the solve
+      // overshoots (measured: pass 1 at 12.79 s with one shape +14.8%).  With this second point the target is
+      // INTERPOLATED per shape, so each shape's own fixed and marginal terms are measured rather than borrowed
+      // from the heaviest shape.
+      std::vector<double> anchorRunHiUs;
+      // (2026-10-05, batch 2b) THE SOLVE'S OWN OUTPUT.  It was readable only when the fallback did NOT fire
+      // (`shots_by_shape` is then the solved vector), which is exactly where the batch-2 defect hid: when the
+      // fallback fired, the reported per-shape counts were the CORRECTION's and the solved ones vanished.
+      std::vector<uint32_t> solvedShotsByShape;
       // (2026-10-05, batch 2) WHAT THE FALLBACK COST: the FIRST full-grid pass's own numbers.  The reported
       // `elapsedUs`/`blocks` describe the run the verdict came from, which is the SECOND pass whenever the
       // fallback fires -- so without these two, the price of the fallback could only be inferred (and it
