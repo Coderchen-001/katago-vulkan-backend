@@ -5809,6 +5809,15 @@ namespace VulkanTuner {
         const bool mOk = ::ggml_backend_vk_tune_probe_candidate(backend, rows.data(), rows.size(), &mp,
                                                                mSamples.data(), mSamples.size(), &mRes,
                                                                mErr, sizeof(mErr));
+        // 🔴 (2026-10-04) PASS 1 IS THE CORRECTION'S OWN INPUT, AND THE NEXT BLOCK OVERWRITES IT (`mRes =
+        // mRes2`).  Copying it here is what makes "which shape was short in pass 1, and by how much" a
+        // READING instead of a derivation: `anchor_us=` and `shots=[min,max]` on the measurement line are
+        // pass 2's, and the min/max pair does not say which shape got which count.  `shotsByShape` starts
+        // as "one count for every shape" (pass 1's); the correction's own vector replaces it below, at the
+        // one place where the corrected result actually becomes the reported one.
+        decision->measurement.anchorUsPass1.assign(mRes.shape_anchor_us,
+                                                   mRes.shape_anchor_us + mRes.n_shape_anchor_us);
+        decision->measurement.shotsByShape.assign(coverage.size(), mp.shots);
         // 🔴 (B-1) ONE CORRECTION STEP, FROM THE BLOCK THIS RUN ACTUALLY MEASURED.  The derivation above
         // is a FIRST GUESS: it fits `block(s) = fixed + s*marginal` from two short points, and that fit
         // overestimates the marginal cost at large `s` (measured: it asked for shots=142 and the run
@@ -5861,6 +5870,11 @@ namespace VulkanTuner {
           mp.nShotsPerShape = 0;
           if (corrOk && mRes2.st == VK_TUNE_PROBE_OK) {
             mRes = mRes2;   // the corrected run IS the measurement: the short one only calibrated the shots
+            // (2026-10-04) ... and the per-shape counts the READINGS describe are pass 2's, so they move at
+            // the same moment the measurement does.  Writing them anywhere else would reopen the gap this
+            // copy exists to close: "which run is the measurement" and "which counts the line reports" are
+            // one decision, not two.
+            decision->measurement.shotsByShape = shotsPerShape;
           }
         }
         decision->measurement.shapes = coverage;
@@ -6108,6 +6122,28 @@ namespace VulkanTuner {
           anchorList += "]";
           mOs << " anchor_us=" << anchorList << " n_anchor_us="
               << decision->measurement.anchorUs.size();
+          // (2026-10-04) THE TWO READINGS THAT MAKE PASS 1 AND THE PAIRING VISIBLE, in the same list idiom
+          // (bracketed, comma-separated, no spaces): pass 1's per-shape rulers -- the correction's own
+          // input -- and the per-shape counts the reported run used.  `anchor_pass1_us` is rounded to
+          // microseconds exactly like `anchor_us=`, so the two lists are literally comparable when the
+          // correction did not run (which is the invariant the smoke pins).
+          string pass1List = "[";
+          for (size_t ai = 0; ai < decision->measurement.anchorUsPass1.size(); ai++) {
+            if (ai != 0) {
+              pass1List += ",";
+            }
+            pass1List += to_string((long) (decision->measurement.anchorUsPass1[ai] + 0.5));
+          }
+          pass1List += "]";
+          string shotsByShapeList = "[";
+          for (size_t si = 0; si < decision->measurement.shotsByShape.size(); si++) {
+            if (si != 0) {
+              shotsByShapeList += ",";
+            }
+            shotsByShapeList += to_string((long) decision->measurement.shotsByShape[si]);
+          }
+          shotsByShapeList += "]";
+          mOs << " anchor_pass1_us=" << pass1List << " shots_by_shape=" << shotsByShapeList;
         }
         logLine(mOs.str());
       }

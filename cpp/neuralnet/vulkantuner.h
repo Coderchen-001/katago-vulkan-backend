@@ -444,6 +444,16 @@ namespace VulkanTuner {
       // bounded-tie rule are decided per shape from these, because one shared ruler was measured to be
       // wrong for six shapes at once.
       std::vector<double> anchorUs;
+      // (2026-10-04) THE TWO READINGS THAT MAKE THE CORRECTION'S OWN INPUT VISIBLE.  Every statement about
+      // "which shape fell short in pass 1, and by how much" used to be a DERIVATION, and one of them was
+      // nearly believed: the correction overwrites `mRes` (`mRes = mRes2`), so the printed `anchor_us=` is
+      // pass 2's, and `shots=[min,max]` does not say WHICH shape got which count.  `anchorUsPass1` is pass
+      // 1's per-shape ruler -- the trigger's own input -- and `shotsByShape` is the per-shape count the
+      // REPORTED run used (pass 2's vector when the correction ran, otherwise one count for every shape).
+      // Together they turn that pairing from an assumption into a reading.  Neither is read by any verdict
+      // or gate: they are printed on the measurement line, and that is their whole job.
+      std::vector<double> anchorUsPass1;
+      std::vector<uint32_t> shotsByShape;
       uint32_t samplesWritten = 0;
       uint32_t pairsIllegal = 0;
       uint32_t spikes = 0;
