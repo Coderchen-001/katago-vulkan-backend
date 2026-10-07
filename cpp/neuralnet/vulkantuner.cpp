@@ -1400,6 +1400,11 @@ namespace VulkanTuner {
         const uint32_t nShapes = (uint32_t) d.measurement.shapes.size();
         bool confirmed = d.measurement.ok && nShapes > 0 && backend != nullptr;
         uint32_t confPairs = 0;
+        // Q2 (2026-10-05): THE COUNT THE CONFIRMATION ACTUALLY USED, recorded OUTSIDE the per-shape loop
+        // because `cp` is scoped to one iteration -- the two NOTICEs below report this, so that what is printed
+        // is what was done (the decoupling made `cp.reps` differ from `PAIRS_FLOOR`, and a constant in these
+        // sentences would then have misreported the run in the durable record).
+        uint32_t confRepsUsed = 0;
         uint32_t confRejected = 0;
         for (uint32_t s = 0; s < nShapes && confirmed; s++) {
           const vk_tune_probe_shape & shape = d.measurement.shapes[s];
@@ -1440,6 +1445,7 @@ namespace VulkanTuner {
                        ? d.measurement.shotsByShape[s]
                        : d.precheckShots;
           cp.reps = (d.measurement.reps > 0) ? d.measurement.reps : (uint32_t) TuneStats::PAIRS_FLOOR;
+          confRepsUsed = cp.reps;
           cp.warmupBlocks = (uint32_t) TuneStats::WARMUP_BLOCKS;
           cp.reps = (uint32_t) TuneStats::PAIRS_FLOOR;   // the declared pair floor, reused (see above)
           cp.stallBlocks = (uint32_t) TuneStats::STALL_BLOCKS;
@@ -1496,7 +1502,7 @@ namespace VulkanTuner {
           d.outcome = "measured";
           logLine("NOTICE: " + d.deviceName + ": candidate " + to_string(j.winner) + " confirmed on fresh "
                   "blocks (" + to_string(confPairs) + " covered shape(s), R_confirm="
-                  + to_string((long) TuneStats::PAIRS_FLOOR) + "), so the row set is written");
+                  + to_string((long) confRepsUsed) + " (floor=" + to_string((long) TuneStats::PAIRS_FLOOR) + ")" + "), so the row set is written");
           return;
         }
         if (d.outcome == "running") {
@@ -1505,7 +1511,7 @@ namespace VulkanTuner {
         logLine("NOTICE: " + d.deviceName + ": candidate " + to_string(j.winner) + " is not worse than stock "
                 "on every covered shape, but the winner confirmation did NOT pass ("
                 + to_string(confRejected) + " of " + to_string(confPairs) + " shape(s) failed to re-confirm, "
-                  "R_confirm=" + to_string((long) TuneStats::PAIRS_FLOOR) + " blocks), so NO row set is "
+                  "R_confirm=" + to_string((long) confRepsUsed) + " (floor=" + to_string((long) TuneStats::PAIRS_FLOOR) + ")" + " blocks), so NO row set is "
                   "written: a winner selected on the same blocks cannot confirm itself, and a confirmation "
                   "that did not happen is not evidence of anything (A2: the `no-winner` class, never a "
                   "sticky negative entry)");
