@@ -166,7 +166,7 @@ namespace VulkanTuner {
     // `logs-t3/step0a/step0a-correction-off.md`): the verdicts do not degrade without it -- `verdicts=1`,
     // `ci_missing = ci_coarse = ci_wide = 0`, half-widths p50 3.49% -> 3.58%, p90 5.94% -> 5.62%, max
     // 7.65% -> 7.39%, `winner=-1` either way -- while each measuring leg costs 13.5 s instead of 24.9 s.
-    const int TUNER_POLICY_VERSION = 5;
+    const int TUNER_POLICY_VERSION = 6;
 
     // Which header keys are required depends on the CHANNEL, and the split follows what each
     // key GUARANTEES.  These two arrays are the single source of truth: the parser builds its
@@ -1425,7 +1425,21 @@ namespace VulkanTuner {
           cp.nShapes = 1;
           cp.objects = objs;
           cp.nObjects = 3;
-          cp.shots = d.precheckShots;
+          // 🔴 R_confirm DECOUPLED (2026-10-05): THE CONFIRMATION MUST NOT BE LESS PRECISE THAN THE MEASUREMENT
+          // IT CONFIRMS.  Both counts used to be pinned to the PRE-CHECK's (`d.precheckShots` and
+          // `PAIRS_FLOOR`), so as soon as the grid ran with more reps than the declared floor the
+          // confirmation's standard error was `sqrt(reps / PAIRS_FLOOR)` times the measurement's -- 2x at
+          // reps = 100 -- and a real winner could only ever confirm by luck.  Measured 2026-10-05: a winning
+          // margin of +0.71% (about HALF the confirmation's SE) failed re-confirmation, and the write gate then
+          // correctly refused the row set; the same run's other winner legs ended `unstable` for the same
+          // reason (the claim sat within one SE of the line).  So the fix is not "a bigger constant" but this
+          // RULE: same regime by default -- `reps` follows the measurement's own budget, and `shots` follows
+          // the winner's shape (the grid is per-shape now) -- and any downgrade must be declared.  This is the
+          // precondition for a reps-heavy regime to ever write a row set, which is exactly what Q2 selected.
+          cp.shots = (s < d.measurement.shotsByShape.size() && d.measurement.shotsByShape[s] > 0)
+                       ? d.measurement.shotsByShape[s]
+                       : d.precheckShots;
+          cp.reps = (d.measurement.reps > 0) ? d.measurement.reps : (uint32_t) TuneStats::PAIRS_FLOOR;
           cp.warmupBlocks = (uint32_t) TuneStats::WARMUP_BLOCKS;
           cp.reps = (uint32_t) TuneStats::PAIRS_FLOOR;   // the declared pair floor, reused (see above)
           cp.stallBlocks = (uint32_t) TuneStats::STALL_BLOCKS;
