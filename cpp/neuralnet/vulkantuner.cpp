@@ -1097,6 +1097,9 @@ namespace VulkanTuner {
       // Q2 (second half): the maximin candidate's own per-shape margins (declared here with the other locals;
       // the field it is copied into is `Judgement::bestShapeMargin`).
       std::vector<double> bestShapeMargin;
+      // ③a: every candidate's scalar, kept for the log (see the field's comment).
+      std::vector<double> candMarginsOut;
+      candMarginsOut.reserve((size_t) nCands);
       for (uint32_t c = 0; c < nCands; c++) {
         bool allShapes = true;
         bool anyUnstable = false;
@@ -1191,6 +1194,9 @@ namespace VulkanTuner {
             bestShapeMargin = candMargins;   // the argmax's OWN margins: where the best candidate falls short
           }
         }
+        // ③a: THIS candidate's scalar, in candidate order (the maximin's per-candidate form).  `-1e9` = it had no
+        // interval on some shape, so it could never have been the maximin.
+        candMarginsOut.push_back((candAllCiOk && candHaveMargin) ? candMinMargin : -1.0e9);
       }
       // (A6b, 2026-10-04) THE TWO ORDER STATISTICS, by NEAREST RANK: the smallest observation whose rank
       // reaches `p` -- no interpolation, no distributional assumption, and the same family as the rank tests
@@ -1211,6 +1217,7 @@ namespace VulkanTuner {
       j.bestMargin = bestMargin;
       j.bestMarginDefined = bestMarginDefined;
       j.bestShapeMargin = bestShapeMargin;
+      j.candMarginByCand = candMarginsOut;
     }
 
     // ── R-28 step (3): THE CANDIDATE-DROP ACCOUNTING AND THE THIRD BRANCH ─────────────────────────
@@ -1405,6 +1412,15 @@ namespace VulkanTuner {
         // is what was done (the decoupling made `cp.reps` differ from `PAIRS_FLOOR`, and a constant in these
         // sentences would then have misreported the run in the durable record).
         uint32_t confRepsUsed = 0;
+        // ③a: THE CONFIRMATION'S OWN EVIDENCE.  Until now only `R_confirm` was printed, so "the confirmation is
+        // as precise as the measurement it confirms" was an ASSUMPTION -- and the three candidate mechanisms for a
+        // refusal (the selection's max-bias, a different sigma in the 3-object regime, a differential drift
+        // between the two calls) could not be told apart.  The WORST bounds over the confirmed shapes are kept,
+        // because the worst shape is the one that decides, together with the `shots` actually used.
+        uint32_t confShotsUsed = 0;
+        double confCiLoWorst = 0.0;
+        double confCiHiWorst = 0.0;
+        bool confBoundsSeen = false;
         uint32_t confRejected = 0;
         for (uint32_t s = 0; s < nShapes && confirmed; s++) {
           const vk_tune_probe_shape & shape = d.measurement.shapes[s];
@@ -1479,6 +1495,12 @@ namespace VulkanTuner {
           }
           const TuneStats::PairedResult cr = TuneStats::pairedSignedRank(confSeries, TuneStats::ALPHA);
           confPairs++;
+          confShotsUsed = cp.shots;
+          if (cr.ciOk) {
+            if (!confBoundsSeen || cr.ciLow < confCiLoWorst) { confCiLoWorst = cr.ciLow; }
+            if (!confBoundsSeen || cr.ciHigh > confCiHiWorst) { confCiHiWorst = cr.ciHigh; }
+            confBoundsSeen = true;
+          }
           if (!cr.ciOk || !TuneStats::notWorseThan(cr, TuneStats::TOLERANCE)) {
             confRejected++;
             confirmed = false;   // this shape failed to re-confirm the winner
@@ -1502,7 +1524,10 @@ namespace VulkanTuner {
           d.outcome = "measured";
           logLine("NOTICE: " + d.deviceName + ": candidate " + to_string(j.winner) + " confirmed on fresh "
                   "blocks (" + to_string(confPairs) + " covered shape(s), R_confirm="
-                  + to_string((long) confRepsUsed) + " (floor=" + to_string((long) TuneStats::PAIRS_FLOOR) + ")" + "), so the row set is written");
+                  + to_string((long) confRepsUsed) + " (floor=" + to_string((long) TuneStats::PAIRS_FLOOR) + "),"
+                  + " shots=" + to_string(confShotsUsed) + " ci_low=" + to_string(confCiLoWorst)
+                  + " ci_high=" + to_string(confCiHiWorst)
+                  + "), so the row set is written");
           return;
         }
         if (d.outcome == "running") {
@@ -1511,7 +1536,9 @@ namespace VulkanTuner {
         logLine("NOTICE: " + d.deviceName + ": candidate " + to_string(j.winner) + " is not worse than stock "
                 "on every covered shape, but the winner confirmation did NOT pass ("
                 + to_string(confRejected) + " of " + to_string(confPairs) + " shape(s) failed to re-confirm, "
-                  "R_confirm=" + to_string((long) confRepsUsed) + " (floor=" + to_string((long) TuneStats::PAIRS_FLOOR) + ")" + " blocks), so NO row set is "
+                  "R_confirm=" + to_string((long) confRepsUsed) + " (floor=" + to_string((long) TuneStats::PAIRS_FLOOR) + ")"
+                  + ", shots=" + to_string(confShotsUsed) + ", ci_low=" + to_string(confCiLoWorst)
+                  + ", ci_high=" + to_string(confCiHiWorst) + " blocks), so NO row set is "
                   "written: a winner selected on the same blocks cannot confirm itself, and a confirmation "
                   "that did not happen is not evidence of anything (A2: the `no-winner` class, never a "
                   "sticky negative entry)");
@@ -6240,6 +6267,18 @@ namespace VulkanTuner {
           bestShapeMarginList += to_string(decision->judgement.bestShapeMargin[bm]);
         }
         bestShapeMarginList += "]";
+        // ③a: the per-candidate scalars, in candidate order (the maximin's per-candidate form).  A `-1e9` entry
+        // is a candidate that had no interval on some shape -- out of range on purpose, so it can never be read as
+        // a real (negative) maximin.  This is what a two-stage selection would rank by, and what lets a weighted
+        // aggregate verdict be previewed offline before anything is built on it.
+        string candMarginList = "[";
+        for (size_t cm = 0; cm < decision->judgement.candMarginByCand.size(); cm++) {
+          if (cm != 0) {
+            candMarginList += ",";
+          }
+          candMarginList += to_string(decision->judgement.candMarginByCand[cm]);
+        }
+        candMarginList += "]";
         jOs << "judge: attempted=" << (decision->judgement.attempted ? 1 : 0)
             << " gate_reject=" << (decision->judgement.gateRejected ? 1 : 0)
             << " gate_high=" << decision->judgement.gateHigh
@@ -6291,6 +6330,8 @@ namespace VulkanTuner {
             // Q2 (second half): the maximin candidate's OWN margins.  Empty when no candidate had intervals
             // everywhere (the fail-closed edge), and the shapes that are negative here are D''s targets.
             << " best_shape_margin=" << bestShapeMarginList
+            // ③a: one scalar per candidate, in candidate order (-1e9 = no interval on some shape).
+            << " cand_margin_by_cand=" << candMarginList
             // P3 (2026-10-01): the two numbers the recovery reads and the one it writes.  `band_max` is
             // the WIDEST observed band among the wide pairs (0 = none), `remeasure` is the budget the
             // second pass was given (0 = the intervals all formed on the first pass).  Both are readings

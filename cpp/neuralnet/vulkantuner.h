@@ -636,6 +636,13 @@ namespace VulkanTuner {
       // good everywhere, which is what a conjunction fails on.  D''-style allocation must feed the shapes that
       // are negative HERE, not the shape with the smallest `shapeMarginMax` (that shape is not the blocker).
       std::vector<double> bestShapeMargin;
+      // 🔴 ③a (2026-10-05) THE PER-CANDIDATE SCALAR, EXPORTED.  The judgement always computed a candidate's
+      // worst-shape margin (`candMinMargin`) but kept only the argmax (`bestMargin`), so the ranking a two-stage
+      // selection needs ("take the top k, re-measure them at another moment") could not be formed from the log at
+      // all -- nor could a weighted-aggregate verdict be previewed offline.  In candidate order; `-1e9` marks a
+      // candidate that had no interval on some shape (out of range on purpose, so a real maximin can never be
+      // confused with a missing one).  A READING: nothing gates on it.
+      std::vector<double> candMarginByCand;
     };
     Judgement judgement;
     // (7d): the branch selection runs ONCE per decision, like the pre-check, the measurement and the
