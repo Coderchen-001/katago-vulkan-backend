@@ -1421,6 +1421,17 @@ namespace VulkanTuner {
         double confCiLoWorst = 0.0;
         double confCiHiWorst = 0.0;
         bool confBoundsSeen = false;
+        // ③a' (2026-10-05): WHY IS THE CONFIRMATION 3-8x LESS PRECISE THAN THE SELECTION?  Measured: its SE is
+        // 0.98-2.82% while the selection's is ~0.33% at the same `reps` and shots -- so "same regime, same
+        // precision" is false, and every write is then refused arithmetically (`z*SE_confirm` alone exceeds
+        // `point + tol`).  First suspect: the confirmation's EFFECTIVE sample count is far below `cp.reps` (a
+        // 3-object call may return far fewer finite paired differences, or the primitive may clamp).  These three
+        // readings settle it: the SMALLEST finite count over the shapes (the decisive one), plus the primitive's
+        // own totals.
+        uint32_t confNEffMin = 0;
+        bool confNEffSeen = false;
+        uint64_t confBlocksSum = 0;
+        uint64_t confSamplesSum = 0;
         uint32_t confRejected = 0;
         for (uint32_t s = 0; s < nShapes && confirmed; s++) {
           const vk_tune_probe_shape & shape = d.measurement.shapes[s];
@@ -1496,6 +1507,12 @@ namespace VulkanTuner {
           const TuneStats::PairedResult cr = TuneStats::pairedSignedRank(confSeries, TuneStats::ALPHA);
           confPairs++;
           confShotsUsed = cp.shots;
+          {
+            const uint32_t nEff = (uint32_t) confSeries.size();
+            if (!confNEffSeen || nEff < confNEffMin) { confNEffMin = nEff; confNEffSeen = true; }
+            confBlocksSum += (uint64_t) cres.blocks;
+            confSamplesSum += (uint64_t) cres.samples;
+          }
           if (cr.ciOk) {
             if (!confBoundsSeen || cr.ciLow < confCiLoWorst) { confCiLoWorst = cr.ciLow; }
             if (!confBoundsSeen || cr.ciHigh > confCiHiWorst) { confCiHiWorst = cr.ciHigh; }
@@ -1527,6 +1544,8 @@ namespace VulkanTuner {
                   + to_string((long) confRepsUsed) + " (floor=" + to_string((long) TuneStats::PAIRS_FLOOR) + "),"
                   + " shots=" + to_string(confShotsUsed) + " ci_low=" + to_string(confCiLoWorst)
                   + " ci_high=" + to_string(confCiHiWorst)
+                  + " n_eff=" + to_string(confNEffMin) + " conf_blocks=" + to_string(confBlocksSum)
+                  + " conf_samples=" + to_string(confSamplesSum)
                   + "), so the row set is written");
           return;
         }
@@ -1539,6 +1558,8 @@ namespace VulkanTuner {
                   "R_confirm=" + to_string((long) confRepsUsed) + " (floor=" + to_string((long) TuneStats::PAIRS_FLOOR) + ")"
                   + ", shots=" + to_string(confShotsUsed) + ", ci_low=" + to_string(confCiLoWorst)
                   + ", ci_high=" + to_string(confCiHiWorst) + " blocks), so NO row set is "
+                  + "n_eff=" + to_string(confNEffMin) + " conf_blocks=" + to_string(confBlocksSum)
+                  + " conf_samples=" + to_string(confSamplesSum) + " "
                   "written: a winner selected on the same blocks cannot confirm itself, and a confirmation "
                   "that did not happen is not evidence of anything (A2: the `no-winner` class, never a "
                   "sticky negative entry)");
