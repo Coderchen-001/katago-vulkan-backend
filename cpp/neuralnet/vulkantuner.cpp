@@ -1432,6 +1432,12 @@ namespace VulkanTuner {
         bool confNEffSeen = false;
         uint64_t confBlocksSum = 0;
         uint64_t confSamplesSum = 0;
+        // A2 (2026-10-11): THE ACCOUNTING SELF-CHECK, riding the two NOTICEs (no new counted line).
+        // `conf_blocks` must be an exact multiple of (nObjects * reps actually asked for): the primitive
+        // reports one block per object per rep, so a mismatch means the shell asked for one budget and the
+        // primitive ran another -- exactly the defect A1 removed, and one that must never come back silently.
+        uint32_t confRepsAsked = 0;
+        uint32_t confObjsUsed = 0;
         uint32_t confRejected = 0;
         for (uint32_t s = 0; s < nShapes && confirmed; s++) {
           const vk_tune_probe_shape & shape = d.measurement.shapes[s];
@@ -1474,7 +1480,13 @@ namespace VulkanTuner {
           cp.reps = (d.measurement.reps > 0) ? d.measurement.reps : (uint32_t) TuneStats::PAIRS_FLOOR;
           confRepsUsed = cp.reps;
           cp.warmupBlocks = (uint32_t) TuneStats::WARMUP_BLOCKS;
-          cp.reps = (uint32_t) TuneStats::PAIRS_FLOOR;   // the declared pair floor, reused (see above)
+          // 🔴 A1 (2026-10-11) DO NOT RE-ADD A `cp.reps = PAIRS_FLOOR` LINE AT THIS SPOT.  One stood exactly
+          // here until today and UNCONDITIONALLY OVERWROTE the decoupled value computed three lines above, so
+          // the confirmation ran at 25 reps while `confRepsUsed` -- and therefore the printed `R_confirm=` --
+          // reported the requested 660.  Measured consequence: the confirmation's SE came out 3-8x the
+          // selection's (`conf_blocks=75=3*25` where 660 had been asked for), which is the arithmetic reason
+          // every heavy-arm run refused to write.  Lesson: a printed value agreeing with the intent is NOT
+          // evidence that the intent was executed; what caught this was the confirmation's own sample count.
           cp.stallBlocks = (uint32_t) TuneStats::STALL_BLOCKS;
           cp.coverageComplete = d.coverageComplete;
           cp.shotsPerShape = nullptr;
@@ -1512,6 +1524,8 @@ namespace VulkanTuner {
             if (!confNEffSeen || nEff < confNEffMin) { confNEffMin = nEff; confNEffSeen = true; }
             confBlocksSum += (uint64_t) cres.blocks;
             confSamplesSum += (uint64_t) cres.samples;
+            confRepsAsked = cp.reps;
+            confObjsUsed = cp.nObjects;
           }
           if (cr.ciOk) {
             if (!confBoundsSeen || cr.ciLow < confCiLoWorst) { confCiLoWorst = cr.ciLow; }
@@ -1546,6 +1560,8 @@ namespace VulkanTuner {
                   + " ci_high=" + to_string(confCiHiWorst)
                   + " n_eff=" + to_string(confNEffMin) + " conf_blocks=" + to_string(confBlocksSum)
                   + " conf_samples=" + to_string(confSamplesSum)
+                  + " reps_accounting_ok=" + to_string((confObjsUsed > 0 && confRepsAsked > 0
+                        && (confBlocksSum % ((uint64_t) confObjsUsed * (uint64_t) confRepsAsked)) == 0) ? 1 : 0)
                   + "), so the row set is written");
           return;
         }
@@ -1559,7 +1575,10 @@ namespace VulkanTuner {
                   + ", shots=" + to_string(confShotsUsed) + ", ci_low=" + to_string(confCiLoWorst)
                   + ", ci_high=" + to_string(confCiHiWorst) + " blocks), so NO row set is "
                   + "n_eff=" + to_string(confNEffMin) + " conf_blocks=" + to_string(confBlocksSum)
-                  + " conf_samples=" + to_string(confSamplesSum) + " "
+                  + " conf_samples=" + to_string(confSamplesSum)
+                  + " reps_accounting_ok=" + to_string((confObjsUsed > 0 && confRepsAsked > 0
+                        && (confBlocksSum % ((uint64_t) confObjsUsed * (uint64_t) confRepsAsked)) == 0) ? 1 : 0)
+                  + " "
                   "written: a winner selected on the same blocks cannot confirm itself, and a confirmation "
                   "that did not happen is not evidence of anything (A2: the `no-winner` class, never a "
                   "sticky negative entry)");
