@@ -6393,6 +6393,43 @@ namespace VulkanTuner {
         scoreMaxList += "]";
         scoreWinnerList += "]";
         scoreMedianList += "]";
+        // R1b-2a (2026-10-12): THE TOURNAMENT SCHEDULE, DERIVED -- NEVER FIXED.  This batch adds no call and
+        // changes no verdict; it makes the schedule ARITHMETIC visible so the multi-call driver (R1b-2b) has
+        // something to be checked against.
+        //   * the PRE-SCREEN's pass count comes from two MEASURED quantities: the single-pass standard error
+        //     (`ci_halfwidth_max / 1.96`, an existing reading) and the separation actually observed on the
+        //     HARDEST shape (`max score_max_by_shape` = how far that shape's champion stands above its own
+        //     candidate median).  The target is a third of that separation, so `passes = (SE/target)^2`
+        //     (integer arithmetic), floored at 1.  On this device it comes out at 4 -- but 4 is the ANSWER
+        //     here, not a constant: a pool of hundreds of candidates, or a quieter machine, moves it.
+        //   * the ROUNDS then narrow by `f = 1/3` and DOUBLE their passes, which is the measured optimum
+        //     (f = 1/2 costs 2.8x more for the same endpoint).
+        double sepMax = 0.0;
+        for (size_t sp = 0; sp < decision->judgement.scoreMaxByShape.size(); sp++) {
+          if (decision->judgement.scoreMaxByShape[sp] > sepMax) {
+            sepMax = decision->judgement.scoreMaxByShape[sp];
+          }
+        }
+        const double se1 = decision->judgement.ciHalfWidthMax / 1.96;
+        uint32_t prePasses = 4;
+        if (se1 > 0.0 && sepMax > 0.0) {
+          const double ratio = 9.0 * se1 * se1 / (sepMax * sepMax);   // = (SE / (sep/3))^2
+          prePasses = (uint32_t) ratio;
+          if (prePasses < 1) {
+            prePasses = 1;
+          }
+        }
+        string planStr = "pre=" + to_string((long) prePasses) + "x" + to_string((long) decision->candidateGeoms.size());
+        uint32_t keptPlan = (uint32_t) decision->candidateGeoms.size();
+        uint32_t passPlan = prePasses;
+        while (keptPlan > 1) {
+          keptPlan = keptPlan / 3;
+          if (keptPlan < 1) {
+            keptPlan = 1;
+          }
+          passPlan = passPlan * 2;
+          planStr += ";r=" + to_string((long) keptPlan) + "x" + to_string((long) passPlan);
+        }
         jOs << "judge: attempted=" << (decision->judgement.attempted ? 1 : 0)
             << " gate_reject=" << (decision->judgement.gateRejected ? 1 : 0)
             << " gate_high=" << decision->judgement.gateHigh
@@ -6450,6 +6487,8 @@ namespace VulkanTuner {
             << " score_max_by_shape=" << scoreMaxList
             << " score_winner_by_shape=" << scoreWinnerList
             << " score_median_by_shape=" << scoreMedianList
+            // R1b-2a: the DERIVED tournament schedule (pre-screen passes + the narrowing rounds).  A READING.
+            << " tournament_plan=" << planStr
             // P3 (2026-10-01): the two numbers the recovery reads and the one it writes.  `band_max` is
             // the WIDEST observed band among the wide pairs (0 = none), `remeasure` is the budget the
             // second pass was given (0 = the intervals all formed on the first pass).  Both are readings
