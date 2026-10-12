@@ -21804,6 +21804,12 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
             key_only.src0_type = (ggml_type) cands[obj.rowIndex].src0_type;
             key_only.src1_type = (ggml_type) cands[obj.rowIndex].src1_type;
             key_only.key_m = cands[obj.rowIndex].key_m;
+            key_only.key_n = cands[obj.rowIndex].key_n;   // R1a: WITHOUT THIS the runtime row's key_n stays 0,
+                                                          // the (m,n,k) match fails for EVERY candidate, and the
+                                                          // measurement measures nothing (measured: pairs=0/0,
+                                                          // pairs_illegal=1296) -- the fourth instance of
+                                                          // "a field became load-bearing, so every producer AND
+                                                          // every field-by-field copy must be audited".
             key_only.key_k = cands[obj.rowIndex].key_k;
             if (ggml_vk_tuned_row_matches(key_only, m, params->shapes[s].n, k)) {
                 pair_legal[(size_t) s * params->nObjects + o] = 1;

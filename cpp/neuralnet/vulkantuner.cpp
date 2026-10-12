@@ -4681,6 +4681,7 @@ namespace VulkanTuner {
     refCand.src1_type = 1;
     refCand.key_m = 192;
     refCand.key_k = 512;
+    refCand.key_n = 768;
     vk_tune_probe_params base {};
     base.shapes = &shape;
     base.nShapes = 1;
