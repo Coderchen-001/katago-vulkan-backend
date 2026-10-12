@@ -643,6 +643,17 @@ namespace VulkanTuner {
       // candidate that had no interval on some shape (out of range on purpose, so a real maximin can never be
       // confused with a missing one).  A READING: nothing gates on it.
       std::vector<double> candMarginByCand;
+      // 🔴 R1b-1 (2026-10-12) THE PER-GEMM TOURNAMENT SCORE, AS A READING (behaviour-neutral).
+      // The tournament compares candidates WITHIN one GEMM by `score_c = hl_c - median_{c'}(hl_c')`, where
+      // `hl` is the paired point estimate of the relative time difference (larger = faster).  Centring on the
+      // shape's OWN median is what makes the comparison fair under a drifting machine WITHOUT a stock arm:
+      // a pass-level shift moves every candidate of that shape by the same amount and cancels.  Per shape
+      // these report the winning candidate's centred score, WHICH candidate that was, and the shape's median
+      // `hl`.  Nothing gates on them: R1b-1 only makes the tournament's ranking a READING, so that "would the
+      // tournament pick the same winner?" is measured before R1b-3 switches any verdict.
+      std::vector<double> scoreMaxByShape;
+      std::vector<int32_t> scoreWinnerByShape;
+      std::vector<double> scoreMedianByShape;
     };
     Judgement judgement;
     // (7d): the branch selection runs ONCE per decision, like the pre-check, the measurement and the

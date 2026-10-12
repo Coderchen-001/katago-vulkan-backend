@@ -1092,6 +1092,10 @@ namespace VulkanTuner {
       // real one, and neither reading is a gate); a candidate missing an interval cannot be the maximin's
       // argmax, the same "no interval, no claim" rule `notWorseThan` already states.
       std::vector<double> shapeMarginMax((size_t) nShapes, -1.0);
+      // R1b-1: the tournament's own quantity, collected WITHOUT changing a single verdict.  Shape-major (the
+      // same layout the measurement builds rows in), NaN where a candidate had no interval -- so the median
+      // and the argmax below see only real estimates and a missing one can never be read as a slow candidate.
+      std::vector<std::vector<double>> hlByShape((size_t) nShapes, std::vector<double>((size_t) nCands, std::numeric_limits<double>::quiet_NaN()));
       std::vector<uint32_t> notWorseByShape((size_t) nShapes, 0u);
       double bestMargin = 0.0;
       bool bestMarginDefined = false;
@@ -1135,6 +1139,7 @@ namespace VulkanTuner {
           // never enter it by accident.  No threshold, no branch: it is a reading.
           const double marginHere = r.ciOk ? (r.ciLow + TuneStats::TOLERANCE) : 0.0;
           if (r.ciOk) {
+            hlByShape[s][c] = r.hl;   // R1b-1: the point estimate the tournament ranks by (a READING)
             const double halfWidth = 0.5 * (r.ciHigh - r.ciLow);
             if (halfWidth > j.ciHalfWidthMax) {
               j.ciHalfWidthMax = halfWidth;
@@ -1217,6 +1222,45 @@ namespace VulkanTuner {
       j.notWorseByShape = notWorseByShape;
       j.bestMargin = bestMargin;
       j.bestMarginDefined = bestMarginDefined;
+      // 🔴 R1b-1 (2026-10-12): THE PER-GEMM TOURNAMENT SCORE, AS A READING -- no verdict, no branch, no write
+      // changes here.  For each shape: the median of the candidates' point estimates is a FREE common
+      // reference (a pass-level shift moves every candidate equally, so it cancels without a stock arm), and
+      // each candidate's score is its distance above that median.  The winner is the argmax, and because the
+      // reference is the shape's own median, this is the quantity the tournament will rank by in R1b-2/3.
+      // A candidate whose interval never formed is ABSENT (NaN), never "slow": missing data must not be free
+      // to become a verdict -- the same rule the branches above already answer for.
+      j.scoreMaxByShape.assign((size_t) nShapes, 0.0);
+      j.scoreWinnerByShape.assign((size_t) nShapes, -1);
+      j.scoreMedianByShape.assign((size_t) nShapes, 0.0);
+      for (uint32_t s = 0; s < nShapes; s++) {
+        std::vector<double> here;
+        for (uint32_t c = 0; c < nCands; c++) {
+          const double v = hlByShape[s][c];
+          if (v == v) {   // `v == v` is false exactly for NaN, without pulling in <cmath>
+            here.push_back(v);
+          }
+        }
+        if (here.empty()) {
+          continue;   // no estimate on this shape: report nothing rather than a zero (which would read as "on par")
+        }
+        std::sort(here.begin(), here.end());
+        const double med = here[here.size() / 2];   // nearest-rank median: the family the rank tests use
+        j.scoreMedianByShape[s] = med;
+        double bestScore = -1.0e300;
+        int bestCand = -1;
+        for (uint32_t c = 0; c < nCands; c++) {
+          const double v = hlByShape[s][c];
+          if (v != v) {
+            continue;
+          }
+          if (v - med > bestScore) {
+            bestScore = v - med;
+            bestCand = (int) c;
+          }
+        }
+        j.scoreWinnerByShape[s] = bestCand;
+        j.scoreMaxByShape[s] = bestScore;
+      }
       j.bestShapeMargin = bestShapeMargin;
       j.candMarginByCand = candMarginsOut;
     }
@@ -6328,6 +6372,27 @@ namespace VulkanTuner {
           candMarginList += to_string(decision->judgement.candMarginByCand[cm]);
         }
         candMarginList += "]";
+        // R1b-1: the per-GEMM tournament reading, shape-major.  `score_max_by_shape` is the winning
+        // candidate's distance above that shape's median point estimate, `score_winner_by_shape` says WHICH
+        // candidate that was (candidate order, the same indices `cand_margin_by_cand` uses), and
+        // `score_median_by_shape` prints the free common reference itself so the score can be recomputed by
+        // hand from the raw `hl` values.  All three are readings: R1b-3 is the batch that acts on them.
+        string scoreMaxList = "[";
+        string scoreWinnerList = "[";
+        string scoreMedianList = "[";
+        for (size_t sm = 0; sm < decision->judgement.scoreMaxByShape.size(); sm++) {
+          if (sm != 0) {
+            scoreMaxList += ",";
+            scoreWinnerList += ",";
+            scoreMedianList += ",";
+          }
+          scoreMaxList += to_string(decision->judgement.scoreMaxByShape[sm]);
+          scoreWinnerList += to_string((long) decision->judgement.scoreWinnerByShape[sm]);
+          scoreMedianList += to_string(decision->judgement.scoreMedianByShape[sm]);
+        }
+        scoreMaxList += "]";
+        scoreWinnerList += "]";
+        scoreMedianList += "]";
         jOs << "judge: attempted=" << (decision->judgement.attempted ? 1 : 0)
             << " gate_reject=" << (decision->judgement.gateRejected ? 1 : 0)
             << " gate_high=" << decision->judgement.gateHigh
@@ -6381,6 +6446,10 @@ namespace VulkanTuner {
             << " best_shape_margin=" << bestShapeMarginList
             // ③a: one scalar per candidate, in candidate order (-1e9 = no interval on some shape).
             << " cand_margin_by_cand=" << candMarginList
+            // 🔴 R1b-1: the per-GEMM tournament score, as a READING (nothing gates on it).
+            << " score_max_by_shape=" << scoreMaxList
+            << " score_winner_by_shape=" << scoreWinnerList
+            << " score_median_by_shape=" << scoreMedianList
             // P3 (2026-10-01): the two numbers the recovery reads and the one it writes.  `band_max` is
             // the WIDEST observed band among the wide pairs (0 = none), `remeasure` is the budget the
             // second pass was given (0 = the intervals all formed on the first pass).  Both are readings
