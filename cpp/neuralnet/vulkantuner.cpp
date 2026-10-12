@@ -73,10 +73,11 @@ namespace VulkanTuner {
     // migration and none is needed: no production cache file existed before this (EXPORT was
     // the only writer and only tests asked for it).  A VERSION 1 file is refused loudly,
     // which is right for a file whose rows were not keyed to the name they live under.
-    const int SCHEMA_VERSION = 6;   // was 5: the WIRE SEGMENT itself went away -- there is no `NEGATIVE`
-                                    // line any more, so a cache file holds exactly one form: `ROWS n`
-                                    // plus its ROW lines.  This is the SAME AXIS as 4 -> 5, which this
-                                    // file's own record says was "the NEGATIVE LINE gained a required
+    const int SCHEMA_VERSION = 7;   // was 6: `key_n` joins the row's IDENTITY (R1a), so an OLD file would let
+                                    // ONE row serve two different `n` silently -- old files are refused by value.
+                                    // (5 -> 6, the earlier bump: the WIRE SEGMENT went away, so a cache file holds
+                                    // exactly one form: `ROWS n` plus its ROW lines.)  This is the SAME AXIS as
+                                    // 4 -> 5, which this file's own record says was "the NEGATIVE LINE gained a required
                                     // SCOPE token": both bumps change the SHAPE of a line on the wire,
                                     // not the required header-key set.  The consequence is the intended
                                     // one: an old file carrying a `NEGATIVE` line now falls into the
@@ -112,7 +113,7 @@ namespace VulkanTuner {
     // the same leg, `..._cm2_tuned_row` (aligned=0 align=1) and `..._cm2_tuned_row_aligned` (aligned=1).
     // `TUNER_VERSION` sits in `REQUIRED_FOR_CACHE` and is compared by VALUE (`:5004`), so raising it
     // invalidates every older file structurally -- which is the point, not a side effect.
-    const int TUNER_VERSION = 4;
+    const int TUNER_VERSION = 5;
 
     // The policy baseline counter (t1-schema.md section 4, "baselineVersion").
     //
@@ -1446,6 +1447,7 @@ namespace VulkanTuner {
           row.src1_type = d.candidateRowSrc1;
           row.key_m = shape.m;
           row.key_k = shape.k;
+          row.key_n = shape.n;
           row.path = d.candidatePath;
           row.geom = d.candidateGeoms[(size_t) j.winner];
           vk_tune_probe_object objs[3];
@@ -1548,6 +1550,7 @@ namespace VulkanTuner {
             row.src1_type = d.candidateRowSrc1;
             row.key_m = d.measurement.shapes[s].m;
             row.key_k = d.measurement.shapes[s].k;
+            row.key_n = d.measurement.shapes[s].n;
             row.path = d.candidatePath;
             row.geom = d.candidateGeoms[(size_t) j.winner];
             d.rows.push_back(row);
@@ -2605,6 +2608,7 @@ namespace VulkanTuner {
         feed((uint32_t) r.src0_type);
         feed((uint32_t) r.src1_type);
         feed(r.key_m);
+        feed(r.key_n);
         feed(r.key_k);
         feed(r.geom.BM); feed(r.geom.BN); feed(r.geom.BK);
         feed(r.geom.WM); feed(r.geom.WN); feed(r.geom.WMITER);
@@ -2793,16 +2797,16 @@ namespace VulkanTuner {
     bool parseRowLine(const string& rest, size_t lineNo, uint32_t deviceSubgroupSize, vk_tune_row_spec& out, string& err) {
       istringstream is(rest);
       int src0 = 0, src1 = 0, path = 0;
-      long long keyM = 0, keyK = 0;
+      long long keyM = 0, keyN = 0, keyK = 0;
       long long g[12] = {0};
       string pathToken;
-      if (!(is >> pathToken >> src0 >> src1 >> keyM >> keyK)) {
-        err = "ROW line " + to_string(lineNo) + ": expected <path> <src0> <src1> <key_m> <key_k>";
+      if (!(is >> pathToken >> src0 >> src1 >> keyM >> keyN >> keyK)) {
+        err = "ROW line " + to_string(lineNo) + ": expected <path> <src0> <src1> <key_m> <key_n> <key_k>";
         return false;
       }
       for (int i = 0; i < 12; i++) {
         if (!(is >> g[i])) {
-          err = "ROW line " + to_string(lineNo) + ": expected 12 geometry fields after key_k";
+          err = "ROW line " + to_string(lineNo) + ": expected 12 geometry fields after key_n";
           return false;
         }
       }
@@ -2831,13 +2835,14 @@ namespace VulkanTuner {
         err = "ROW line " + to_string(lineNo) + ": unknown path '" + pathToken + "'";
         return false;
       }
-      if (keyM < 0 || keyK < 0) {
-        err = "ROW line " + to_string(lineNo) + ": key_m/key_k must be >= 0 (0 = whole slot)";
+      if (keyM < 0 || keyN < 0 || keyK < 0) {
+        err = "ROW line " + to_string(lineNo) + ": key_m/key_n/key_k must be >= 0 (0 = whole slot)";
         return false;
       }
       out.src0_type = src0;
       out.src1_type = src1;
       out.key_m = (uint32_t) keyM;
+      out.key_n = (uint32_t) keyN;
       out.key_k = (uint32_t) keyK;
       out.path = path;
       out.geom.BM = (uint32_t) g[0];
@@ -3082,7 +3087,7 @@ namespace VulkanTuner {
       os << "ROWS " << rows.size() << "\n";
       for (const vk_tune_row_spec& r : rows) {
         os << "ROW " << r.path << " " << r.src0_type << " " << r.src1_type
-           << " " << r.key_m << " " << r.key_k
+           << " " << r.key_m << " " << r.key_n << " " << r.key_k
            << " " << r.geom.BM << " " << r.geom.BN << " " << r.geom.BK
            << " " << r.geom.WM << " " << r.geom.WN << " " << r.geom.WMITER
            << " " << r.geom.TM << " " << r.geom.TN << " " << r.geom.BS
@@ -3382,11 +3387,11 @@ namespace VulkanTuner {
     // INDEPENDENT implementation (python, logs-t3/1b2b/r0-*), never from this function:
     //   empty row set (the four zero bytes of the row count) -> basis * prime^4 mod 2^64
     //                                                        = 0x4d25767f9dce13f5
-    //   one legal row (count + 17 fields = 18 feeds)          = 0xe3cde8d1133b7112
+    //   one legal row (count + 18 fields = 19 feeds)          = 0x611c0f4bc5cc0463
     // The empty vector alone does NOT pin the protocol: four zero bytes leave the digest
     // insensitive to the xor order, the byte order and the field order.  Sensitivity proof --
     // both values DIFFER from the expected one, so a weakened vector cannot pass by accident:
-    //   swap two field positions -> 0x12b27bd83877cd52 ;  feed the bytes big-endian -> 0x85f45fe6df78624c
+    //   swap two field positions -> 0x5ee1b16115201363 (key_m <-> key_k) ;  feed the bytes big-endian -> 0xe82b99d6810a524b
     // LITERAL DISCIPLINE (t1-schema.md 1.3): these two literals may only come from the
     // independent implementation.  REFERENCE them; never recompute them in place and never edit
     // them to match a red leg -- "make the literal agree with the code" is the ONE way this
@@ -3398,6 +3403,7 @@ namespace VulkanTuner {
       v.src1_type = 1;   // f16
       v.key_m = 192;
       v.key_k = 512;
+      v.key_n = 768;
       v.geom.BM = 128; v.geom.BN = 128; v.geom.BK = 32;
       v.geom.WM = 32;  v.geom.WN = 64;  v.geom.WMITER = 2;
       v.geom.TM = 2;   v.geom.TN = 2;   v.geom.BS = 256;
@@ -3425,7 +3431,7 @@ namespace VulkanTuner {
       const string gotEmpty = rowSetHash(vector<vk_tune_row_spec>());
       const string gotOne   = rowSetHash(vector<vk_tune_row_spec>{ v });
       const string wantEmpty = "4d25767f9dce13f5";
-      const string wantOne   = "e3cde8d1133b7112";
+      const string wantOne   = "611c0f4bc5cc0463";
       if (why != nullptr || why64no == nullptr || why64ok != nullptr || why32no == nullptr
           || gotEmpty != wantEmpty || gotOne != wantOne) {
         ok = false;
@@ -3547,6 +3553,7 @@ namespace VulkanTuner {
           r.src1_type = 0;
           r.key_m = 0;
           r.key_k = 0;
+          r.key_n = 0;
           r.geom.BM = 64;
           r.geom.BN = 64;
           r.geom.BK = 0;
@@ -3715,7 +3722,7 @@ namespace VulkanTuner {
           firstBad = string("predicate with wave=0 said ") + (r0 == nullptr ? "LEGAL (BUG)" : r0);
       }
       RowsFile rf0; string err0;
-      const bool parsed0 = parseRowsFile("ROW scalar 1 1 0 0 32 32 32 0 0 0 0 0 0 0 0 0\n", 0, rf0, err0);
+      const bool parsed0 = parseRowsFile("ROW scalar 1 1 0 0 0 32 32 32 0 0 0 0 0 0 0 0 0\n", 0, rf0, err0);
       if(parsed0 || !rf0.rows.empty()) {
         ok = false;
         if(firstBad.empty())
@@ -4308,7 +4315,7 @@ namespace VulkanTuner {
             const vk_tune_row_spec & exp = want[i];
             caseNRows = got.path == exp.path && got.src0_type == exp.src0_type
                      && got.src1_type == exp.src1_type && got.key_m == exp.key_m
-                     && got.key_k == exp.key_k
+                     && got.key_k == exp.key_k && got.key_n == exp.key_n
                      && got.geom.BM == exp.geom.BM && got.geom.BN == exp.geom.BN
                      && got.geom.BK == exp.geom.BK && got.geom.WM == exp.geom.WM
                      && got.geom.WN == exp.geom.WN && got.geom.WMITER == exp.geom.WMITER
@@ -5931,6 +5938,7 @@ namespace VulkanTuner {
             row.src1_type = decision->candidateRowSrc1;
             row.key_m = coverage[s].m;
             row.key_k = coverage[s].k;
+            row.key_n = coverage[s].n;
             row.path = decision->candidatePath;
             row.geom = decision->candidateGeoms[c];
             rows.push_back(row);

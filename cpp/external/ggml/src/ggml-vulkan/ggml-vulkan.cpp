@@ -275,6 +275,7 @@ struct vk_tuned_row {
     ggml_type    src1_type = GGML_TYPE_COUNT;
     uint32_t     key_m = 0;                    // routing key; 0 = applies to the whole slot (v1)
     uint32_t     key_k = 0;
+    uint32_t     key_n = 0;                    // R1a: the GEMM's n, part of the row's IDENTITY
     vk_pipeline  unaligned;
     vk_pipeline  aligned;
 };
@@ -283,15 +284,17 @@ struct vk_tuned_row {
 //   key_m == 0 -> whole-slot row, applies to every shape of this (family, acc)
 //   k == 0     -> the caller does not know k, so NO keyed row may match (falling back
 //                 to stock beats matching with a wrong key)
-//   otherwise  -> exact (m, k) match
-static inline bool ggml_vk_tuned_row_matches(const vk_tuned_row & row, uint32_t m, uint32_t k) {
+//   n == 0     -> same rule for n (R1a): a caller that does not know n must not be served
+//                 a keyed row, because n now decides which geometry is optimal
+//   otherwise  -> exact (m, n, k) match
+static inline bool ggml_vk_tuned_row_matches(const vk_tuned_row & row, uint32_t m, uint32_t n, uint32_t k) {
     if (row.key_m == 0) {
         return true;
     }
-    if (k == 0) {
+    if (k == 0 || n == 0) {
         return false;
     }
-    return row.key_m == m && row.key_k == k;
+    return row.key_m == m && row.key_n == n && row.key_k == k;
 }
 
 // Which of a row's two pipelines may serve this call.  THIS IS THE P1 RULE
@@ -340,7 +343,7 @@ struct vk_tuned_row_table {
     }
 
     // Query.  Freezes the table (first query = the commit point).
-    const vk_tuned_row * lookup(const vk_matmul_pipeline_struct * target, uint32_t m, uint32_t k) {
+    const vk_tuned_row * lookup(const vk_matmul_pipeline_struct * target, uint32_t m, uint32_t n, uint32_t k) {
         frozen = true;   // the caller logs the freeze on the production path (see
                          // ggml_vk_guess_matmul_pipeline); the self-test's local table
                          // must not print evidence lines.
@@ -349,7 +352,7 @@ struct vk_tuned_row_table {
             return nullptr;
         }
         for (const vk_tuned_row & row : it->second) {
-            if (ggml_vk_tuned_row_matches(row, m, k)) {
+            if (ggml_vk_tuned_row_matches(row, m, n, k)) {
                 return &row;
             }
         }
@@ -10052,14 +10055,14 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
 // v1 installs at most one row per (family, acc) with key_m == 0 ("whole slot"); the
 // multi-row version matches on the exact (m, k) key.  The matching rule and the freeze
 // semantics live in vk_tuned_row_table (defined with the row struct).
-static const vk_tuned_row * ggml_vk_tuned_row_for(ggml_backend_vk_context * ctx, const vk_matmul_pipeline & mmp, uint32_t m, uint32_t k) {
-    return ctx->tuned.lookup(mmp.get(), m, k);
+static const vk_tuned_row * ggml_vk_tuned_row_for(ggml_backend_vk_context * ctx, const vk_matmul_pipeline & mmp, uint32_t m, uint32_t n, uint32_t k) {
+    return ctx->tuned.lookup(mmp.get(), m, n, k);
 }
 
 // Report when a tuned row applies to this (family, acc) for this shape.  Diagnostics
 // only (bit 8); the row itself is applied by ggml_vk_guess_matmul_pipeline.
 static void ggml_vk_t2_log_tuned_row(ggml_backend_vk_context * ctx, const vk_matmul_pipeline & mmp, uint32_t m, uint32_t n, uint32_t k, const char * chain) {
-    const vk_tuned_row * row = vk_t2_on(8u) ? ggml_vk_tuned_row_for(ctx, mmp, m, k) : nullptr;
+    const vk_tuned_row * row = vk_t2_on(8u) ? ggml_vk_tuned_row_for(ctx, mmp, m, n, k) : nullptr;
     if (row == nullptr || row->unaligned == nullptr) {
         return;
     }
@@ -10430,10 +10433,12 @@ static void ggml_vk_tuned_row_selftest(ggml_backend_vk_context * ctx) {
     vk_tuned_row keyed;                         // exact (m, k) == (192, 384)
     keyed.key_m = 192;
     keyed.key_k = 384;
-    const bool match_whole_any   = ggml_vk_tuned_row_matches(whole_slot, 512, 192);
-    const bool match_keyed_exact = ggml_vk_tuned_row_matches(keyed, 192, 384);
-    const bool match_keyed_m     = ggml_vk_tuned_row_matches(keyed, 512, 384);
-    const bool match_keyed_k0    = ggml_vk_tuned_row_matches(keyed, 192, 0);   // must be false
+    keyed.key_n = 512;
+    const bool match_whole_any   = ggml_vk_tuned_row_matches(whole_slot, 512, 384, 192);
+    const bool match_keyed_exact = ggml_vk_tuned_row_matches(keyed, 192, 512, 384);
+    const bool match_keyed_m     = ggml_vk_tuned_row_matches(keyed, 512, 512, 384);
+    const bool match_keyed_k0    = ggml_vk_tuned_row_matches(keyed, 192, 512, 0);   // must be false
+    const bool match_keyed_n0    = ggml_vk_tuned_row_matches(keyed, 192, 0, 384);   // must be false (R1a)
     const bool sentinel_ok = match_whole_any && match_keyed_exact && !match_keyed_m && !match_keyed_k0;
 
     // G13 (t3-shell-plan.md section 1.4, the P1 rule).  Synthetic pipelines are enough:
@@ -10466,7 +10471,7 @@ static void ggml_vk_tuned_row_selftest(ggml_backend_vk_context * ctx) {
     vk_tuned_row_table tab;
     vk_matmul_pipeline_struct fake_target;
     const bool install1 = tab.install(&fake_target, std::vector<vk_tuned_row>{}, nullptr);
-    const bool lookup_before_freeze = tab.lookup(&fake_target, 1, 1) == nullptr;   // freezes
+    const bool lookup_before_freeze = tab.lookup(&fake_target, 1, 1, 1) == nullptr;   // freezes
     std::string late_reason;
     const bool install2 = tab.install(&fake_target, std::vector<vk_tuned_row>{}, &late_reason);
     const bool table_ok = install1 && lookup_before_freeze && !install2 && !late_reason.empty();
@@ -10540,7 +10545,7 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
             ggml_vk_t2_line("tuned rows frozen by first lookup (" + ggml_vk_tune_ctx_tag(ctx)
                             + ", target families=" + std::to_string(ctx->tuned.rows.size()) + ")");
         }
-        const vk_tuned_row * row = ggml_vk_tuned_row_for(ctx, mmp, m, k);
+        const vk_tuned_row * row = ggml_vk_tuned_row_for(ctx, mmp, m, n, k);
         if (row != nullptr) {
             const vk_pipeline picked = ggml_vk_tuned_row_pick(*row, aligned);
             if (picked != nullptr) {
@@ -20920,7 +20925,7 @@ bool ggml_backend_is_vk(ggml_backend_t backend) {
 //
 // Bump when the fingerprint's field list changes: an old cache must not be reused under a
 // new meaning (t1-schema.md section 1, "VERSION").
-#define VK_TUNE_FINGERPRINT_VERSION 1
+#define VK_TUNE_FINGERPRINT_VERSION 2
 
 // Device/driver identity for the cache file name and header (t1-schema.md section 1).
 // Returns the number of bytes written excluding the terminator, or 0 when the caller's
@@ -21078,7 +21083,7 @@ static const vk_tuned_row_capability_class VK_TUNE_CAPABILITY_CLASSES[] = {
     { "geometry needs more shared memory than this device has", false },
     { "path=cm1 with a PAD/RESHAPE override on the Intel-proprietary coopmat class, whose effective "
       "values this build hardcodes (0/true) and whose layout has never been measured here", true },
-    { "two rows share (src0, src1, key_m, key_k) but differ in PAD/RESHAPE: the dispatch face cannot "
+    { "two rows share (src0, src1, key_m, key_n, key_k) but differ in PAD/RESHAPE: the dispatch face cannot "
       "tell them apart, so neither is installed", true },
     // 2026-09-24: closing the RESHAPE row override.  OUR GAP on purpose -- it is a decision about
     // what we expose, not a capability of the device; classifying it as a device verdict would let a
@@ -21800,7 +21805,7 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
             key_only.src1_type = (ggml_type) cands[obj.rowIndex].src1_type;
             key_only.key_m = cands[obj.rowIndex].key_m;
             key_only.key_k = cands[obj.rowIndex].key_k;
-            if (ggml_vk_tuned_row_matches(key_only, m, k)) {
+            if (ggml_vk_tuned_row_matches(key_only, m, params->shapes[s].n, k)) {
                 pair_legal[(size_t) s * params->nObjects + o] = 1;
                 pairs_legal++;
             } else {
@@ -22645,16 +22650,16 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
     std::map<std::string, bool> declared_keys;
     // cm1-d / item 7: the dispatch face has NO pad/reshape dimension -- vk_tuned_row_matches works
     // on the exact (m, k) pair (GV:287-295) and the lookup returns one row -- so a set holding two
-    // rows with the same (family, key_m, key_k) and DIFFERENT (pad, reshape) is not a set: whichever
+    // rows with the same (family, key_m, key_n, key_k) and DIFFERENT (pad, reshape) is not a set: whichever
     // landed first would shadow the other, and the shadowing would present itself as "there is only
     // one row here".  The whole GROUP is refused rather than the later row, so the outcome can never
     // be half-installed.  Exact duplicates are idempotent and stay legal.
     struct vk_row_pin { int pad; int reshape; bool conflict; };
-    std::map<std::array<uint64_t, 4>, vk_row_pin> row_pins;
+    std::map<std::array<uint64_t, 5>, vk_row_pin> row_pins;
     for (size_t i = 0; i < n_rows; i++) {
         const vk_tune_row_spec & r = rows[i];
-        const std::array<uint64_t, 4> pk = { (uint64_t) r.src0_type, (uint64_t) r.src1_type,
-                                             (uint64_t) r.key_m, (uint64_t) r.key_k };
+        const std::array<uint64_t, 5> pk = { (uint64_t) r.src0_type, (uint64_t) r.src1_type,
+                                             (uint64_t) r.key_m, (uint64_t) r.key_n, (uint64_t) r.key_k };
         auto it = row_pins.find(pk);
         if (it == row_pins.end()) {
             row_pins.emplace(pk, vk_row_pin { r.geom.pad, r.geom.reshape, false });
@@ -22668,12 +22673,12 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
         // The first version of this check sat in a loop of its own, where `continue` skipped nothing:
         // both rows were logged as dropped and then installed anyway -- measured by the A3p leg
         // (2 installed, pipes=8, and a hit, i.e. the shadowing it exists to prevent).
-        const std::array<uint64_t, 4> pk = { (uint64_t) r.src0_type, (uint64_t) r.src1_type,
-                                             (uint64_t) r.key_m, (uint64_t) r.key_k };
+        const std::array<uint64_t, 5> pk = { (uint64_t) r.src0_type, (uint64_t) r.src1_type,
+                                             (uint64_t) r.key_m, (uint64_t) r.key_n, (uint64_t) r.key_k };
         const auto pit = row_pins.find(pk);
         if (pit != row_pins.end() && pit->second.conflict) {
             drop_row(i, VK_TUNE_ROW_DROP_UNSUPPORTED,
-                     "two rows share (src0, src1, key_m, key_k) but differ in PAD/RESHAPE: the "
+                     "two rows share (src0, src1, key_m, key_n, key_k) but differ in PAD/RESHAPE: the "
                      "dispatch face cannot tell them apart, so neither is installed");
             continue;
         }
@@ -22768,6 +22773,7 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
             row.src1_type = (ggml_type) r.src1_type;
             row.key_m = r.key_m;
             row.key_k = r.key_k;
+            row.key_n = r.key_n;
             row.unaligned = built;
             row.aligned = built_aligned;
             // Install-time clauses: I1/I3/I4/I5 only.  I2 stays in the self-test because it is

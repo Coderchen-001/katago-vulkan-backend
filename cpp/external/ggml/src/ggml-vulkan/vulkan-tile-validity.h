@@ -92,13 +92,21 @@ struct vk_tile_geometry {
 //
 // `src0_type`/`src1_type` are ggml_type values carried as int on purpose: this header
 // knows nothing about ggml, and the backend is the only side that has to interpret them.
-// `key_m`/`key_k` are 0 for "whole slot" (matches any shape), which is the v1 form; see
-// ggml_vk_tuned_row_matches for the matching rule.
+// `key_m`/`key_k`/`key_n` are the EXACT GEMM shape this row is optimal for (R1a, 2026-10-12).
+// `key_n` was added because `n` has five real uses in pipeline selection
+// (`ggml_vk_guess_matmul_pipeline`): the workgroup counts `CEIL_DIV(m,wg0)*CEIL_DIV(n,wg1)`,
+// `n > crossover_large && prefer_large`, `n > crossover_medium`, `m <= 32 || n <= 32` and
+// `m <= 64 || n <= 64`.  Two shapes sharing `(m,k)` but differing in `n` (measured: n in
+// {256,512}, a 2x difference) could therefore need DIFFERENT geometry while the old key
+// forced them to share one row -- one key mixing two cases.  `key_m == 0` was the v1
+// "whole slot" form (matches any shape); it is being retired (R1b) because it claims
+// "optimal for every shape", which is exactly what per-GEMM selection denies.
 struct vk_tune_row_spec {
     int src0_type;
     int src1_type;
     uint32_t key_m;
     uint32_t key_k;
+    uint32_t key_n;
     int path;                  // vk_tile_path
     struct vk_tile_geometry geom;
 };
