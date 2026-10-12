@@ -4681,7 +4681,7 @@ namespace VulkanTuner {
     refCand.src1_type = 1;
     refCand.key_m = 192;
     refCand.key_k = 512;
-    refCand.key_n = 768;
+    refCand.key_n = 64;   // R1a: MUST equal the paired shape's `n` above (64), not another fixture's key
     vk_tune_probe_params base {};
     base.shapes = &shape;
     base.nShapes = 1;
