@@ -6084,6 +6084,35 @@ namespace VulkanTuner {
             coverage.resize((size_t) capS);
           }
         }
+        // 🔴 G1-b (2026-10-12): THE VRAM BOUND, APPLIED WHERE `shots` IS DECIDED RATHER THAN ONLY WHERE IT IS
+        // ALLOCATED.  The backend already clamps (in `shots_of`, its single reader, so the bound can never be
+        // bypassed), but that made the REPORTED numbers the REQUESTED ones: MEASURED on the first run of this
+        // change, `shots_by_shape=[880,880,880,3520,3520,3520]` and `per_dispatch_us=0.079` while the same
+        // line's `hot_us=279` makes those counts impossible -- 3520 dispatches cannot fit in 279 us at the
+        // 8 us this device measures.  The block really ran the capped count; only the printed count (and the
+        // ratio built from it) was the request.  "The reported number must be the number that ran" is the rule
+        // this project pays for repeatedly, so the cap is applied HERE as well: `solved_shots` and
+        // `shots_by_shape` are then the counts the probe will actually dispatch, and the backend's clamp
+        // becomes defence in depth rather than the only one.
+        auto shotsCapForShape = [](const vk_tune_probe_shape & sh) -> uint32_t {
+          const uint64_t per = (uint64_t) sh.n * (uint64_t) sh.m * 4ull;
+          if (per == 0 || TuneStats::TUNE_PROBE_BLOCK_BUDGET_MB == 0) {
+            return 0u;   // 0 means "no cap"
+          }
+          const uint64_t cap = ((uint64_t) TuneStats::TUNE_PROBE_BLOCK_BUDGET_MB * 1024ull * 1024ull) / per;
+          return cap < 1ull ? 1u : (uint32_t) cap;
+        };
+        auto clampShotsToBudget = [&](const vk_tune_probe_shape & sh, uint32_t sh0) -> uint32_t {
+          const uint32_t cap = shotsCapForShape(sh);
+          return (cap != 0u && sh0 > cap) ? cap : sh0;
+        };
+        uint32_t globalShotsCap = 0;
+        for (size_t cs = 0; cs < coverage.size(); cs++) {
+          const uint32_t cap = shotsCapForShape(coverage[cs]);
+          if (cap != 0u && (globalShotsCap == 0u || cap < globalShotsCap)) {
+            globalShotsCap = cap;   // the most restrictive shape, because the global value serves them all
+          }
+        }
         // (b) THE ROWS, in an order the identity count below depends on: object `2 + c*nCovered + s` is
         //     candidate `c` measured on covered shape `s`.
         const uint32_t armCount = 2;
@@ -6137,6 +6166,9 @@ namespace VulkanTuner {
         mp.objects = mObjects.data();
         mp.nObjects = (uint32_t) mObjects.size();
         mp.shots = decision->precheckShots;
+        if (globalShotsCap != 0u && mp.shots > globalShotsCap) {
+          mp.shots = globalShotsCap;   // G1-b: the reported count is the count that will run (see the cap block)
+        }
         mp.warmupBlocks = (uint32_t) TuneStats::WARMUP_BLOCKS;
         mp.reps = measReps;
         mp.stallBlocks = (uint32_t) TuneStats::STALL_BLOCKS;
@@ -6166,6 +6198,9 @@ namespace VulkanTuner {
         ap.objects = anchorObjects;
         ap.nObjects = 2;
         ap.shots = decision->precheckShots;
+        if (globalShotsCap != 0u && ap.shots > globalShotsCap) {
+          ap.shots = globalShotsCap;   // G1-b: same, for both anchor passes (the second is the measured peak)
+        }
         ap.warmupBlocks = (uint32_t) TuneStats::WARMUP_BLOCKS;
         ap.reps = measReps;   // the SAME statistic the grid's anchors are taken with (PAIRS_FLOOR), so the two are comparable
         ap.stallBlocks = (uint32_t) TuneStats::STALL_BLOCKS;
@@ -6287,6 +6322,12 @@ namespace VulkanTuner {
           }
         }
         decision->measurement.solvedShotsByShape = solvedShotsPerShape;
+        // G1-b: the per-shape counts are clamped BEFORE they are handed over, so the vector the probe receives
+        // and the vector the decision reports are the same numbers (see the cap block above for the measured
+        // inconsistency this closes).
+        for (size_t cs = 0; cs < solvedShotsPerShape.size() && cs < coverage.size(); cs++) {
+          solvedShotsPerShape[cs] = clampShotsToBudget(coverage[cs], solvedShotsPerShape[cs]);
+        }
         mp.shotsPerShape = solvedShotsPerShape.data();
         mp.nShotsPerShape = (uint32_t) solvedShotsPerShape.size();
         mp.seed = TuneStats::PROBE_MEASURE_ROTATION_SEED;
