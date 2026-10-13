@@ -654,6 +654,15 @@ namespace VulkanTuner {
       std::vector<double> scoreMaxByShape;
       std::vector<int32_t> scoreWinnerByShape;
       std::vector<double> scoreMedianByShape;
+      // 🔴 R1b-2b-1 (2026-10-12) THE NARROWING RULE'S OUTPUT, as a reading: which candidates the tournament
+      // would carry into its next round if this round's estimates were the whole story.  Per shape the top
+      // third of the candidates that HAVE an estimate (ranked by the centred score), and the survivor set is
+      // their UNION -- a shape's champion must never be dropped, because a false negative removes a real
+      // winner from every later round while a false positive only costs blocks.  The COUNT is the interesting
+      // part: the flat plan assumes "one third of the pool", and the union of six shapes' top thirds is
+      // USUALLY LARGER than that (measured: the six shapes picked six different champions), so R1b-2b's loop
+      // must recompute its schedule from the real count instead of trusting the estimate.
+      std::vector<uint32_t> tournamentKeep;
     };
     Judgement judgement;
     // (7d): the branch selection runs ONCE per decision, like the pre-check, the measurement and the

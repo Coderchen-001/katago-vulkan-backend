@@ -1261,6 +1261,50 @@ namespace VulkanTuner {
         j.scoreWinnerByShape[s] = bestCand;
         j.scoreMaxByShape[s] = bestScore;
       }
+      // 🔴 R1b-2b-1 (2026-10-12): THE NARROWING RULE, evaluated on THIS round's real estimates (a reading --
+      // nothing is dropped yet).  Per shape: the top third of the candidates that have an estimate, ranked by
+      // the centred score; the survivor set is the UNION over shapes, because dropping a shape's champion is
+      // the expensive error (a false negative removes a real winner from every later round, whereas a false
+      // positive merely costs blocks).  The COUNT is what R1b-2b's loop must plan with: the flat `f = 1/3`
+      // schedule assumes one third of the pool, and six shapes choosing six different champions makes the
+      // union bigger than that.
+      {
+        std::vector<char> keepMark((size_t) nCands, 0);
+        uint32_t keepCount = 0;
+        for (uint32_t s = 0; s < nShapes; s++) {
+          std::vector<std::pair<double, uint32_t>> ranked;
+          for (uint32_t c = 0; c < nCands; c++) {
+            const double v = hlByShape[s][c];
+            if (v == v) {
+              ranked.push_back(std::make_pair(v, c));
+            }
+          }
+          if (ranked.empty()) {
+            continue;
+          }
+          std::sort(ranked.begin(), ranked.end(),
+                    [](const std::pair<double, uint32_t> & a, const std::pair<double, uint32_t> & b) {
+                      return a.first > b.first;   // best (fastest) first
+                    });
+          size_t takeN = ranked.size() / 3;
+          if (takeN < 1) {
+            takeN = 1;
+          }
+          for (size_t i = 0; i < takeN; i++) {
+            if (!keepMark[ranked[i].second]) {
+              keepMark[ranked[i].second] = 1;
+              keepCount++;
+            }
+          }
+        }
+        j.tournamentKeep.clear();
+        for (uint32_t c = 0; c < nCands; c++) {
+          if (keepMark[c]) {
+            j.tournamentKeep.push_back(c);
+          }
+        }
+        (void) keepCount;   // the vector's size is the same number; kept for the reader
+      }
       j.bestShapeMargin = bestShapeMargin;
       j.candMarginByCand = candMarginsOut;
     }
@@ -2579,6 +2623,11 @@ namespace VulkanTuner {
         "KATAGO_VK_CM2_BM", "KATAGO_VK_LAYOUTDBG_EDGE", "KATAGO_VK_LAYOUT_HINT",
         "KATAGO_VK_NARROW_BARRIER", "KATAGO_VK_QKV_NOCONT", "KATAGO_VK_ROPE_DISABLE",
         "KATAGO_VULKAN_LAYOUTDBG", "KATAGO_VULKAN_NOALLOC",
+        // 🔴 G1 diagnostics (2026-10-12): these shrink the SEARCH SET, so they change what the tuner MEASURES
+        // and therefore what it may CHOOSE -- which is exactly why they belong in this list rather than in a
+        // dev tier beside them: a diagnostic run must not write a cache that claims to be this device's
+        // optimum.  (The tier rule is the one the census states: "changes the tune's choice => KNOBS[]".)
+        "KATAGO_VK_TUNE_MAXCANDS", "KATAGO_VK_TUNE_ONEGEOM",
       };
       // NOTE: the build revision is truncated to 16 characters and that is NOT the lossy kind
       // of truncation the knob values below must avoid -- a SHA is a fixed-length prefix-free
@@ -5168,6 +5217,33 @@ namespace VulkanTuner {
         for (size_t ci = 0; ci < cands.size(); ci++) {
           d->candidateGeoms.push_back(cands[ci].geom);
         }
+        // 🔴 G1 DIAGNOSTICS (2026-10-12): two DEV-ONLY knobs that shrink the SEARCH SET so the 10 GB spike
+        // can be split into its two axes.  Default OFF (unset) and zero production effect -- the same
+        // env-gated, default-no-op shape `KATAGO_VK_CM2_BK`/`_BM` already have.
+        //
+        // WHY BOTH ARE NEEDED, and this is the whole point of the pair: capping the candidate COUNT leaves all
+        // 36 GEOMETRY KINDS in place, and each kind carries its own specialised constants (BM/BN/BK/smaller/
+        // aligned), so a flat peak under a count cap would be MISREAD as "the candidates are not the cause".
+        // The two axes are therefore:
+        //   * KATAGO_VK_TUNE_MAXCANDS=<n>  -- keep at most n candidates   (the OBJECT axis: rows/tensors)
+        //   * KATAGO_VK_TUNE_ONEGEOM=1     -- every candidate uses the FIRST geometry (the GEOMETRY-KIND axis)
+        // The catalogue line above still reports the full enumeration: it answers "what did the search return",
+        // while these knobs answer "what did the measurement walk", and the measurement's own `cands=`/`objects=`
+        // readings show the difference.
+        if (const char * mc = getenv("KATAGO_VK_TUNE_MAXCANDS")) {
+          const long capN = strtol(mc, nullptr, 10);
+          if (capN > 0 && (size_t) capN < d->candidateGeoms.size()) {
+            d->candidateGeoms.resize((size_t) capN);
+          }
+        }
+        if (const char * og = getenv("KATAGO_VK_TUNE_ONEGEOM")) {
+          if (og[0] == '1' && !d->candidateGeoms.empty()) {
+            const vk_tile_geometry firstGeom = d->candidateGeoms[0];
+            for (size_t gi = 0; gi < d->candidateGeoms.size(); gi++) {
+              d->candidateGeoms[gi] = firstGeom;
+            }
+          }
+        }
         logLine(formatCandidateCatalog(*d, cands));
       }
 
@@ -6430,6 +6506,16 @@ namespace VulkanTuner {
           passPlan = passPlan * 2;
           planStr += ";r=" + to_string((long) keptPlan) + "x" + to_string((long) passPlan);
         }
+        // R1b-2b-1: WHICH candidates the narrowing rule keeps (candidate indices, the same order
+        // `cand_margin_by_cand` and `score_winner_by_shape` use), so the rule's own output is a reading.
+        string keepList = "[";
+        for (size_t kk = 0; kk < decision->judgement.tournamentKeep.size(); kk++) {
+          if (kk != 0) {
+            keepList += ",";
+          }
+          keepList += to_string((long) decision->judgement.tournamentKeep[kk]);
+        }
+        keepList += "]";
         jOs << "judge: attempted=" << (decision->judgement.attempted ? 1 : 0)
             << " gate_reject=" << (decision->judgement.gateRejected ? 1 : 0)
             << " gate_high=" << decision->judgement.gateHigh
@@ -6489,6 +6575,8 @@ namespace VulkanTuner {
             << " score_median_by_shape=" << scoreMedianList
             // R1b-2a: the DERIVED tournament schedule (pre-screen passes + the narrowing rounds).  A READING.
             << " tournament_plan=" << planStr
+            // R1b-2b-1: the narrowing rule's own output (the union of the shapes' top thirds).  A READING.
+            << " tournament_keep=" << keepList
             // P3 (2026-10-01): the two numbers the recovery reads and the one it writes.  `band_max` is
             // the WIDEST observed band among the wide pairs (0 = none), `remeasure` is the budget the
             // second pass was given (0 = the intervals all formed on the first pass).  Both are readings
