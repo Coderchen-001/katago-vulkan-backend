@@ -22241,6 +22241,7 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
     // in `result->*` -- the first version declared them in the inner scope and the build said so (C2065).
     std::string nsByShapeStr = "[]";
     std::string nsSentinelStr = "[]";
+    std::string nsByObjStr = "[]";   // P1-b2: only filled when a T2 probe bit is on
     uint64_t elapsed_us_total = 0;
     uint64_t warmup_us_total = 0;
     uint32_t no_progress_streak = 0;
@@ -22566,13 +22567,21 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
         // measured on the same thing twice), and the operator-kind check ("every interval was exactly one
         // mul_mat" is what makes each delta describe the candidate's kernel and nothing else).  All three are
         // readings; nothing branches on them.
+        // P1-b2: FIVE numbers, because the tail's FREQUENCY is the fact that decides how it must be handled.
+        // The new framework has no gate, so a tail can only be absorbed by the median -- and whether that is
+        // legitimate depends on how often it fires: if p99 is still an ordinary value, the tail is a rare
+        // event the median absorbs; if the MEDIAN itself is large, the geometry is simply slow and the median
+        // is reporting that honestly.  A median+IQR alone would hide the frequency, and a max alone would let
+        // one sample stand for the whole distribution.
         auto nsSummary = [](std::vector<uint64_t> v) -> std::string {
             if (v.empty()) {
-                return "0:0:0:0";
+                return "0:0:0:0:0";
             }
             std::sort(v.begin(), v.end());
-            return std::to_string(v.size()) + ":" + std::to_string(v.front()) + ":"
-                   + std::to_string(v[v.size() / 2]) + ":" + std::to_string(v.back());
+            const size_t n = v.size();
+            auto pct = [&](double q) -> uint64_t { return v[(size_t) (q * (double) (n - 1))]; };
+            return std::to_string(n) + ":" + std::to_string(v[n / 2]) + ":" + std::to_string(pct(0.90))
+                   + ":" + std::to_string(pct(0.99)) + ":" + std::to_string(v.back());
         };
         nsByShapeStr = "[";
         nsSentinelStr = "[";
@@ -22592,6 +22601,26 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
         }
         nsByShapeStr += "]";
         nsSentinelStr += "]";
+        // P1-b2: the per-(shape, object) detail, GATED behind the T2 probe bits (it is one entry per object --
+        // 218 on a measurement call -- and would otherwise dominate the line).  It answers two questions at
+        // once: whether the two instruments rank the objects the SAME WAY within each shape (the only real
+        // evidence that they measure the same thing), and WHERE the 1.8-2.35 ms tail lives.  If it clusters on
+        // a few (shape, object) pairs then it is that candidate's own property and the median would hide it;
+        // if it scatters then it is noise, and the median is the right instrument for it.
+        if (vk_t2_probe != 0) {
+            nsByObjStr = "[";
+            for (size_t si3 = 0; si3 < nodeNsBySO.size(); si3++) {
+                if (si3 != 0) {
+                    nsByObjStr += ";";
+                }
+                nsByObjStr += "s" + std::to_string(si3);
+                for (size_t oi3 = 0; oi3 < nodeNsBySO[si3].size(); oi3++) {
+                    nsByObjStr += (oi3 == 0 ? ":" : ",") + std::to_string(oi3) + "="
+                                  + nsSummary(nodeNsBySO[si3][oi3]);
+                }
+            }
+            nsByObjStr += "]";
+        }
         result->samples = samples_written;
         result->spikes = spikes;
         result->dropped_build_failed = build_failed;
@@ -22640,6 +22669,7 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
                     + ",max=" + std::to_string(result->node_ns_max) + "] node_ns_by_shape=" + nsByShapeStr
                     + " node_ns_sentinel_by_shape=" + nsSentinelStr + " node_ns_kinds=matmul/total="
                     + std::to_string(nodeNsMatmul) + "/" + std::to_string(nodeNsIntervals)
+                    + " node_ns_by_obj=" + nsByObjStr
                     + " alloc_bytes=" + allocList + " shots_by_shape=" + shotsList + " shapes=" + std::to_string(params->nShapes) + " objects="
                     + std::to_string(params->nObjects) + " shots=" + std::to_string(params->shots)
                     + " warmup=" + std::to_string(params->warmupBlocks) + " reps="
