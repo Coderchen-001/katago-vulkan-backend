@@ -2785,6 +2785,13 @@ struct ggml_backend_vk_context {
     // between "one wall-clock sample per block of shots" and "one kernel-time sample per dispatch".
     // Empty unless GGML_VK_PERF_LOGGER is set, which is also what makes the reading opt-in and its absence
     // explicit (`n_node_ns == 0` says the instrument was not on).
+    // 🔴 P1-b (2026-10-13): THE OPERATOR OF EACH INTERVAL, parallel to `last_node_ns`.  The non-concurrent
+    // path brackets every node with a timestamp AND a barrier, so an interval could in principle contain more
+    // than the candidate's kernel (a copy or a transpose in the same graph would ride along).  A constant
+    // extra is harmless (common mode), but if the node KIND varies with the object then the fixed term stops
+    // cancelling.  The check is "how many intervals were exactly a mul_mat", and it costs one vector here
+    // because the logging loop already walks the nodes.
+    std::vector<int> last_node_op;
     std::vector<uint64_t> last_node_ns;
     int32_t num_queries {};
     int32_t query_idx {};
@@ -20495,6 +20502,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     if (vk_perf_logger_enabled) {
         ctx->last_node_ns.clear();   // P1: one graph's worth, not an accumulation across graphs
+        ctx->last_node_op.clear();   // P1-b: same lifetime as the times it describes
         GGML_ASSERT(!ctx->compute_ctx.expired());
         compute_ctx = ctx->compute_ctx.lock();
         ggml_vk_ctx_end(compute_ctx);
@@ -20515,6 +20523,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 const uint64_t ns_here = uint64_t((timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod);
                 ctx->perf_logger->log_timing(node, name, ns_here);
                 ctx->last_node_ns.push_back(ns_here);   // P1: the probe reads these (query order == node order)
+                ctx->last_node_op.push_back((int) (node != nullptr ? node->op : -1));   // P1-b
             }
         } else {
             // Log each group of nodes
@@ -22215,8 +22224,23 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
 
     uint32_t blocks_timed = 0;
     // P1: every node time the perf logger handed back during THIS call (all blocks, all passes), in
-    // nanoseconds.  Aggregated at the end into min/median/max so the two instruments can be compared.
+    // nanoseconds, ATTRIBUTED to the (shape, object) whose block produced it -- free, because the
+    // accumulation sits inside the (pass, shape, object) loops, and it is what makes the timestamp
+    // instrument's per-shape winner sequence comparable with the wall clock's.
     std::vector<uint64_t> nodeNsAll;
+    // P1-b: (shape, object) -> that block's node times.  The second key is what the acceptance needs: the
+    // wall clock's winner is chosen BETWEEN OBJECTS per shape, so only a (shape, object) reading can show
+    // whether the two instruments agree on the ORDER.  Object 1 is the A/A sentinel in a measurement call
+    // (0 = stock, 1 = the sentinel that shares stock's pipeline), so the sentinel's own spread is the
+    // timestamp instrument's noise floor measured on the same thing twice.
+    std::vector<std::vector<std::vector<uint64_t>>> nodeNsBySO(
+        (size_t) params->nShapes, std::vector<std::vector<uint64_t>>((size_t) params->nObjects));
+    uint64_t nodeNsIntervals = 0;      // P1-b: intervals the logger reported
+    uint64_t nodeNsMatmul = 0;         // P1-b: of those, the ones that were a mul_mat (the expected 1:1)
+    // P1-b: declared at FUNCTION scope because the report that prints them lives outside the block that fills
+    // in `result->*` -- the first version declared them in the inner scope and the build said so (C2065).
+    std::string nsByShapeStr = "[]";
+    std::string nsSentinelStr = "[]";
     uint64_t elapsed_us_total = 0;
     uint64_t warmup_us_total = 0;
     uint32_t no_progress_streak = 0;
@@ -22311,9 +22335,17 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
                     block_us[idx] = dt_us;
                     block_measured[idx] = 1;
                     blocks_timed++;
-                    // P1: the block's own per-node kernel times (empty unless GGML_VK_PERF_LOGGER is on).
+                    // P1/P1-b: the block's own per-node kernel times (empty unless GGML_VK_PERF_LOGGER is on),
+                    // attributed to this (shape, object) and counted by operator kind.
                     for (size_t nsi = 0; nsi < ctx->last_node_ns.size(); nsi++) {
                         nodeNsAll.push_back(ctx->last_node_ns[nsi]);
+                        if ((size_t) s < nodeNsBySO.size() && (size_t) o < nodeNsBySO[(size_t) s].size()) {
+                            nodeNsBySO[(size_t) s][(size_t) o].push_back(ctx->last_node_ns[nsi]);
+                        }
+                        nodeNsIntervals++;
+                        if (nsi < ctx->last_node_op.size() && ctx->last_node_op[nsi] == (int) GGML_OP_MUL_MAT) {
+                            nodeNsMatmul++;
+                        }
                     }
                     elapsed_us_total += dt_us;
                 } else {
@@ -22530,6 +22562,36 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
             result->node_ns_med = sortedNs[sortedNs.size() / 2];
             result->node_ns_max = sortedNs.back();
         }
+        // P1-b: the per-shape summary, the A/A sentinel's own spread (the timestamp instrument's noise floor
+        // measured on the same thing twice), and the operator-kind check ("every interval was exactly one
+        // mul_mat" is what makes each delta describe the candidate's kernel and nothing else).  All three are
+        // readings; nothing branches on them.
+        auto nsSummary = [](std::vector<uint64_t> v) -> std::string {
+            if (v.empty()) {
+                return "0:0:0:0";
+            }
+            std::sort(v.begin(), v.end());
+            return std::to_string(v.size()) + ":" + std::to_string(v.front()) + ":"
+                   + std::to_string(v[v.size() / 2]) + ":" + std::to_string(v.back());
+        };
+        nsByShapeStr = "[";
+        nsSentinelStr = "[";
+        for (size_t si2 = 0; si2 < nodeNsBySO.size(); si2++) {
+            std::vector<uint64_t> allHere;
+            for (size_t oi2 = 0; oi2 < nodeNsBySO[si2].size(); oi2++) {
+                for (size_t vi2 = 0; vi2 < nodeNsBySO[si2][oi2].size(); vi2++) {
+                    allHere.push_back(nodeNsBySO[si2][oi2][vi2]);
+                }
+            }
+            if (si2 != 0) {
+                nsByShapeStr += ",";
+                nsSentinelStr += ",";
+            }
+            nsByShapeStr += nsSummary(allHere);
+            nsSentinelStr += nsSummary(nodeNsBySO[si2].size() > 1 ? nodeNsBySO[si2][1] : std::vector<uint64_t>());
+        }
+        nsByShapeStr += "]";
+        nsSentinelStr += "]";
         result->samples = samples_written;
         result->spikes = spikes;
         result->dropped_build_failed = build_failed;
@@ -22575,7 +22637,10 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
     shotsList += "]";
     ggml_vk_t3_line("probe: node_ns=[n=" + std::to_string(result->n_node_ns) + ",min="
                     + std::to_string(result->node_ns_min) + ",med=" + std::to_string(result->node_ns_med)
-                    + ",max=" + std::to_string(result->node_ns_max) + "] alloc_bytes=" + allocList + " shots_by_shape=" + shotsList + " shapes=" + std::to_string(params->nShapes) + " objects="
+                    + ",max=" + std::to_string(result->node_ns_max) + "] node_ns_by_shape=" + nsByShapeStr
+                    + " node_ns_sentinel_by_shape=" + nsSentinelStr + " node_ns_kinds=matmul/total="
+                    + std::to_string(nodeNsMatmul) + "/" + std::to_string(nodeNsIntervals)
+                    + " alloc_bytes=" + allocList + " shots_by_shape=" + shotsList + " shapes=" + std::to_string(params->nShapes) + " objects="
                     + std::to_string(params->nObjects) + " shots=" + std::to_string(params->shots)
                     + " warmup=" + std::to_string(params->warmupBlocks) + " reps="
                     + std::to_string(params->reps) + " pairs_legal=" + std::to_string(pairs_legal)
