@@ -22260,7 +22260,8 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
     std::string nsByShapeStr = "[]";
     std::string nsSentinelStr = "[]";
     std::string nsByObjStr = "[]";   // P1-b2: only filled when a T2 probe bit is on
-    // P1-c1: the clock's own resolution, ns per tick (function scope for the same reason as the strings above).
+    std::string nsFirstStr = "[]";   // P1-c2: the first few samples per (shape, object), same gate
+    // P1-c2: the clock's own resolution, ns per tick (function scope for the same reason as the strings above).
     double tsPeriodNs = 0.0;
     uint64_t elapsed_us_total = 0;
     uint64_t warmup_us_total = 0;
@@ -22658,6 +22659,36 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
             }
             nsByObjStr += "]";
         }
+        // 🔴 P1-c2 (2026-10-13): THE FIRST FEW SAMPLES OF EACH (shape, object), in ARRIVAL ORDER.  This is what
+        // decides whether the per-object warmup has to be re-established when the block layer goes.  The plan
+        // that replaces `warmupBlocks` is "discard the first k samples of each (shape, object)", and k has to
+        // come from a measurement rather than from the assumption that the tail IS a cold pipeline: if the
+        // first sample sits far above the object's own median and the next few do not, the tail is start-up and
+        // discarding it is right; if the first few look like the rest, the tail belongs to the candidate and
+        // discarding it would hide a real property.  `nodeNsBySO` already holds the values in arrival order, so
+        // this costs a print and no new storage (still aggregates: a few values per (shape, object), never the
+        // ~119k raw intervals).
+        if (getenv("KATAGO_VK_T3_NODE_DETAIL") != nullptr) {
+            nsFirstStr = "[";
+            for (size_t si4 = 0; si4 < nodeNsBySO.size(); si4++) {
+                if (si4 != 0) {
+                    nsFirstStr += ";";
+                }
+                nsFirstStr += "s" + std::to_string(si4);
+                for (size_t oi4 = 0; oi4 < nodeNsBySO[si4].size(); oi4++) {
+                    const std::vector<uint64_t> & v4 = nodeNsBySO[si4][oi4];
+                    if (v4.empty()) {
+                        continue;
+                    }
+                    nsFirstStr += (oi4 == 0 ? ":" : ",") + std::to_string(oi4) + "=";
+                    const size_t takeFirst = std::min<size_t>(3, v4.size());
+                    for (size_t fi = 0; fi < takeFirst; fi++) {
+                        nsFirstStr += (fi == 0 ? "" : "/") + std::to_string(v4[fi]);
+                    }
+                }
+            }
+            nsFirstStr += "]";
+        }
         result->samples = samples_written;
         result->spikes = spikes;
         result->dropped_build_failed = build_failed;
@@ -22706,7 +22737,7 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
                     + ",max=" + std::to_string(result->node_ns_max) + "] node_ns_by_shape=" + nsByShapeStr
                     + " node_ns_sentinel_by_shape=" + nsSentinelStr + " node_ns_kinds=matmul/total="
                     + std::to_string(nodeNsMatmul) + "/" + std::to_string(nodeNsIntervals)
-                    + " node_ns_by_obj=" + nsByObjStr + " ts_period_ns=" + std::to_string(tsPeriodNs)
+                    + " node_ns_by_obj=" + nsByObjStr + " node_ns_first=" + nsFirstStr + " ts_period_ns=" + std::to_string(tsPeriodNs)
                     + " alloc_bytes=" + allocList + " shots_by_shape=" + shotsList + " shapes=" + std::to_string(params->nShapes) + " objects="
                     + std::to_string(params->nObjects) + " shots=" + std::to_string(params->shots)
                     + " warmup=" + std::to_string(params->warmupBlocks) + " reps="
