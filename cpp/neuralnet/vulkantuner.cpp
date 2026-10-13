@@ -2504,6 +2504,28 @@ namespace VulkanTuner {
     // grammar -- `all` or a base-10 bitmask, see vk_t2_probe's comment -- so one env asks both
     // sides for their self-checks.  Never reached under KATAGO_VK_TUNE=0: makeDecision returns
     // before this (and the backend suppresses its probes there for the same reason).
+    // 🔴 G1 (2026-10-12): THE BLOCK-LENGTH TARGET, overridable by a DEV knob so the memory/floor trade can be
+    // MEASURED instead of argued.  The chain is: the target sets `shots` (via the pre-check's inversion and the
+    // per-shape solve), and the probe allocates ONE mul_mat destination per shot, so a shape's block is
+    // `shots x n x m x 4` bytes.  MEASURED: 8.22 us per dispatch and 4.2 MB per shot on the widest covered
+    // shape, so the default 2 ms floor needs ~243 shots and ~1.0 GB for ONE shape -- the floor itself is what
+    // makes the probe's memory large, which is why the honest question is not "which pool is too big" but
+    // "how short a block can a PAIRED comparison tolerate".  The submission/synchronise overhead a short block
+    // pays is COMMON MODE: both members of a pair pay it, so it cancels in the difference the judgement reads.
+    // This knob is what lets that be measured (block time vs the pair widths), and it deliberately does NOT
+    // touch `shapeRulerOk`'s criterion: with a relaxed target that criterion SHOULD keep reporting that the
+    // ruler is too coarse, because that is exactly the risk being measured.
+    double tuneBlockTargetUs() {
+      const char* v = getenv("KATAGO_VK_TUNE_BLOCKMS");
+      if (v != nullptr && v[0] != '\0') {
+        const double ms = atof(v);
+        if (ms > 0.0 && ms < 1000.0) {
+          return ms * 1000.0;
+        }
+      }
+      return TuneStats::MIN_BLOCK_TIME_MS * 1000.0;
+    }
+
     unsigned long t2ProbeBits() {
       const char* v = getenv("KATAGO_VK_T2_PROBE");
       if (v == nullptr || v[0] == '\0') {
@@ -2628,6 +2650,7 @@ namespace VulkanTuner {
         // dev tier beside them: a diagnostic run must not write a cache that claims to be this device's
         // optimum.  (The tier rule is the one the census states: "changes the tune's choice => KNOBS[]".)
         "KATAGO_VK_TUNE_MAXCANDS", "KATAGO_VK_TUNE_ONEGEOM", "KATAGO_VK_TUNE_MAXSHAPES",
+        "KATAGO_VK_TUNE_BLOCKMS",
       };
       // NOTE: the build revision is truncated to 16 characters and that is NOT the lossy kind
       // of truncation the knob values below must avoid -- a SHA is a fixed-length prefix-free
@@ -5858,7 +5881,7 @@ namespace VulkanTuner {
           const double fixedUs = blkAtPreShots - marginalUs * (double) preShots;
           decision->precheckFixedUs = fixedUs;
           decision->precheckMarginalUs = marginalUs;
-          const double targetBlockUs = TuneStats::MIN_BLOCK_TIME_MS * 1000.0;
+          const double targetBlockUs = tuneBlockTargetUs();
           double wantShots = 1.0;
           if (marginalUs > 0.0) {
             wantShots = (targetBlockUs - fixedUs) / marginalUs;
@@ -6235,7 +6258,7 @@ namespace VulkanTuner {
         // exactly the pre-batch behaviour -- a failed anchor run must not invent per-shape numbers.
         std::vector<uint32_t> solvedShotsPerShape(coverage.size(), mp.shots);
         if (aUsable) {
-          const double targetUs = TuneStats::MIN_BLOCK_TIME_MS * 1000.0;
+          const double targetUs = tuneBlockTargetUs();
           const double span = (double) shotsHi - (double) mp.shots;
           const size_t nAnchor = std::min((size_t) aRes.n_shape_anchor_us, (size_t) aRes2.n_shape_anchor_us);
           for (size_t sIdx = 0; sIdx < coverage.size() && sIdx < nAnchor; sIdx++) {
