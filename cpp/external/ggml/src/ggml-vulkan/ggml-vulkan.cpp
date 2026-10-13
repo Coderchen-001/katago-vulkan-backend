@@ -22636,7 +22636,15 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
         // evidence that they measure the same thing), and WHERE the 1.8-2.35 ms tail lives.  If it clusters on
         // a few (shape, object) pairs then it is that candidate's own property and the median would hide it;
         // if it scatters then it is noise, and the median is the right instrument for it.
-        if (vk_t2_probe != 0) {
+        // P1-b3: the per-(shape, object) detail, behind its OWN env -- NOT a T2 probe bit.  MEASURED: setting
+        // any probe bit makes the primitive refuse to measure (the `measure:` line comes back empty and only
+        // the self-test probes run, at 63-68 us instead of the production ~9 us), so a probe bit cannot gate a
+        // reading that is supposed to accompany a REAL measurement.  The rule this instantiates: probe bits are
+        // the self-test channel; measurement-time diagnostics use an independent dev env.  This env only
+        // changes what is PRINTED, so it does not enter the policy fingerprint (the same tier as
+        // `KATAGO_VK_TUNE_STATS_TRIALS`).  Aggregates only: one five-number summary per (shape, object), never
+        // the raw per-interval events (a measurement call produces ~119k of those).
+        if (getenv("KATAGO_VK_T3_NODE_DETAIL") != nullptr) {
             nsByObjStr = "[";
             for (size_t si3 = 0; si3 < nodeNsBySO.size(); si3++) {
                 if (si3 != 0) {

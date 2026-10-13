@@ -2674,7 +2674,7 @@ namespace VulkanTuner {
         // dev tier beside them: a diagnostic run must not write a cache that claims to be this device's
         // optimum.  (The tier rule is the one the census states: "changes the tune's choice => KNOBS[]".)
         "KATAGO_VK_TUNE_MAXCANDS", "KATAGO_VK_TUNE_ONEGEOM", "KATAGO_VK_TUNE_MAXSHAPES",
-        "KATAGO_VK_TUNE_BLOCKMS", "KATAGO_VK_TUNE_BUDGETMB",
+        "KATAGO_VK_TUNE_BLOCKMS", "KATAGO_VK_TUNE_BUDGETMB", "KATAGO_VK_T3_NODE_DETAIL",
       };
       // NOTE: the build revision is truncated to 16 characters and that is NOT the lossy kind
       // of truncation the knob values below must avoid -- a SHA is a fixed-length prefix-free
