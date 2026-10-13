@@ -2627,7 +2627,7 @@ namespace VulkanTuner {
         // and therefore what it may CHOOSE -- which is exactly why they belong in this list rather than in a
         // dev tier beside them: a diagnostic run must not write a cache that claims to be this device's
         // optimum.  (The tier rule is the one the census states: "changes the tune's choice => KNOBS[]".)
-        "KATAGO_VK_TUNE_MAXCANDS", "KATAGO_VK_TUNE_ONEGEOM",
+        "KATAGO_VK_TUNE_MAXCANDS", "KATAGO_VK_TUNE_ONEGEOM", "KATAGO_VK_TUNE_MAXSHAPES",
       };
       // NOTE: the build revision is truncated to 16 characters and that is NOT the lossy kind
       // of truncation the knob values below must avoid -- a SHA is a fixed-length prefix-free
@@ -6043,6 +6043,21 @@ namespace VulkanTuner {
           }
           coverage.push_back(decision->graphShapes[order[i]]);
           coveredCount += decision->graphShapeCounts[order[i]];
+        }
+        // 🔴 G1 diagnostics (2026-10-12), the THIRD axis -- HOW MANY SHAPES the measurement walks.  Measured:
+        // the two candidate-side knobs (`KATAGO_VK_TUNE_MAXCANDS`, `KATAGO_VK_TUNE_ONEGEOM`) leave the ~10 GB
+        // spike EXACTLY unchanged, and a 0.2 s poll puts both allocation waves in the first six seconds of a
+        // 21 s run, i.e. BEFORE the measurement (which lasts 0.65 s and walks objects=218).  So the spike is
+        // fixed before any candidate is looked at, and the remaining suspect is per-SHAPE: the probe's own
+        // pipeline set (per shape x warptile class x acc target x alignment variant).  Capping the coverage
+        // set is the only way to ask that directly.  Same contract as the other two knobs: env-gated, default
+        // off, zero production effect, and in `policyFingerprint()` because it changes what is measured and
+        // therefore what may be chosen.
+        if (const char * ms = getenv("KATAGO_VK_TUNE_MAXSHAPES")) {
+          const long capS = strtol(ms, nullptr, 10);
+          if (capS > 0 && (size_t) capS < coverage.size()) {
+            coverage.resize((size_t) capS);
+          }
         }
         // (b) THE ROWS, in an order the identity count below depends on: object `2 + c*nCovered + s` is
         //     candidate `c` measured on covered shape `s`.
