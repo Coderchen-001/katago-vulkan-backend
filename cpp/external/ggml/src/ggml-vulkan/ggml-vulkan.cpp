@@ -2733,6 +2733,16 @@ struct ggml_backend_vk_context {
     // instead of asserting a call count that an unrelated refactor could halve.
     uint64_t probe_override_hits {};
     vk_pipeline probe_override_pipeline {};
+    // 🔴 P1-c step 0 (2026-10-13): A PER-NODE OVERRIDE, keyed by the destination tensor.  The context-level field
+    // above forces EVERY matmul in a graph onto one pipeline, which is why today's design is "one graph = one
+    // candidate".  The new measurement batches k passes over ALL objects into ONE submit -- that is not an
+    // optimisation but the fairness requirement: within a pass every object must be dispatched inside the same
+    // time window, or the drift between them stops cancelling and turns into a per-object offset.  Since each
+    // candidate writes its OWN destination tensor, the destination is a natural key, and it is available at the
+    // one place that dispatches a matmul (`ggml_vk_matmul`, where `dst` is already in hand).
+    // The map is empty in production and in every existing path, so this addition changes nothing until the
+    // probe fills it; the context-level field stays for the current block path and its self-test legs.
+    std::unordered_map<const ggml_tensor *, vk_pipeline> probe_override_by_node;
     bool pr_recorded {};    // cache ready: subsequent evals replay
     // Multi-segment replay cache: the graph may be recorded as several command
     // buffers (op-internal intermediate submissions), so we cache ALL segments'
@@ -11227,6 +11237,17 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
 
     vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline(ctx, mmp, ne01, ne11, ne10, aligned, res.src0_type, effective_src1_type);
+
+    // P1-c step 0: the per-node override, consulted AFTER the resolver so that a dispatch inside a batched graph
+    // (many objects, many passes, ONE submit) can still run the pipeline its own candidate chose.  Empty map =>
+    // identical behaviour to before this batch.  `dst` is the key because each candidate writes its own output.
+    if (!ctx->probe_override_by_node.empty()) {
+        auto nodeOverrideIt = ctx->probe_override_by_node.find(dst);
+        if (nodeOverrideIt != ctx->probe_override_by_node.end() && nodeOverrideIt->second != nullptr) {
+            pipeline = nodeOverrideIt->second;
+            ctx->probe_override_hits++;
+        }
+    }
 
     // T3 item 12 (t3-shell-plan.md section 6.1): prove the dispatched K is the true K
     // and not the padded one.  This is the link that decides whether a row's align is
