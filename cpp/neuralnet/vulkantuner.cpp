@@ -2599,6 +2599,7 @@ namespace VulkanTuner {
     };
     const PolicyConstantSpec POLICY_CONSTANTS[] = {
       { "spike_rate_gate", std::to_string(TuneStats::SPIKE_RATE_GATE) },
+      { "probe_block_budget_mb", std::to_string(TuneStats::TUNE_PROBE_BLOCK_BUDGET_MB) },
       { "spike_band_lo",   std::to_string(TuneStats::SPIKE_BAND_LO)   },
       { "spike_band_hi",   std::to_string(TuneStats::SPIKE_BAND_HI)   },
       { "alpha",           std::to_string(TuneStats::ALPHA)           },
@@ -5830,6 +5831,7 @@ namespace VulkanTuner {
         pp.seed = TuneStats::PROBE_MEASURE_ROTATION_SEED;
         pp.spikeBandLo = TuneStats::SPIKE_BAND_LO;
         pp.spikeBandHi = TuneStats::SPIKE_BAND_HI;
+        pp.blockBudgetMB = TuneStats::TUNE_PROBE_BLOCK_BUDGET_MB;
         std::vector<double> preD((size_t) 2 * (size_t) preReps, 0.0);
         vk_tune_probe_result preRes {};
         char preErr[512];
@@ -6177,6 +6179,7 @@ namespace VulkanTuner {
         ap.seed = TuneStats::PROBE_MEASURE_ROTATION_SEED;
         ap.spikeBandLo = TuneStats::SPIKE_BAND_LO;
         ap.spikeBandHi = TuneStats::SPIKE_BAND_HI;
+        ap.blockBudgetMB = TuneStats::TUNE_PROBE_BLOCK_BUDGET_MB;
         // 🔴 TWO POINTS, BOTH IN THE TARGET'S REGIME (2026-10-05, batch 2b).  ONE point was not enough, and
         // the measurement says exactly why: the block/shots relation is CONCAVE for the light shapes (measured:
         // their per-shot cost rose 6.79 -> 7.57 us when their count went 228 -> 262), so a marginal taken at
@@ -6289,6 +6292,7 @@ namespace VulkanTuner {
         mp.seed = TuneStats::PROBE_MEASURE_ROTATION_SEED;
         mp.spikeBandLo = TuneStats::SPIKE_BAND_LO;
         mp.spikeBandHi = TuneStats::SPIKE_BAND_HI;
+        mp.blockBudgetMB = TuneStats::TUNE_PROBE_BLOCK_BUDGET_MB;
         const size_t mSlots = coverage.size() * mObjects.size();
         std::vector<double> mSamples(mSlots * (size_t) mp.reps, 0.0);
         vk_tune_probe_result mRes {};

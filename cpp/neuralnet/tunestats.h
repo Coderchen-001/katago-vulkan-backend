@@ -69,6 +69,23 @@ namespace TuneStats {
   // (`logs-t3/step0a/step0a-correction-off.md`).  Two block-length sanity louds take over the watching job,
   // and the deletion's reasoning plus its resurrection recipe live in `correction-removal-inventory.md`.
   constexpr double MIN_BLOCK_TIME_MS = 2.0;
+  // 🔴 G1 (2026-10-12): THE VRAM BOUND ON ONE SHAPE'S BLOCK GRAPH, and the number is a declared policy value
+  // for the same reason the tolerance and the band are: it changes what is measured, so it enters
+  // `policyFingerprint()` (via POLICY_CONSTANTS) and an old cache cannot be reused under a new bound.
+  //
+  // WHY IT IS NEEDED.  `vk_tune_probe_params.shotsPerShape`'s own comment already rules that "a block
+  // shortened by VRAM ... means a heavy shape has to be able to shorten ITSELF", but nothing enforced a
+  // bound: the pre-check solves `shots` for a TIME target only, and the probe allocates ONE mul_mat
+  // DESTINATION PER SHOT.  MEASURED, reading the buffer size directly: 5.7-6.4 MiB per shot on the widest
+  // covered shapes, 5.4 GB for one six-shape measurement, and 10.7 GB for the SECOND ANCHOR PASS -- which
+  // was the entire 12.2 GB peak.  At 64 MB per shape the six shapes cost ~384 MB instead of 5.4 GB.
+  //
+  // THE PRICE, and why it is acceptable: a shortened block has a coarser timing quantum (1 us / block), so
+  // each sample is noisier.  That is a COST, not a bias -- the comparison is paired and interleaved within a
+  // pass, so both members of a pair pay the same block length, and the ranking rests on pass-internal
+  // relative quantities.  The compensation is more passes, which is what the round schedule is for.  Zero
+  // would disable the bound (the pre-batch behaviour).
+  constexpr uint32_t TUNE_PROBE_BLOCK_BUDGET_MB = 64;
   constexpr long   PAIRS_FLOOR = 25;         // DECLARED + conservative: 16 and 25 are indistinguishable here (see the header)
   constexpr double ALPHA = 0.05;             // declared, not hidden inside a formula
   constexpr double TOLERANCE = 0.01;         // 1% : the product tolerance

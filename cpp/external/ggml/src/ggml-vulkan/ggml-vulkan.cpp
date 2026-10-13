@@ -21581,9 +21581,26 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
         }
     }
     // THE ONE READER of the two forms, so no call site can reach for `params->shots` for a shape
-    // without saying so.
+    // without saying so.  🔴 G1 (2026-10-12): AND THE ONE PLACE THE VRAM BOUND CAN BE APPLIED, because it is
+    // the only place that knows both the shape's dimensions and the shot count it is about to allocate.
+    // Every call site -- the pre-check, both anchor passes and the measurement -- goes through here, so the
+    // bound holds for all of them at once (the measured peak was the SECOND ANCHOR PASS, 10.7 GB, which a
+    // bound applied only to the measurement would have missed entirely).
     const auto shots_of = [&](uint32_t s) -> uint32_t {
-        return params->nShotsPerShape != 0 ? params->shotsPerShape[s] : params->shots;
+        uint32_t sh = (params->nShotsPerShape != 0) ? params->shotsPerShape[s] : params->shots;
+        if (params->blockBudgetMB != 0) {
+            const uint64_t bytesPerDestination = (uint64_t) params->shapes[s].n * (uint64_t) params->shapes[s].m * 4ull;
+            if (bytesPerDestination != 0) {
+                const uint64_t cap = ((uint64_t) params->blockBudgetMB * 1024ull * 1024ull) / bytesPerDestination;
+                if (cap < 1ull) {
+                    sh = 1u;   // a single destination still exceeds the budget: one shot is the floor, and the
+                               // caller sees the shortened block through the block-time readings it already has
+                } else if ((uint64_t) sh > cap) {
+                    sh = (uint32_t) cap;
+                }
+            }
+        }
+        return sh;
     };
     if (params->spikeBandLo <= 0.0 || params->spikeBandHi <= params->spikeBandLo) {
         // The band is handed in (the declared values live in cpp/neuralnet/tunestats.h), so this is the

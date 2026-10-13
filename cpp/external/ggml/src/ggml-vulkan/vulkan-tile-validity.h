@@ -270,6 +270,17 @@ struct vk_tune_probe_params {
     // a reader could see.
     double spikeBandLo;
     double spikeBandHi;
+    // 🔴 G1 (2026-10-12): THE VRAM BOUND THE `shotsPerShape` COMMENT ABOVE SAYS IS MISSING.  That comment
+    // already rules that "a block shortened by VRAM ... means a heavy shape has to be able to shorten
+    // ITSELF", and the mechanism (`shotsPerShape`) exists -- but nothing ever enforced a bound: the solve
+    // only targets a TIME, and the probe allocates ONE mul_mat destination per shot, so a shape's block is
+    // `shots x n x m x 4` bytes.  MEASURED (direct read of `ggml_backend_buffer_get_size`): 5.7-6.4 MiB per
+    // shot on the widest covered shapes, 5.4 GB for one six-shape measurement and 10.7 GB for the second
+    // anchor pass -- the whole peak.  The bound is handed in by the caller (not spelled in the backend) for
+    // the same reason the band and the seed are: it changes what is measured, so it has to be part of the
+    // policy the caller fingerprints, and a value only the producer reads is exactly the field that reaches
+    // production with nothing able to change it.  Zero disables the bound (the pre-batch behaviour).
+    uint32_t blockBudgetMB;
 };
 
 // The runtime spike rate is the fraction of blocks the amplitude-band detector marks.  The band is the
