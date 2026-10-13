@@ -2792,6 +2792,19 @@ struct ggml_backend_vk_context {
     // cancelling.  The check is "how many intervals were exactly a mul_mat", and it costs one vector here
     // because the logging loop already walks the nodes.
     std::vector<int> last_node_op;
+    // 🔴 P1-c1 (2026-10-13): WHETHER TO SKIP THE PROFILER'S OWN EXTRA BARRIER.  The non-concurrent perf-logger
+    // path calls `ggml_vk_sync_buffers` unconditionally after each timestamp, ON TOP of the dependency-driven
+    // syncs that `ggml_vk_build_graph` already performs (the concurrent branch guards the same call with
+    // `if (need_sync)`, which is what proves the unconditional one is the profiler's own).  That extra barrier
+    // is what makes each interval "node i running ALONE": measured, the same anchor block costs 268 us in
+    // production and 435 us with the logger on (+62%), and a single interval read 20 us where the block's own
+    // average per dispatch was 14.5 us.  Without it a timestamp pair still means "everything up to this point
+    // completed", so consecutive timestamps differ by the node's MARGINAL cost inside the pipeline -- which is
+    // the production-faithful quantity this tuner ranks by.
+    // It is a per-context flag rather than a global because the probe is not the only thing that computes on
+    // this context; setting it around the probe's own graph computes keeps the change local to the caller that
+    // asked for it (and the probe's blocks are independent mul_mats, so no dependency sync is skipped).
+    bool perfNoBarrier {};
     std::vector<uint64_t> last_node_ns;
     int32_t num_queries {};
     int32_t query_idx {};
@@ -20449,7 +20462,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->query_nodes[ctx->query_idx] = cgraph->nodes[i];
                 ctx->query_fusion_names[ctx->query_idx] = fusion_string;
                 compute_ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
-                ggml_vk_sync_buffers(ctx, compute_ctx);
+                // P1-c1: the profiler's own extra barrier, skipped on request so the timestamps measure the
+                // MARGINAL cost in the pipeline instead of "this node alone".  The dependency-driven syncs
+                // inside `ggml_vk_build_graph` are untouched, so correctness does not depend on this call.
+                if (!ctx->perfNoBarrier) {
+                    ggml_vk_sync_buffers(ctx, compute_ctx);
+                }
             } else {
                 // track a fusion string and number of fused ops for the current node_idx
                 ctx->query_fusion_names[i] = fusion_string;
@@ -22242,6 +22260,8 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
     std::string nsByShapeStr = "[]";
     std::string nsSentinelStr = "[]";
     std::string nsByObjStr = "[]";   // P1-b2: only filled when a T2 probe bit is on
+    // P1-c1: the clock's own resolution, ns per tick (function scope for the same reason as the strings above).
+    double tsPeriodNs = 0.0;
     uint64_t elapsed_us_total = 0;
     uint64_t warmup_us_total = 0;
     uint32_t no_progress_streak = 0;
@@ -22278,7 +22298,12 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
                 // standard libraries, and a wall-clock jump in the middle of a block would enter the
                 // sample set as a spike that no envelope generator could attribute.
                 const auto t0 = std::chrono::steady_clock::now();
+                // P1-c1: ask for the pipeline-faithful timestamps (no extra profiler barrier) for the duration
+                // of this block, then hand the context back the way it was found.
+                const bool perfNoBarrierWas = ctx->perfNoBarrier;
+                ctx->perfNoBarrier = true;
                 const ggml_status gst = ggml_backend_graph_compute(backend, shape_graph[s]);
+                ctx->perfNoBarrier = perfNoBarrierWas;
                 ggml_backend_synchronize(backend);
                 const auto t1 = std::chrono::steady_clock::now();
 
@@ -22583,6 +22608,10 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
             return std::to_string(n) + ":" + std::to_string(v[n / 2]) + ":" + std::to_string(pct(0.90))
                    + ":" + std::to_string(pct(0.99)) + ":" + std::to_string(v.back());
         };
+        // P1-c1: the clock's own resolution, in nanoseconds per tick.  The acceptance for removing the
+        // profiler barrier has to show that the (now smaller) differences still sit ABOVE this, otherwise the
+        // finer ruler would be coarser than what it measures.
+        tsPeriodNs = (double) ctx->device->properties.limits.timestampPeriod;
         nsByShapeStr = "[";
         nsSentinelStr = "[";
         for (size_t si2 = 0; si2 < nodeNsBySO.size(); si2++) {
@@ -22669,7 +22698,7 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
                     + ",max=" + std::to_string(result->node_ns_max) + "] node_ns_by_shape=" + nsByShapeStr
                     + " node_ns_sentinel_by_shape=" + nsSentinelStr + " node_ns_kinds=matmul/total="
                     + std::to_string(nodeNsMatmul) + "/" + std::to_string(nodeNsIntervals)
-                    + " node_ns_by_obj=" + nsByObjStr
+                    + " node_ns_by_obj=" + nsByObjStr + " ts_period_ns=" + std::to_string(tsPeriodNs)
                     + " alloc_bytes=" + allocList + " shots_by_shape=" + shotsList + " shapes=" + std::to_string(params->nShapes) + " objects="
                     + std::to_string(params->nObjects) + " shots=" + std::to_string(params->shots)
                     + " warmup=" + std::to_string(params->warmupBlocks) + " reps="
