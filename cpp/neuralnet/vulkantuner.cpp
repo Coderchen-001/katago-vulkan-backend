@@ -2526,6 +2526,29 @@ namespace VulkanTuner {
       return TuneStats::MIN_BLOCK_TIME_MS * 1000.0;
     }
 
+    // 🔴 G1 (2026-10-13): THE VRAM BOUND, OVERRIDABLE BY A DEV KNOB SO IT CAN BE MEASURED RATHER THAN PICKED.
+    // The constant's own comment already says the bound is a POLICY value (it changes what is measured); this
+    // function is what makes its VALUE overridable without lying to the fingerprint -- the knob is declared in
+    // `policyFingerprint`'s env list, so the value travels into the policy string the same way
+    // `KATAGO_VK_TUNE_BLOCKMS`' does, and two runs under different budgets can never share a cache.
+    // WHY IT NEEDS A SWEEP: the bound is not only a memory parameter.  MEASURED after the bound landed,
+    // `shots_by_shape` fell from ~237 to [11,10,30,30,30,15], i.e. block lengths of ~90..240 us against a 1 us
+    // clock quantum -- 0.4..1.1%, where the old 2 ms blocks sat at 0.05%.  The quantization is COMMON inside a
+    // pass (every candidate pays the same block length), so it cannot bias the ranking, but it does add noise
+    // per sample (the visible side-effect: spikes 43 -> 271), so it has to be paid for in PASSES.  "Tighter
+    // bound => shorter block => more passes needed" is therefore a sentence the spec has to carry, and the
+    // exchange rate is what decides the default.
+    uint32_t tuneBlockBudgetMB() {
+      const char* v = getenv("KATAGO_VK_TUNE_BUDGETMB");
+      if (v != nullptr && v[0] != '\0') {
+        const long mb = strtol(v, nullptr, 10);
+        if (mb > 0 && mb <= 65536) {
+          return (uint32_t) mb;
+        }
+      }
+      return TuneStats::TUNE_PROBE_BLOCK_BUDGET_MB;
+    }
+
     unsigned long t2ProbeBits() {
       const char* v = getenv("KATAGO_VK_T2_PROBE");
       if (v == nullptr || v[0] == '\0') {
@@ -2651,7 +2674,7 @@ namespace VulkanTuner {
         // dev tier beside them: a diagnostic run must not write a cache that claims to be this device's
         // optimum.  (The tier rule is the one the census states: "changes the tune's choice => KNOBS[]".)
         "KATAGO_VK_TUNE_MAXCANDS", "KATAGO_VK_TUNE_ONEGEOM", "KATAGO_VK_TUNE_MAXSHAPES",
-        "KATAGO_VK_TUNE_BLOCKMS",
+        "KATAGO_VK_TUNE_BLOCKMS", "KATAGO_VK_TUNE_BUDGETMB",
       };
       // NOTE: the build revision is truncated to 16 characters and that is NOT the lossy kind
       // of truncation the knob values below must avoid -- a SHA is a fixed-length prefix-free
@@ -5831,7 +5854,7 @@ namespace VulkanTuner {
         pp.seed = TuneStats::PROBE_MEASURE_ROTATION_SEED;
         pp.spikeBandLo = TuneStats::SPIKE_BAND_LO;
         pp.spikeBandHi = TuneStats::SPIKE_BAND_HI;
-        pp.blockBudgetMB = TuneStats::TUNE_PROBE_BLOCK_BUDGET_MB;
+        pp.blockBudgetMB = tuneBlockBudgetMB();
         std::vector<double> preD((size_t) 2 * (size_t) preReps, 0.0);
         vk_tune_probe_result preRes {};
         char preErr[512];
@@ -6214,7 +6237,7 @@ namespace VulkanTuner {
         ap.seed = TuneStats::PROBE_MEASURE_ROTATION_SEED;
         ap.spikeBandLo = TuneStats::SPIKE_BAND_LO;
         ap.spikeBandHi = TuneStats::SPIKE_BAND_HI;
-        ap.blockBudgetMB = TuneStats::TUNE_PROBE_BLOCK_BUDGET_MB;
+        ap.blockBudgetMB = tuneBlockBudgetMB();
         // 🔴 TWO POINTS, BOTH IN THE TARGET'S REGIME (2026-10-05, batch 2b).  ONE point was not enough, and
         // the measurement says exactly why: the block/shots relation is CONCAVE for the light shapes (measured:
         // their per-shot cost rose 6.79 -> 7.57 us when their count went 228 -> 262), so a marginal taken at
@@ -6333,7 +6356,7 @@ namespace VulkanTuner {
         mp.seed = TuneStats::PROBE_MEASURE_ROTATION_SEED;
         mp.spikeBandLo = TuneStats::SPIKE_BAND_LO;
         mp.spikeBandHi = TuneStats::SPIKE_BAND_HI;
-        mp.blockBudgetMB = TuneStats::TUNE_PROBE_BLOCK_BUDGET_MB;
+        mp.blockBudgetMB = tuneBlockBudgetMB();
         const size_t mSlots = coverage.size() * mObjects.size();
         std::vector<double> mSamples(mSlots * (size_t) mp.reps, 0.0);
         vk_tune_probe_result mRes {};
