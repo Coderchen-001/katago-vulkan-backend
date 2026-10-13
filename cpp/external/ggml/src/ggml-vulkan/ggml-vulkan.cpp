@@ -21993,6 +21993,15 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
     // R-13: the object each shape resolves to, filled in the build loop below because that is where
     // the shape's tensors exist.  It is the object the DISPATCHER will use, not a type comparison.
     std::vector<vk_matmul_pipeline> shape_obj(params->nShapes, nullptr);
+    // 🔴 G1 DIRECT READING (2026-10-12): the ACTUAL device bytes each shape's block graph holds, and the
+    // `shots` that produced them.  Measured before this existed: the ~10 GB peak is 2.9 GB fixed + ~1.5 GB
+    // per shape, and it is INVARIANT to the candidate count (MAXSHAPES=1 with 38/11/6 objects peaked at
+    // 4467/4450/4444 MiB) while the code path here allocates one mul_mat DESTINATION per shot -- the source
+    // of the bytes was therefore inferred from a peak, not read.  These two vectors turn the inference into
+    // a number, and the ratio `alloc_bytes / (shots * m * n * 4)` says how much of a shape's block is
+    // destinations, with the graph metadata and descriptors as the remainder.
+    std::vector<size_t> shape_buf_bytes(params->nShapes, 0);
+    std::vector<uint32_t> shape_shots(params->nShapes, 0);
 
     // Per-CALL RAII, and it has to be: the graphs outlive every early return below (a refusal half way
     // through the passes must not leave VRAM held for the rest of the process), and a `shots`-sized
@@ -22073,6 +22082,8 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
                           "run's blocks were shortened)");
         }
         shape_buf[s] = p_buf;
+        shape_buf_bytes[s] = (size_t) ggml_backend_buffer_get_size(p_buf);
+        shape_shots[s] = shots_of(s);
     }
 
     // ---- R-13: a candidate must target the SHAPE'S object, and a mismatch refuses the whole call -------
@@ -22500,7 +22511,21 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
         result->elapsed_us = elapsed_us_total;
     }
 
-    ggml_vk_t3_line("probe: shapes=" + std::to_string(params->nShapes) + " objects="
+    // G1 direct reading: the per-shape device bytes and the `shots` behind them, printed BEFORE the counts so
+    // `alloc_bytes[i] / (shots_by_shape[i] * m_i * n_i * 4)` can be formed by hand straight off the line.
+    std::string allocList = "[";
+    std::string shotsList = "[";
+    for (size_t ai = 0; ai < shape_buf_bytes.size(); ai++) {
+        if (ai != 0) {
+            allocList += ",";
+            shotsList += ",";
+        }
+        allocList += std::to_string(shape_buf_bytes[ai]);
+        shotsList += std::to_string(shape_shots[ai]);
+    }
+    allocList += "]";
+    shotsList += "]";
+    ggml_vk_t3_line("probe: alloc_bytes=" + allocList + " shots_by_shape=" + shotsList + " shapes=" + std::to_string(params->nShapes) + " objects="
                     + std::to_string(params->nObjects) + " shots=" + std::to_string(params->shots)
                     + " warmup=" + std::to_string(params->warmupBlocks) + " reps="
                     + std::to_string(params->reps) + " pairs_legal=" + std::to_string(pairs_legal)
