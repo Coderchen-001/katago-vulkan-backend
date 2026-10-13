@@ -6119,10 +6119,16 @@ namespace VulkanTuner {
         // becomes defence in depth rather than the only one.
         auto shotsCapForShape = [](const vk_tune_probe_shape & sh) -> uint32_t {
           const uint64_t per = (uint64_t) sh.n * (uint64_t) sh.m * 4ull;
-          if (per == 0 || TuneStats::TUNE_PROBE_BLOCK_BUDGET_MB == 0) {
+          // 🔴 The EFFECTIVE value, not the constant: reading `TuneStats::TUNE_PROBE_BLOCK_BUDGET_MB` here
+          // bypassed the override entirely (MEASURED: a run under `KATAGO_VK_TUNE_BUDGETMB=1024` still clamped
+          // to the 64 MB caps -- `shots_by_shape=[11,10,30,30,30,15]` unchanged, with `precheck shots=213` and
+          // `solved_shots=[40,...]` proving the solve had asked for far more).  The shell and the backend must
+          // ask the same question, and the knob is what answers it.
+          const uint32_t budgetMB = tuneBlockBudgetMB();
+          if (per == 0 || budgetMB == 0) {
             return 0u;   // 0 means "no cap"
           }
-          const uint64_t cap = ((uint64_t) TuneStats::TUNE_PROBE_BLOCK_BUDGET_MB * 1024ull * 1024ull) / per;
+          const uint64_t cap = ((uint64_t) budgetMB * 1024ull * 1024ull) / per;
           return cap < 1ull ? 1u : (uint32_t) cap;
         };
         auto clampShotsToBudget = [&](const vk_tune_probe_shape & sh, uint32_t sh0) -> uint32_t {
