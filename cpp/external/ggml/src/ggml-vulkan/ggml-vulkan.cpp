@@ -2777,6 +2777,15 @@ struct ggml_backend_vk_context {
     std::vector<int> query_fusion_node_count;
     std::vector<ggml_tensor *> query_nodes;
     std::vector<int> query_node_idx;
+    // 🔴 P1 (2026-10-13): THE LAST GRAPH'S PER-NODE KERNEL TIMES, in node order, in NANOSECONDS.  Filled by
+    // the NON-concurrent perf-logger path, which brackets every node with a timestamp and a `sync_buffers`,
+    // so each delta is that node's OWN duration (a timestamp alone records "all prior work completed", so
+    // without the bracket two overlapping dispatches would give cumulative times instead of durations).
+    // The tuner's probe reads this: its blocks are many independent dispatches, so this is the difference
+    // between "one wall-clock sample per block of shots" and "one kernel-time sample per dispatch".
+    // Empty unless GGML_VK_PERF_LOGGER is set, which is also what makes the reading opt-in and its absence
+    // explicit (`n_node_ns == 0` says the instrument was not on).
+    std::vector<uint64_t> last_node_ns;
     int32_t num_queries {};
     int32_t query_idx {};
 };
@@ -20485,7 +20494,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
 
     if (vk_perf_logger_enabled) {
-        // End the command buffer and submit/wait
+        ctx->last_node_ns.clear();   // P1: one graph's worth, not an accumulation across graphs
         GGML_ASSERT(!ctx->compute_ctx.expired());
         compute_ctx = ctx->compute_ctx.lock();
         ggml_vk_ctx_end(compute_ctx);
@@ -20503,7 +20512,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             for (int i = 1; i < ctx->query_idx; i++) {
                 auto node = ctx->query_nodes[i];
                 auto name = ctx->query_fusion_names[i];
-                ctx->perf_logger->log_timing(node, name, uint64_t((timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod));
+                const uint64_t ns_here = uint64_t((timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod);
+                ctx->perf_logger->log_timing(node, name, ns_here);
+                ctx->last_node_ns.push_back(ns_here);   // P1: the probe reads these (query order == node order)
             }
         } else {
             // Log each group of nodes
@@ -22203,6 +22214,9 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
     }
 
     uint32_t blocks_timed = 0;
+    // P1: every node time the perf logger handed back during THIS call (all blocks, all passes), in
+    // nanoseconds.  Aggregated at the end into min/median/max so the two instruments can be compared.
+    std::vector<uint64_t> nodeNsAll;
     uint64_t elapsed_us_total = 0;
     uint64_t warmup_us_total = 0;
     uint32_t no_progress_streak = 0;
@@ -22297,6 +22311,10 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
                     block_us[idx] = dt_us;
                     block_measured[idx] = 1;
                     blocks_timed++;
+                    // P1: the block's own per-node kernel times (empty unless GGML_VK_PERF_LOGGER is on).
+                    for (size_t nsi = 0; nsi < ctx->last_node_ns.size(); nsi++) {
+                        nodeNsAll.push_back(ctx->last_node_ns[nsi]);
+                    }
                     elapsed_us_total += dt_us;
                 } else {
                     warmup_us_total += dt_us;
@@ -22499,6 +22517,19 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
         result->shapes = params->nShapes;
         result->objects = params->nObjects;
         result->blocks = blocks_timed;
+        // P1: summarise the per-dispatch kernel times (0/0/0/0 when the perf logger is off -- the reading is
+        // opt-in, and `n_node_ns == 0` is what says so rather than a zero that could be read as a time).
+        result->n_node_ns = (uint32_t) nodeNsAll.size();
+        result->node_ns_min = 0;
+        result->node_ns_med = 0;
+        result->node_ns_max = 0;
+        if (!nodeNsAll.empty()) {
+            std::vector<uint64_t> sortedNs = nodeNsAll;
+            std::sort(sortedNs.begin(), sortedNs.end());
+            result->node_ns_min = sortedNs.front();
+            result->node_ns_med = sortedNs[sortedNs.size() / 2];
+            result->node_ns_max = sortedNs.back();
+        }
         result->samples = samples_written;
         result->spikes = spikes;
         result->dropped_build_failed = build_failed;
@@ -22542,7 +22573,9 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
     }
     allocList += "]";
     shotsList += "]";
-    ggml_vk_t3_line("probe: alloc_bytes=" + allocList + " shots_by_shape=" + shotsList + " shapes=" + std::to_string(params->nShapes) + " objects="
+    ggml_vk_t3_line("probe: node_ns=[n=" + std::to_string(result->n_node_ns) + ",min="
+                    + std::to_string(result->node_ns_min) + ",med=" + std::to_string(result->node_ns_med)
+                    + ",max=" + std::to_string(result->node_ns_max) + "] alloc_bytes=" + allocList + " shots_by_shape=" + shotsList + " shapes=" + std::to_string(params->nShapes) + " objects="
                     + std::to_string(params->nObjects) + " shots=" + std::to_string(params->shots)
                     + " warmup=" + std::to_string(params->warmupBlocks) + " reps="
                     + std::to_string(params->reps) + " pairs_legal=" + std::to_string(pairs_legal)

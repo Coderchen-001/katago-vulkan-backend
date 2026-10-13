@@ -330,6 +330,17 @@ struct vk_tune_probe_result {
     uint32_t shots_min;
     uint32_t shots_max;
     double t_block_hot_us;   // the estimate's input: median of the hot blocks of the heaviest shape
+    // 🔴 P1 (2026-10-13): THE PER-DISPATCH KERNEL TIMES OF THIS CALL'S BLOCKS, summarised in nanoseconds.
+    // The block machinery exists because a WALL-CLOCK sample of one dispatch is ~8 us against a 1 us clock
+    // (+-12%), so `shots` dispatches are bundled into one block and their total is divided -- which is why a
+    // block needs one output tensor PER SHOT.  A GPU timestamp measures each dispatch's own kernel time, so
+    // the same information arrives as N independent samples with ONE output.  This batch makes that reading
+    // available and comparable; the switch that removes `shots`/`reps`/blocks is the next step.
+    // `n_node_ns == 0` means the perf logger was not on: the instrument was absent, NOT that the time was 0.
+    uint32_t n_node_ns;
+    uint64_t node_ns_min;
+    uint64_t node_ns_med;
+    uint64_t node_ns_max;
     uint64_t elapsed_us;
     // 🔴 (7e-3) THE PER-SHAPE RULER.  `t_block_hot_us` is the HEAVIEST shape's block, but a block's
     // microsecond clock gives THAT BLOCK a relative floor of 1/block_us, and the block length differs per
