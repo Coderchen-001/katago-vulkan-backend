@@ -2815,6 +2815,17 @@ struct ggml_backend_vk_context {
     // this context; setting it around the probe's own graph computes keeps the change local to the caller that
     // asked for it (and the probe's blocks are independent mul_mats, so no dependency sync is skipped).
     bool perfNoBarrier {};
+    // 🔴 P1-c3 (2026-10-13): WHETHER TO SKIP THE DEPENDENCY TRACKING for the graph being built.  The tuning probe
+    // wants k passes over ALL objects inside ONE submit, and for that every node must be free to write the SAME
+    // output buffer: the measurement never reads a result, so nothing it produces can be a real dependency.  The
+    // tracker, however, judges overlap by BUFFER + RANGE (`overlaps_unsynced`, so aliasing descriptors does not
+    // hide it), and would therefore insert a barrier before nearly every node -- which is exactly the regime the
+    // P1-c1 batch removed, where a timestamp interval measures "this node alone + barrier" instead of its
+    // marginal cost in a pipeline.  With this flag the lists are never populated for that graph, so no sync is
+    // ever requested for it, and one shared destination is both barrier-free and correct (its values are never
+    // read).  Off by default; only the probe sets it, around its own graph construction, and production never
+    // sets it -- the same discipline as `perfNoBarrier`.
+    bool probeNoDeps {};
     std::vector<uint64_t> last_node_ns;
     int32_t num_queries {};
     int32_t query_idx {};
@@ -17974,7 +17985,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         // For all fused ops, check if the destination node or any of the source
         // nodes require synchronization.
-        for (int32_t i = 0; i < ctx->num_additional_fused_ops + 1 && !need_sync; ++i) {
+        for (int32_t i = 0; i < ctx->num_additional_fused_ops + 1 && !need_sync && !ctx->probeNoDeps; ++i) {
             const ggml_tensor *cur_node = cgraph->nodes[node_idx + i];
             // If the node actually writes to memory, then check if it needs to sync
             if (ctx->fused_ops_write_mask & (1 << i)) {
@@ -18009,7 +18020,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             }
         }
         // Add all fused nodes to the unsynchronized lists.
-        for (int32_t i = 0; i < ctx->num_additional_fused_ops + 1; ++i) {
+        // P1-c3: NOT while `probeNoDeps` is set -- the lists are what the next node's detection reads, so leaving
+        // them empty is the whole mechanism that makes a shared destination batch barrier-free.
+        for (int32_t i = 0; !ctx->probeNoDeps && i < ctx->num_additional_fused_ops + 1; ++i) {
             const ggml_tensor *cur_node = cgraph->nodes[node_idx + i];
             // Multiple outputs could be written, e.g. in topk_moe. Add them all to the list.
             if (ctx->fused_ops_write_mask & (1 << i)) {
