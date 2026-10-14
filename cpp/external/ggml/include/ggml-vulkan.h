@@ -3,6 +3,14 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+// 🔴 P1-c5 (2026-10-13): mark whether a USER eval is executing, so the tuning probe's window predicate can ask
+// the question it actually needs ("is the device exclusively mine right now?") instead of the proxy it used
+// before ("has any eval already run?").  The new tuner flow measures BETWEEN evals, where the device is
+// exclusive but an eval has already run, so the proxy was refusing a legitimate window.
+// Declared here, OUTSIDE the `extern "C"` block below, because the definition in ggml-vulkan.cpp is C++.
+// The tuner is the only caller; production paths never set it.
+void ggml_vk_set_user_eval_in_flight(ggml_backend_t backend, bool inFlight);
+
 #ifdef  __cplusplus
 extern "C" {
 #endif

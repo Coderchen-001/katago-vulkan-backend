@@ -2716,6 +2716,16 @@ struct ggml_backend_vk_context {
     // traversal and re-submit the cached single-cb submission.
     bool pr_enabled {};
     bool pr_recording {};   // eval >= 2: record mode
+    // 🔴 P1-c5 (2026-10-13): WHETHER A USER EVAL IS EXECUTING RIGHT NOW.  The probe's window predicate used to be
+    // `pr_evals != 0`, which says "an eval has ALREADY run" -- a proxy for the thing it actually needs, "the
+    // device is exclusively mine right now".  The new tuner flow measures BETWEEN evals (eval 1 ran on stock and
+    // produced the real activations; eval 2 has not started), and there the device IS exclusive, yet the proxy
+    // refuses.  The comment above that refusal already names the principle: "naming the state the probe actually
+    // depends on is what keeps this check true if the state machine ever moves".  So the proxy is replaced by the
+    // state itself, set around the USER's eval compute only -- the probe's own graph computes run inside the
+    // tuner, which is not inside an eval, so they do not set it (a shared flag set by ggml_vk_graph_compute
+    // would deadlock the probe against itself).
+    bool pr_user_eval_in_flight {};
     // W4e: while the measurement primitive runs, it forces WHICH pipeline a block dispatches.
     // It cannot go through the row table, and the reason is not style: the primitive's own lookup
     // would FREEZE that table (R3 refuses any later install), while the primitive runs BEFORE the
@@ -2866,6 +2876,20 @@ static std::string ggml_vk_tune_ctx_tag(const ggml_backend_vk_context * ctx) {
 // So: build the complete line INCLUDING its "\n", then write it with exactly ONE <<.
 // ggml_vk_evidence_line() takes a whole line; the two prefixed wrappers exist so that the
 // "[T2] " and "[T3] " literals each appear exactly once in this file (guardrail R10).
+// 🔴 P1-c5 (2026-10-13): mark whether a USER eval is executing, for the probe's window predicate.
+// The tuner sets this around the user's eval compute; the probe's own graph computes run inside the tuner (not
+// inside an eval) and must NOT set it, which is why this is a separate entry point rather than something
+// `ggml_vk_graph_compute` does for every call -- a shared flag there would make the probe refuse itself.
+// The predicate it feeds used to be `pr_evals != 0`, a proxy for "the device is exclusively mine"; the new flow
+// measures BETWEEN evals, where the device is exclusive but an eval has already run, so the proxy was wrong.
+void ggml_vk_set_user_eval_in_flight(ggml_backend_t backend, bool inFlight) {
+    if (backend == nullptr || backend->context == nullptr) {
+        return;
+    }
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    ctx->pr_user_eval_in_flight = inFlight;
+}
+
 static void ggml_vk_evidence_line(const std::string & line) {
     std::cerr << (line + "\n");
 }
@@ -21767,9 +21791,9 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
                       "a submission that did nothing -- and a RECORDING one would write the probe's "
                       "blocks into the user's graph");
     }
-    if (ctx->pr_evals != 0) {
+    if (ctx->pr_user_eval_in_flight) {
         return refuse(VK_TUNE_PROBE_REFUSED_PRECONDITION,
-                      "an eval has already run in this context (pr_evals=" + std::to_string(ctx->pr_evals)
+                      "a user eval is executing right now (pr_evals=" + std::to_string(ctx->pr_evals)
                       + "): device-exclusive measurement cannot be claimed");
     }
     if (vk_t2_on(4u) || vk_t2_on(8u)) {

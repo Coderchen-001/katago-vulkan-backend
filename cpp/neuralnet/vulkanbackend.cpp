@@ -3212,7 +3212,13 @@ void NeuralNet::getOutput(
     ggml_backend_tensor_set(gpuHandle->inputMeta, inputBuffers->metaInput.data(), 0,
                             inputBuffers->singleInputMetaElts * runBatchSize * sizeof(float));
 
-  if(ggml_backend_graph_compute(gpuHandle->backend, gpuHandle->graph) != GGML_STATUS_SUCCESS)
+  // P1-c5: tell the probe's window predicate that a USER eval is executing.  Cleared BEFORE the throw, so a
+  // failed eval cannot leave the flag set for the rest of the process (which would make every later
+  // between-evals measurement refuse).
+  ggml_vk_set_user_eval_in_flight(gpuHandle->backend, true);
+  const ggml_status evalStatus = ggml_backend_graph_compute(gpuHandle->backend, gpuHandle->graph);
+  ggml_vk_set_user_eval_in_flight(gpuHandle->backend, false);
+  if(evalStatus != GGML_STATUS_SUCCESS)
     throw StringError("VULKAN backend: graph compute failed");
 
   // N-1: reuse the per-eval staging buffers owned by InputBuffers instead of
