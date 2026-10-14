@@ -3212,12 +3212,13 @@ void NeuralNet::getOutput(
     ggml_backend_tensor_set(gpuHandle->inputMeta, inputBuffers->metaInput.data(), 0,
                             inputBuffers->singleInputMetaElts * runBatchSize * sizeof(float));
 
-  // P1-c5: tell the probe's window predicate that a USER eval is executing.  Cleared BEFORE the throw, so a
-  // failed eval cannot leave the flag set for the rest of the process (which would make every later
-  // between-evals measurement refuse).
-  ggml_vk_set_user_eval_in_flight(gpuHandle->backend, true);
+  // P1-c5/P1-c6: count this user eval as in flight.  Decremented BEFORE the throw, so a failed eval cannot leave
+  // the count positive for the rest of the process (which would make every later between-evals measurement
+  // refuse).  A counter, not a flag: the server evaluates on several threads, and the state machine that waits
+  // for "the first eval" has to wait until none is in flight.
+  ggml_vk_add_user_eval_in_flight(gpuHandle->backend, +1);
   const ggml_status evalStatus = ggml_backend_graph_compute(gpuHandle->backend, gpuHandle->graph);
-  ggml_vk_set_user_eval_in_flight(gpuHandle->backend, false);
+  ggml_vk_add_user_eval_in_flight(gpuHandle->backend, -1);
   if(evalStatus != GGML_STATUS_SUCCESS)
     throw StringError("VULKAN backend: graph compute failed");
 
