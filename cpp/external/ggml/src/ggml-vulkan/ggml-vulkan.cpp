@@ -2826,6 +2826,16 @@ struct ggml_backend_vk_context {
     // read).  Off by default; only the probe sets it, around its own graph construction, and production never
     // sets it -- the same discipline as `perfNoBarrier`.
     bool probeNoDeps {};
+    // 🔴 P1-c4 (2026-10-13): WHETHER THE CALLER ASKED FOR THE PRECISION CHECK.  This batch lands the switch
+    // only, and reports it as a reading, because the check itself must be a SEPARATE PASS rather than a hook in
+    // the measurement loop: reading an output back needs a device-to-host copy and its own synchronisation, and
+    // running that inside the timed region would inflate the very block time the performance round ranks by.
+    // The plan (registered in t3-shell-plan.md section 9.4) is a pass that, per shape, computes stock once,
+    // reads that output back as the reference, then for each candidate computes and reads back its output and
+    // compares EVERY element (all elements, no sampling, no early exit) against the reference with the
+    // multiplication form of the relative test, so no division and no median can hide a local error.  Off by
+    // default, so this batch changes no existing behaviour.
+    bool probePrecisionWanted {};
     std::vector<uint64_t> last_node_ns;
     int32_t num_queries {};
     int32_t query_idx {};
@@ -22295,6 +22305,9 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
     std::string nsSentinelStr = "[]";
     std::string nsByObjStr = "[]";   // P1-b2: only filled when a T2 probe bit is on
     std::string nsFirstStr = "[]";   // P1-c2: the first few samples per (shape, object), same gate
+    // P1-c4: the switch's own state, reported so "asked for but not yet run" cannot be mistaken for "ran and
+    // found nothing".  The probe reads the env once per call; the separate pass (next batch) consumes the flag.
+    ctx->probePrecisionWanted = (getenv("KATAGO_VK_T3_PRECISION") != nullptr);
     // P1-c2: the clock's own resolution, ns per tick (function scope for the same reason as the strings above).
     double tsPeriodNs = 0.0;
     uint64_t elapsed_us_total = 0;
@@ -22772,6 +22785,7 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
                     + " node_ns_sentinel_by_shape=" + nsSentinelStr + " node_ns_kinds=matmul/total="
                     + std::to_string(nodeNsMatmul) + "/" + std::to_string(nodeNsIntervals)
                     + " node_ns_by_obj=" + nsByObjStr + " node_ns_first=" + nsFirstStr + " ts_period_ns=" + std::to_string(tsPeriodNs)
+                    + " precision_wanted=" + std::to_string(ctx->probePrecisionWanted ? 1 : 0)
                     + " alloc_bytes=" + allocList + " shots_by_shape=" + shotsList + " shapes=" + std::to_string(params->nShapes) + " objects="
                     + std::to_string(params->nObjects) + " shots=" + std::to_string(params->shots)
                     + " warmup=" + std::to_string(params->warmupBlocks) + " reps="
