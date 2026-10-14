@@ -213,6 +213,35 @@ namespace VulkanTuner {
       return string(hash).substr(0, 16);
     }
 
+    // 🔴 P1-c7 (2026-10-13): THE CACHE PATH, AS A PURE FUNCTION OF THE KEY.  The comment where it was first
+    // spelled says exactly this ("the PATH is a pure function of the key"), and this batch makes it literally
+    // true: one spelling, callable from outside the decision.
+    //
+    // WHY IT HAD TO BE EXTRACTED.  The rule for this tuner is "no matching cache => tune and write it; matching
+    // cache => read it", and the ONE requirement that creates is that the NN server must not be running several
+    // evaluations while a tune measures the device.  That requirement has to be met BEFORE the server's threads
+    // are spawned -- i.e. someone must be able to ask "will this start-up tune?" without running a decision and
+    // without a backend handle, which is exactly what this function makes possible.  The start-up side passes
+    // the same inputs the decision passes, so both sides land on the same file.
+    //
+    // The ORDER of the segments is load-bearing (see the long comment at the original spelling): identity in
+    // the directory, the two sweep dimensions in the file name.  Nothing here may be reordered or re-tagged
+    // without a version event -- a changed spelling orphans every existing cache file.
+    string tuneCachePathFor(
+        const string& cacheRoot,
+        const string& fingerprint,
+        const string& modelFileTag,
+        const string& modeString,
+        int nnXLen,
+        int nnYLen,
+        int maxBatchSize
+    ) {
+      return cacheRoot + "/" + shortHash(fingerprint) + "-" + modelFileTag
+           + "-m" + shortHash(modeString)
+           + "/" + std::to_string(nnXLen) + "x" + std::to_string(nnYLen)
+           + "-mb" + std::to_string(maxBatchSize) + ".txt";
+    }
+
     // Make a *value* safe to place in a line-oriented text format.  The REAL guarantee, stated
     // exactly: every control character (including newline, 0x0A) becomes '_', so a value can
     // never forge a field or start a new line, and POLICY is the LAST field on its line, so
@@ -5214,6 +5243,19 @@ namespace VulkanTuner {
       d->deviceFile = std::to_string(nnXLen) + "x" + std::to_string(nnYLen)
                     + "-mb" + std::to_string(maxBatchSize) + ".txt";
       d->cachePath = d->cacheDir + "/" + d->deviceFile;
+      // 🔴 P1-c7 self-证: the extracted pure function must reproduce the path the two original spellings just
+      // built.  Without this the start-up pre-check (which uses the pure function, and therefore has no decision
+      // and no backend to derive anything from) could look at a DIFFERENT file than the load path -- i.e. it
+      // would answer "tune" for a run that is about to load a cache, or worse, "no need" for one that is not.
+      // A mismatch is not a warning: it means the two spellings of the key have diverged, so this refuses.
+      {
+        const string pathViaPure = tuneCachePathFor(cacheRoot, d->fingerprint, model.fileTag(), d->modeString,
+                                                    nnXLen, nnYLen, maxBatchSize);
+        if (pathViaPure != d->cachePath) {
+          throw StringError("VK tuner: the extracted cache-path function disagrees with the load path: '"
+                            + pathViaPure + "' vs '" + d->cachePath + "'");
+        }
+      }
       d->cacheFileExists = FileUtils::exists(d->cachePath);
       d->hasPipelineCacheBytes = pipelineCacheBytesBefore(d->pipelineCacheBytesBefore);
 
