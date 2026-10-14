@@ -22305,6 +22305,9 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
     std::string nsSentinelStr = "[]";
     std::string nsByObjStr = "[]";   // P1-b2: only filled when a T2 probe bit is on
     std::string nsFirstStr = "[]";   // P1-c2: the first few samples per (shape, object), same gate
+    // P1-c4 step 2a: the precision channel's reading, filled by the separate pass below (never inside the timed
+    // measurement window).
+    std::string precisionRefStr = "[]";
     // P1-c4: the switch's own state, reported so "asked for but not yet run" cannot be mistaken for "ran and
     // found nothing".  The probe reads the env once per call; the separate pass (next batch) consumes the flag.
     ctx->probePrecisionWanted = (getenv("KATAGO_VK_T3_PRECISION") != nullptr);
@@ -22779,6 +22782,94 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
     }
     allocList += "]";
     shotsList += "]";
+    // 🔴 P1-c4 step 2a (2026-10-13): THE PRECISION CHANNEL'S FIRST HALF -- stock's reference, read back.
+    // It runs HERE, after every timed block and before the report, for the reason this batch was split: reading
+    // an output back needs a device-to-host copy and its OWN synchronisation, and the measurement window runs
+    // from just before a graph compute to just after its synchronise -- a readback inside that window would
+    // inflate the block time the performance round ranks by, and it would inflate it unevenly (whichever
+    // candidate gets read would look slower).
+    //
+    // Note the explicit `ggml_backend_synchronize` before EVERY `ggml_backend_tensor_get`: the backend's
+    // get_tensor is `ggml_vk_buffer_read` and nothing else (ggml-vulkan.cpp:18768-18779), so it does NOT wait
+    // for the queue -- the existing in-tree self-test works because it synchronises first (compute ->
+    // synchronise -> get_tensor).  Omitting it here would read stale or garbage bytes and the comparison would
+    // then blame a healthy candidate, which is the one failure mode this step must not have.  Synchronising is
+    // free here: this pass is outside every timing window.
+    //
+    // What it establishes, per shape: the reference's element count, whether it is finite and non-trivial, and
+    // whether a second identical run reproduces it bit for bit -- i.e. proof that the readback path itself is
+    // sound.  Without that proof the candidate comparison would misdiagnose a broken READBACK as a candidate
+    // that computes wrong numbers.
+    if (ctx->probePrecisionWanted) {
+        precisionRefStr = "[";
+        for (uint32_t s = 0; s < params->nShapes; s++) {
+            if (shape_graph[s] == nullptr) {
+                continue;
+            }
+            const ggml_tensor * outT = nullptr;
+            for (int i = 0; i < shape_graph[s]->n_nodes; i++) {
+                const ggml_tensor * nd = shape_graph[s]->nodes[i];
+                if (nd != nullptr && nd->op == GGML_OP_MUL_MAT) {
+                    outT = nd;
+                    break;
+                }
+            }
+            if (outT == nullptr) {
+                continue;
+            }
+            const size_t nb = ggml_nbytes(outT);
+            auto oneRun = [&](std::vector<uint8_t> & dst) {
+                {   // stock runs with NO override: `obj.stock ? nullptr : obj_pipe[o]`
+                    override_guard og(ctx, nullptr);
+                    ggml_backend_graph_compute(backend, shape_graph[s]);
+                    ggml_backend_synchronize(backend);
+                }
+                dst.assign(nb, 0);
+                ggml_backend_tensor_get(outT, dst.data(), 0, nb);
+            };
+            std::vector<uint8_t> h1, h2;
+            oneRun(h1);
+            oneRun(h2);
+            size_t diff = 0;
+            for (size_t b = 0; b < nb; b++) {
+                if (h1[b] != h2[b]) {
+                    diff++;
+                }
+            }
+            // The magnitudes: read as f32 or f16 depending on what this family's output actually is.
+            double maxAbs = 0.0;
+            size_t nans = 0;
+            const size_t nelem = (size_t) ggml_nelements(outT);
+            if (outT->type == GGML_TYPE_F32) {
+                const float * f = (const float *) h1.data();
+                for (size_t e = 0; e < nb / sizeof(float); e++) {
+                    if (!std::isfinite(f[e])) {
+                        nans++;
+                    } else {
+                        maxAbs = std::max(maxAbs, (double) std::fabs(f[e]));
+                    }
+                }
+            } else if (outT->type == GGML_TYPE_F16) {
+                const ggml_fp16_t * h = (const ggml_fp16_t *) h1.data();
+                for (size_t e = 0; e < nb / sizeof(ggml_fp16_t); e++) {
+                    const float v = ggml_fp16_to_fp32(h[e]);
+                    if (!std::isfinite(v)) {
+                        nans++;
+                    } else {
+                        maxAbs = std::max(maxAbs, (double) std::fabs(v));
+                    }
+                }
+            }
+            if (s != 0) {
+                precisionRefStr += ";";
+            }
+            precisionRefStr += "s" + std::to_string(s) + ":nelem=" + std::to_string(nelem)
+                             + ":max=" + std::to_string(maxAbs) + ":nan=" + std::to_string(nans)
+                             + ":rerun_diff=" + std::to_string(diff);
+        }
+        precisionRefStr += "]";
+    }
+
     ggml_vk_t3_line("probe: node_ns=[n=" + std::to_string(result->n_node_ns) + ",min="
                     + std::to_string(result->node_ns_min) + ",med=" + std::to_string(result->node_ns_med)
                     + ",max=" + std::to_string(result->node_ns_max) + "] node_ns_by_shape=" + nsByShapeStr
@@ -22786,6 +22877,7 @@ bool ggml_backend_vk_tune_probe_candidate(ggml_backend_t backend, const vk_tune_
                     + std::to_string(nodeNsMatmul) + "/" + std::to_string(nodeNsIntervals)
                     + " node_ns_by_obj=" + nsByObjStr + " node_ns_first=" + nsFirstStr + " ts_period_ns=" + std::to_string(tsPeriodNs)
                     + " precision_wanted=" + std::to_string(ctx->probePrecisionWanted ? 1 : 0)
+                    + " precision_ref=" + precisionRefStr
                     + " alloc_bytes=" + allocList + " shots_by_shape=" + shotsList + " shapes=" + std::to_string(params->nShapes) + " objects="
                     + std::to_string(params->nObjects) + " shots=" + std::to_string(params->shots)
                     + " warmup=" + std::to_string(params->warmupBlocks) + " reps="
